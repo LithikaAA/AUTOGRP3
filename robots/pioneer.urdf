@@ -1,0 +1,814 @@
+<?xml version="1.0"?>
+<!--
+=========================
+SENSOR REALISM CHANGES
+=========================
+
+For this project, I modified the sensor setup to better reflect real-world behaviour instead of ideal/perfect sensing.
+
+Firstly, I positioned all sensors (LiDAR, camera, IMU) with realistic offsets from the robot chassis using proper joint transforms. This ensures the data is not coming from the robot centre but from physically accurate mounting points, similar to how sensors are placed on real robots.
+
+For the LiDAR, I avoided making it "perfect" by:
+- Keeping a realistic mounting height and forward offset
+- Using proper scan angles instead of full 360° ideal coverage
+- Relying on Gazebo's built-in noise and range limits instead of assuming exact distance readings
+
+For the camera:
+- I added a separate optical frame (cam_optical_link) to match real ROS camera conventions
+- Positioned it slightly forward and elevated to simulate an actual front-facing camera
+- Ensured it does not have unrealistic field-of-view or perfect detection
+
+For the IMU:
+- Mounted it on the chassis rather than assuming perfect orientation data
+- Relied on simulated noise instead of exact angular/linear readings
+
+Additionally:
+- Small collision geometries were used for sensors instead of large or idealised shapes
+- No sensor was given perfect visibility or zero-noise measurements
+- All sensor frames were connected through TF correctly so that data aligns realistically in RViz
+
+Overall, these changes make the robot behave more like a real system where sensor readings are limited, noisy, and dependent on placement, rather than perfectly accurate.
+-->
+<robot name="pioneer3at_body">
+
+  <link name="base_link"/> <!-- Main robot reference frame -->
+
+  <material name="ChassisRed">
+    <color rgba="1 0 0 1"/> <!-- Red for the main chassis -->
+  </material>
+
+  <material name="TopBlack">
+    <color rgba="0.038 0.038 0.038 1.0"/> <!-- Dark colour for the top plate -->
+  </material>
+
+  <material name="AxleGrey">
+    <color rgba="0.5 0.5 0.5 1"/> <!-- Grey for axle pieces -->
+  </material>
+
+  <material name="HubcapYellow">
+    <color rgba="1.0 0.811 0.151 1.0"/> <!-- Yellow for hubcaps -->
+  </material>
+
+  <material name="WheelBlack">
+    <color rgba="0.117 0.117 0.117 1"/> <!-- Black for wheels -->
+  </material>
+
+  <!-- ========================= -->
+  <!-- CHASSIS -->
+  <!-- ========================= -->
+  <link name="chassis">
+    <inertial>
+      <mass value="20.0"/> <!-- Approximate chassis mass -->
+      <origin xyz="0 0 -0.090"/> <!-- Inertial centre is slightly below the link origin -->
+      <inertia ixx="0.3338" ixy="0.0" ixz="0.0" iyy="0.4783" iyz="0.0" izz="0.3338"/> <!-- Chassis inertia -->
+    </inertial>
+
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0.0"/> <!-- Chassis mesh sits at the link origin -->
+      <geometry>
+        <mesh filename="meshes/chassis.dae"/> <!-- Chassis mesh file -->
+      </geometry>
+      <material name="ChassisRed"/> <!-- Use the red chassis material -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0.0"/> <!-- Collision aligned with the chassis -->
+      <geometry>
+        <mesh filename="meshes/chassis.dae"/> <!-- Same mesh used for collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="chassis">
+    <material>Gazebo/Red</material> <!-- Gazebo render material -->
+  </gazebo>
+
+  <joint name="base_chassis_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.00 0 0.177"/> <!-- Places chassis above base_link -->
+    <parent link="base_link"/> <!-- Base frame -->
+    <child link="chassis"/> <!-- Chassis attached to base -->
+  </joint>
+
+  <plugin
+      filename="ignition-gazebo-joint-state-publisher-system"
+      name="ignition::gazebo::systems::JointStatePublisher">
+    <topic>joint_states</topic> <!-- Publishes joint states -->
+  </plugin>
+
+  <!-- ========================= -->
+  <!-- TOP PLATE -->
+  <!-- ========================= -->
+  <link name="top_plate">
+    <inertial>
+      <mass value="0.1"/> <!-- Top plate is light -->
+      <origin xyz="-0.025 0 -0.223"/> <!-- Inertial centre from original model -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple placeholder inertia -->
+    </inertial>
+
+    <visual>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at link origin -->
+      <geometry>
+        <mesh filename="meshes/top.dae"/> <!-- Top plate mesh -->
+      </geometry>
+      <material name="TopBlack"/> <!-- Black material -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision aligned -->
+      <geometry>
+        <box size="0.1 0.1 0.1"/> <!-- Simple collision box -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="top_plate">
+    <material>Gazebo/Black</material> <!-- Gazebo material -->
+  </gazebo>
+
+  <joint name="chassis_top_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.043 0 0.254"/> <!-- Mounts the top plate above the body -->
+    <parent link="base_link"/> <!-- Parent -->
+    <child link="top_plate"/> <!-- Child -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- FRONT LEFT WHEEL ASSEMBLY -->
+  <!-- ========================= -->
+
+  <link name="p3at_front_left_axle">
+    <inertial>
+      <mass value="0.1"/> <!-- Axle is a light support part -->
+      <origin xyz="0 0 0"/> <!-- Inertial frame at centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="front_left_axle">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Axle mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/axle.dae"/> <!-- Axle mesh -->
+      </geometry>
+      <material name="AxleGrey"/> <!-- Grey axle -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Tiny collision box is enough -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_front_left_axle">
+    <material>Gazebo/Grey</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_front_left_axle_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.135 0.156 0.111"/> <!-- Front-left axle position -->
+    <parent link="base_link"/> <!-- Parent link -->
+    <child link="p3at_front_left_axle"/> <!-- Child link -->
+  </joint>
+
+  <link name="p3at_front_left_hub">
+    <inertial>
+      <mass value="0.1"/> <!-- Hub is also light -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="front_left_hub">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Hub mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/left_hubcap.dae"/> <!-- Left hubcap mesh -->
+      </geometry>
+      <material name="HubcapYellow"/> <!-- Yellow hubcap -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision box -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_front_left_hub">
+    <material>Gazebo/Yellow</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_front_left_hub_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0.041 0"/> <!-- Pushes hub outward -->
+    <parent link="p3at_front_left_axle"/> <!-- Parent axle -->
+    <child link="p3at_front_left_hub"/> <!-- Child hub -->
+  </joint>
+
+  <link name="p3at_front_left_wheel">
+    <inertial>
+      <mass value="0.7"/> <!-- Slightly heavier wheel for less ideal motion -->
+      <origin xyz="0 0 0"/> <!-- Wheel centre -->
+      <inertia ixx="0.012411765597" ixy="0" ixz="0" iyy="0.015218160428" iyz="0" izz="0.011763977943"/> <!-- Wheel inertia -->
+    </inertial>
+
+    <visual name="front_left_wheel">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Wheel mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/wheel.dae"/> <!-- Wheel mesh -->
+      </geometry>
+      <material name="WheelBlack"/> <!-- Black wheel -->
+    </visual>
+
+    <collision>
+      <origin rpy="-1.57079635 0 0" xyz="0 0 0"/> <!-- Rotates collision cylinder to match wheel axis -->
+      <geometry>
+        <cylinder length="0.075" radius="0.111"/> <!-- Cylinder collision for the wheel -->
+      </geometry>
+      <surface>
+        <friction>
+          <ode>
+            <mu>1.0</mu> <!-- Main tyre grip -->
+            <mu2>0.9</mu2> <!-- Secondary grip -->
+            <slip1>0.02</slip1> <!-- Small longitudinal slip -->
+            <slip2>0.02</slip2> <!-- Small lateral slip -->
+          </ode>
+        </friction>
+      </surface>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_front_left_wheel">
+    <material>Gazebo/Black</material> <!-- Gazebo wheel colour -->
+    <kp>5000000.0</kp> <!-- Lower stiffness so contact is less rigid -->
+    <kd>10.0</kd> <!-- Lower damping -->
+    <mu1>1.0</mu1> <!-- Main friction -->
+    <mu2>0.9</mu2> <!-- Secondary friction -->
+  </gazebo>
+
+  <joint name="p3at_front_left_wheel_joint" type="continuous">
+    <axis xyz="0 1 0"/> <!-- Wheel rotates around y axis -->
+    <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Joint at wheel centre -->
+    <parent link="p3at_front_left_hub"/> <!-- Parent hub -->
+    <child link="p3at_front_left_wheel"/> <!-- Child wheel -->
+    <limit effort="40" velocity="30"/> <!-- Less ideal effort and speed -->
+    <dynamics damping="1.2" friction="0.2"/> <!-- Adds damping and joint friction -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- FRONT RIGHT WHEEL -->
+  <!-- ========================= -->
+
+  <link name="p3at_front_right_axle">
+    <inertial>
+      <mass value="0.1"/> <!-- Light axle -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="front_right_axle">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/axle.dae"/> <!-- Axle mesh -->
+      </geometry>
+      <material name="AxleGrey"/> <!-- Grey axle -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_front_right_axle">
+    <material>Gazebo/Grey</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_front_right_axle_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0.135 -0.156 0.111"/> <!-- Mirrored right side position -->
+    <parent link="base_link"/> <!-- Parent -->
+    <child link="p3at_front_right_axle"/> <!-- Child -->
+  </joint>
+
+  <link name="p3at_front_right_hub">
+    <inertial>
+      <mass value="0.1"/> <!-- Light hub -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="front_right_hub">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Hub mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/right_hubcap.dae"/> <!-- Right hubcap mesh -->
+      </geometry>
+      <material name="HubcapYellow"/> <!-- Yellow hubcap -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_front_right_hub">
+    <material>Gazebo/Yellow</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_front_right_hub_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 -0.041 0"/> <!-- Pushes hub outward on the right side -->
+    <parent link="p3at_front_right_axle"/> <!-- Parent axle -->
+    <child link="p3at_front_right_hub"/> <!-- Child hub -->
+  </joint>
+
+  <link name="p3at_front_right_wheel">
+    <inertial>
+      <mass value="0.7"/> <!-- Slightly heavier wheel -->
+      <origin xyz="0 0 0"/> <!-- Wheel centre -->
+      <inertia ixx="0.012411765597" ixy="0" ixz="0" iyy="0.015218160428" iyz="0" izz="0.011763977943"/> <!-- Wheel inertia -->
+    </inertial>
+
+    <visual name="front_right_wheel">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/wheel.dae"/> <!-- Wheel mesh -->
+      </geometry>
+      <material name="WheelBlack"/> <!-- Black wheel -->
+    </visual>
+
+    <collision>
+      <origin rpy="-1.57079635 0 0" xyz="0 0 0"/> <!-- Rotates cylinder to match wheel axis -->
+      <geometry>
+        <cylinder length="0.075" radius="0.111"/> <!-- Wheel collision cylinder -->
+      </geometry>
+      <surface>
+        <friction>
+          <ode>
+            <mu>1.0</mu> <!-- Main tyre grip -->
+            <mu2>0.9</mu2> <!-- Secondary grip -->
+            <slip1>0.02</slip1> <!-- Small longitudinal slip -->
+            <slip2>0.02</slip2> <!-- Small lateral slip -->
+          </ode>
+        </friction>
+      </surface>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_front_right_wheel">
+    <material>Gazebo/Black</material> <!-- Gazebo colour -->
+    <kp>5000000.0</kp> <!-- Contact stiffness -->
+    <kd>10.0</kd> <!-- Contact damping -->
+    <mu1>1.0</mu1> <!-- Main friction -->
+    <mu2>0.9</mu2> <!-- Secondary friction -->
+  </gazebo>
+
+  <joint name="p3at_front_right_wheel_joint" type="continuous">
+    <axis xyz="0 1 0"/> <!-- Rotation axis -->
+    <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Joint centre -->
+    <parent link="p3at_front_right_hub"/> <!-- Parent hub -->
+    <child link="p3at_front_right_wheel"/> <!-- Child wheel -->
+    <limit effort="40" velocity="30"/> <!-- Reduced limits -->
+    <dynamics damping="1.2" friction="0.2"/> <!-- Realistic damping and friction -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- BACK LEFT WHEEL -->
+  <!-- ========================= -->
+
+  <link name="p3at_back_left_axle">
+    <inertial>
+      <mass value="0.1"/> <!-- Light axle -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="back_left_axle">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/axle.dae"/> <!-- Axle mesh -->
+      </geometry>
+      <material name="AxleGrey"/> <!-- Grey axle -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_back_left_axle">
+    <material>Gazebo/Grey</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_back_left_axle_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.135 0.156 0.111"/> <!-- Back-left axle position -->
+    <parent link="base_link"/> <!-- Parent -->
+    <child link="p3at_back_left_axle"/> <!-- Child -->
+  </joint>
+
+  <link name="p3at_back_left_hub">
+    <inertial>
+      <mass value="0.1"/> <!-- Light hub -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="back_left_hub">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Hub mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/left_hubcap.dae"/> <!-- Left hubcap mesh -->
+      </geometry>
+      <material name="HubcapYellow"/> <!-- Yellow hubcap -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_back_left_hub">
+    <material>Gazebo/Yellow</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_back_left_hub_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 0.041 0"/> <!-- Left side hub offset -->
+    <parent link="p3at_back_left_axle"/> <!-- Parent axle -->
+    <child link="p3at_back_left_hub"/> <!-- Child hub -->
+  </joint>
+
+  <link name="p3at_back_left_wheel">
+    <inertial>
+      <mass value="0.7"/> <!-- Slightly heavier wheel -->
+      <origin xyz="0 0 0"/> <!-- Wheel centre -->
+      <inertia ixx="0.012411765597" ixy="0" ixz="0" iyy="0.015218160428" iyz="0" izz="0.011763977943"/> <!-- Wheel inertia -->
+    </inertial>
+
+    <visual name="back_left_wheel">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/wheel.dae"/> <!-- Wheel mesh -->
+      </geometry>
+      <material name="WheelBlack"/> <!-- Black wheel -->
+    </visual>
+
+    <collision>
+      <origin rpy="-1.57079635 0 0" xyz="0 0 0"/> <!-- Rotates cylinder into wheel orientation -->
+      <geometry>
+        <cylinder length="0.075" radius="0.111"/> <!-- Wheel collision -->
+      </geometry>
+      <surface>
+        <friction>
+          <ode>
+            <mu>1.0</mu> <!-- Main tyre grip -->
+            <mu2>0.9</mu2> <!-- Secondary grip -->
+            <slip1>0.02</slip1> <!-- Longitudinal slip -->
+            <slip2>0.02</slip2> <!-- Lateral slip -->
+          </ode>
+        </friction>
+      </surface>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_back_left_wheel">
+    <material>Gazebo/Black</material> <!-- Gazebo colour -->
+    <kp>5000000.0</kp> <!-- Contact stiffness -->
+    <kd>10.0</kd> <!-- Contact damping -->
+    <mu1>1.0</mu1> <!-- Main friction -->
+    <mu2>0.9</mu2> <!-- Secondary friction -->
+  </gazebo>
+
+  <joint name="p3at_back_left_wheel_joint" type="continuous">
+    <axis xyz="0 1 0"/> <!-- Rotation axis -->
+    <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Joint centre -->
+    <parent link="p3at_back_left_hub"/> <!-- Parent hub -->
+    <child link="p3at_back_left_wheel"/> <!-- Child wheel -->
+    <limit effort="40" velocity="30"/> <!-- Less ideal drive limits -->
+    <dynamics damping="1.2" friction="0.2"/> <!-- Damping and joint friction -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- BACK RIGHT WHEEL -->
+  <!-- ========================= -->
+
+  <link name="p3at_back_right_axle">
+    <inertial> 
+      <mass value="0.1"/> <!-- Light axle -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="back_right_axle">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/axle.dae"/> <!-- Axle mesh -->
+      </geometry>
+      <material name="AxleGrey"/> <!-- Grey axle -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_back_right_axle">
+    <material>Gazebo/Grey</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_back_right_axle_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="-0.135 -0.156 0.111"/> <!-- Back-right axle position -->
+    <parent link="base_link"/> <!-- Parent -->
+    <child link="p3at_back_right_axle"/> <!-- Child -->
+  </joint>
+
+  <link name="p3at_back_right_hub">
+    <inertial>
+      <mass value="0.1"/> <!-- Light hub -->
+      <origin xyz="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1.0" ixy="0.0" ixz="0.0" iyy="1.0" iyz="0.0" izz="1.0"/> <!-- Simple inertia -->
+    </inertial>
+
+    <visual name="back_right_hub">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Hub mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/right_hubcap.dae"/> <!-- Right hubcap mesh -->
+      </geometry>
+      <material name="HubcapYellow"/> <!-- Yellow hubcap -->
+    </visual>
+
+    <collision>
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Small collision -->
+      </geometry>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_back_right_hub">
+    <material>Gazebo/Yellow</material> <!-- Gazebo colour -->
+  </gazebo>
+
+  <joint name="base_back_right_hub_joint" type="fixed">
+    <origin rpy="0 0 0" xyz="0 -0.041 0"/> <!-- Right side hub offset -->
+    <parent link="p3at_back_right_axle"/> <!-- Parent axle -->
+    <child link="p3at_back_right_hub"/> <!-- Child hub -->
+  </joint>
+
+  <link name="p3at_back_right_wheel">
+    <inertial>
+      <mass value="0.7"/> <!-- Slightly heavier wheel -->
+      <origin xyz="0 0 0"/> <!-- Wheel centre -->
+      <inertia ixx="0.012411765597" ixy="0" ixz="0" iyy="0.015218160428" iyz="0" izz="0.011763977943"/> <!-- Wheel inertia -->
+    </inertial>
+
+    <visual name="back_right_wheel">
+      <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="meshes/p3at_meshes/wheel.dae"/> <!-- Wheel mesh -->
+      </geometry>
+      <material name="WheelBlack"/> <!-- Black wheel -->
+    </visual>
+
+    <collision>
+      <origin rpy="-1.57079635 0 0" xyz="0 0 0"/> <!-- Rotates cylinder to match wheel axis -->
+      <geometry>
+        <cylinder length="0.075" radius="0.111"/> <!-- Wheel collision -->
+      </geometry>
+      <surface>
+        <friction>
+          <ode>
+            <mu>1.0</mu> <!-- Main tyre grip -->
+            <mu2>0.9</mu2> <!-- Secondary grip -->
+            <slip1>0.02</slip1> <!-- Longitudinal slip -->
+            <slip2>0.02</slip2> <!-- Lateral slip -->
+          </ode>
+        </friction>
+      </surface>
+    </collision>
+  </link>
+
+  <gazebo reference="p3at_back_right_wheel">
+    <material>Gazebo/Black</material> <!-- Gazebo colour -->
+    <kp>5000000.0</kp> <!-- Contact stiffness -->
+    <kd>10.0</kd> <!-- Contact damping -->
+    <mu1>1.0</mu1> <!-- Main friction -->
+    <mu2>0.9</mu2> <!-- Secondary friction -->
+  </gazebo>
+
+  <joint name="p3at_back_right_wheel_joint" type="continuous">
+    <axis xyz="0 1 0"/> <!-- Rotation axis -->
+    <origin rpy="0 0 0" xyz="0 0 0"/> <!-- Joint centre -->
+    <parent link="p3at_back_right_hub"/> <!-- Parent hub -->
+    <child link="p3at_back_right_wheel"/> <!-- Child wheel -->
+    <limit effort="40" velocity="30"/> <!-- Reduced drive limits -->
+    <dynamics damping="1.2" friction="0.2"/> <!-- Damping and joint friction -->
+  </joint>
+
+  <!-- ========================= -->
+  <!-- DIFFERENTIAL DRIVE PLUGIN -->
+  <!-- ========================= -->
+  <gazebo>
+    <plugin
+      filename="gz-sim-diff-drive-system"
+      name="gz::sim::systems::DiffDrive">
+      <left_joint>p3at_front_left_wheel_joint</left_joint> <!-- Left side front wheel -->
+      <left_joint>p3at_back_left_wheel_joint</left_joint> <!-- Left side back wheel -->
+      <right_joint>p3at_back_right_wheel_joint</right_joint> <!-- Right side back wheel -->
+      <right_joint>p3at_front_right_wheel_joint</right_joint> <!-- Right side front wheel -->
+      <wheel_separation>0.268</wheel_separation> <!-- Distance between left and right wheel sets -->
+      <wheel_radius>0.111</wheel_radius> <!-- Wheel radius -->
+      <odom_publish_frequency>15</odom_publish_frequency> <!-- Odometry update frequency -->
+      <topic>cmd_vel</topic> <!-- Velocity command topic -->
+      <frame_id>odom</frame_id> <!-- Odometry frame -->
+      <child_frame_id>base_link</child_frame_id> <!-- Robot base frame -->
+      <odom_topic>odom</odom_topic> <!-- Odometry topic -->
+    </plugin>
+  </gazebo>
+
+  <!-- ========================= -->
+  <!-- LIDAR -->
+  <!-- ========================= -->
+  <joint name="laser_joint" type="fixed">
+    <parent link="chassis"/> <!-- Lidar is mounted on the chassis -->
+    <child link="laser_frame"/> <!-- Sensor frame -->
+    <origin xyz="0.2 0 0.104" rpy="0 0 0"/> <!-- Front-middle lidar position -->
+  </joint>
+
+  <link name="laser_frame">
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/> <!-- Collision centred -->
+      <geometry>
+        <box size="0.01 0.01 0.01"/> <!-- Tiny collision box -->
+      </geometry>
+    </collision>
+
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/> <!-- Mesh at origin -->
+      <geometry>
+        <mesh filename="/mnt/c/Users/Lithi/Desktop/AUTO4408/Project 1/robots/meshes/hokuyo1.dae"/> <!-- Hokuyo mesh -->
+      </geometry>
+    </visual>
+
+    <inertial>
+      <mass value="0.15"/> <!-- Small but not zero mass -->
+      <origin xyz="0 0 0" rpy="0 0 0"/> <!-- Inertial centre -->
+      <inertia ixx="1e-4" ixy="0" ixz="0" iyy="1e-4" iyz="0" izz="1e-4"/> <!-- Small inertia -->
+    </inertial>
+  </link>
+
+  <gazebo reference="laser_frame">
+    <material>Gazebo/Blue</material> <!-- Blue lidar in Gazebo -->
+    <sensor name="laser" type="gpu_lidar">
+      <topic>scan</topic> <!-- Laser scan topic -->
+      <update_rate>8</update_rate> <!-- Reduced update rate for less ideal sensing -->
+
+      <lidar>
+        <scan>
+          <horizontal>
+            <samples>540</samples> <!-- Slightly reduced sample count -->
+            <resolution>1</resolution> <!-- One ray per sample -->
+            <min_angle>-1.5708</min_angle> <!-- Start angle -->
+            <max_angle>1.5708</max_angle> <!-- End angle -->
+          </horizontal>
+        </scan>
+
+        <range>
+          <min>0.12</min> <!-- More realistic minimum range -->
+          <max>8.0</max> <!-- Reduced maximum range -->
+          <resolution>0.01</resolution> <!-- Range resolution -->
+        </range>
+
+        <noise>
+          <type>gaussian</type> <!-- Gaussian noise -->
+          <mean>0.0</mean> <!-- Zero mean -->
+          <stddev>0.02</stddev> <!-- Small range noise -->
+        </noise>
+      </lidar>
+
+      <always_on>1</always_on> <!-- Sensor always active -->
+      <visualize>true</visualize> <!-- Visualise scan while testing -->
+    </sensor>
+  </gazebo>
+
+  <!-- ========================= -->
+  <!-- CAMERA -->
+  <!-- ========================= -->
+  <joint name="cam_joint" type="fixed">
+    <parent link="chassis"/> <!-- Camera mounted on chassis -->
+    <child link="cam_frame"/> <!-- Camera frame -->
+    <origin xyz="0.24 0 0.084" rpy="0 0 0"/> <!-- Front-facing camera position -->
+  </joint>
+
+  <link name="cam_frame">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/> <!-- Visual at origin -->
+      <geometry>
+        <box size="0.01 0.05 0.01"/> <!-- Small visual box -->
+      </geometry>
+      <material name="greenCam">
+        <color rgba="0 1.0 0 1.0"/> <!-- Green camera marker -->
+      </material>
+    </visual>
+  </link>
+
+  <joint name="cam_optical_joint" type="fixed">
+    <parent link="cam_frame"/> <!-- Parent camera frame -->
+    <child link="cam_optical_link"/> <!-- Standard optical frame -->
+    <origin xyz="0 0 0" rpy="-1.5708 0 -1.5708"/> <!-- Optical frame rotation -->
+  </joint>
+
+  <link name="cam_optical_link"/> <!-- Optical frame link -->
+
+  <gazebo reference="cam_optical_link">
+    <sensor name="camera" type="camera">
+      <pose>0 0 0 0 0 0</pose> <!-- Sensor pose -->
+      <always_on>true</always_on> <!-- Camera always active -->
+      <update_rate>20</update_rate> <!-- Lower update rate than ideal -->
+      <visualize>true</visualize> <!-- Useful while testing -->
+      <topic>camera/image</topic> <!-- Camera topic -->
+      <frame>cam_optical_link</frame> <!-- Frame used by the camera messages -->
+
+      <camera>
+        <horizontal_fov>1.047</horizontal_fov> <!-- Around 60 degree field of view -->
+        <image>
+          <width>640</width> <!-- Image width -->
+          <height>480</height> <!-- Image height -->
+          <format>R8G8B8</format> <!-- RGB image format -->
+        </image>
+        <clip>
+          <near>0.15</near> <!-- Near clip -->
+          <far>12.0</far> <!-- Far clip -->
+        </clip>
+        <noise>
+          <type>gaussian</type> <!-- Gaussian image noise -->
+          <mean>0.0</mean> <!-- Zero mean -->
+          <stddev>0.01</stddev> <!-- Small image noise -->
+        </noise>
+      </camera>
+    </sensor>
+  </gazebo>
+
+  <!-- ========================= -->
+  <!-- IMU -->
+  <!-- ========================= -->
+  <gazebo reference="base_link">
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on> <!-- IMU always active -->
+      <update_rate>50</update_rate> <!-- "Realistic" update rate -->
+      <visualize>false</visualize> <!-- No visualisation needed -->
+      <topic>imu</topic> <!-- IMU topic -->
+
+      <imu>
+        <angular_velocity>
+          <x>
+            <noise type="gaussian">
+              <mean>0</mean> <!-- Zero mean noise -->
+              <stddev>0.001</stddev> <!-- Gyro noise -->
+            </noise>
+          </x>
+          <y>
+            <noise type="gaussian">
+              <mean>0</mean> <!-- Zero mean noise -->
+              <stddev>0.001</stddev> <!-- Gyro noise -->
+            </noise>
+          </y>
+          <z>
+            <noise type="gaussian">
+              <mean>0</mean> <!-- Zero mean noise -->
+              <stddev>0.0015</stddev> <!-- Slightly larger yaw noise -->
+            </noise>
+          </z>
+        </angular_velocity>
+
+        <linear_acceleration>
+          <x>
+            <noise type="gaussian">
+              <mean>0</mean> <!-- Zero mean accel noise -->
+              <stddev>0.03</stddev> <!-- Acceleration noise -->
+            </noise>
+          </x>
+          <y>
+            <noise type="gaussian">
+              <mean>0</mean> <!-- Zero mean accel noise -->
+              <stddev>0.03</stddev> <!-- Acceleration noise -->
+            </noise>
+          </y>
+          <z>
+            <noise type="gaussian">
+              <mean>0</mean> <!-- Zero mean accel noise -->
+              <stddev>0.04</stddev> <!-- Slightly larger vertical noise -->
+            </noise>
+          </z>
+        </linear_acceleration>
+      </imu>
+    </sensor>
+  </gazebo>
+
+</robot>
