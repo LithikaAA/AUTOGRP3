@@ -7,7 +7,7 @@ def generate_launch_description():
         Node(
             package='ariaNode',
             executable='ariaNode',
-            arguments=['-remoteHost', '192.168.1.32'],
+            arguments=['-remoteHost', '192.168.2.213'],
             output='screen'
         ),
         Node(
