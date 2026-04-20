@@ -2,6 +2,11 @@
 
 import math
 import rclpy
+
+# for nav files in ws
+import os
+from ament_index_python.packages import get_package_share_directory
+
 from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
@@ -69,7 +74,11 @@ class WaypointController(Node):
         # ----------- LOAD WAYPOINTS FROM FILE -----------
         self.waypoints = []
 
-        file_path = "/mnt/c/Users/Lithi/Desktop/AUTO4408/Project 1/waypoints.txt"
+        # file_path = "/mnt/c/Users/Lithi/Desktop/AUTO4408/Project 1/waypoints.txt"
+        file_path = os.path.join(
+            get_package_share_directory('pioneer_nav'),
+            'waypoint.txt'
+        )
 
         try:
             with open(file_path, "r") as f:
