@@ -38,6 +38,7 @@ ament_target_dependencies(ariaNode
 
 target_link_libraries(
   ariaNode
+  # Aria
   libAria.so
 )
 

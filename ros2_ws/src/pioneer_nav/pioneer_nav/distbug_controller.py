@@ -3,9 +3,20 @@
 import math
 import time
 import rclpy
+
+# for nav files in ws
+import os
+from ament_index_python.packages import get_package_share_directory
+
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, PoseArray
+
+# from geometry_msgs.msg import Twist, PoseArray
+from geometry_msgs.msg import Twist
+from sensor_msgs.msg import NavSatFix
+from nav_msgs.msg import Odometry
+
 from sensor_msgs.msg import LaserScan
+
 
 
 # this helper is so i can limit values like speeds/turn rates
@@ -59,8 +70,13 @@ class WaypointController(Node):
         # I load the waypoints from a text file so I can test different paths
         # easily without touching the actual controller logic.
         self.waypoints = []
-        file_path = "/mnt/c/Users/Lithi/Desktop/AUTO4408/Project 1/ros2_ws/src/pioneer_nav/waypoint.txt"
-        
+        # file_path = "/mnt/c/Users/Lithi/Desktop/AUTO4408/Project 1/ros2_ws/src/pioneer_nav/waypoint.txt"
+
+        file_path = os.path.join(
+            get_package_share_directory('pioneer_nav'),
+            'waypoint.txt'
+        )
+
         try:
             with open(file_path, "r") as f:
                 for line in f:
@@ -69,8 +85,10 @@ class WaypointController(Node):
                         continue
                     
                     # Each line is x y yaw, so I unpack them straight into floats.
-                    x, y, yaw = map(float, line.split())
-                    self.waypoints.append((x, y, yaw))
+                    # x, y, yaw = map(float, line.split())
+                    # self.waypoints.append((x, y, yaw))
+                    lat, lon, yaw = map(float, line.split())
+                    self.waypoints.append((lat, lon, yaw))
                     
             self.get_logger().info(f"Loaded {len(self.waypoints)} waypoints.")
             
@@ -192,12 +210,15 @@ class WaypointController(Node):
         
         # Subscribe to Gazebo world pose instead of odom because I wanted the controller
         # to use the actual Gazebo position directly.
-        self.pose_sub = self.create_subscription(
-            PoseArray,
-            self.world_pose_topic,
-            self.world_pose_callback,
-            10
-        )
+        # origin for converting GPS to x,y
+        self.origin_lat = None
+        self.origin_lon = None
+
+        self.gps_sub = self.create_subscription(
+            NavSatFix, '/fix', self.gps_callback, 10)
+
+        self.odom_sub = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10)
         
         # Subscribe to lidar scan for obstacle detection.
         self.scan_sub = self.create_subscription(
@@ -282,33 +303,32 @@ class WaypointController(Node):
 
         return blocked_front or blocked_front_left
     
-    def world_pose_callback(self, msg):
-        # If Gazebo gives no poses, there is nothing to update.
-        if len(msg.poses) == 0:
-            return
-        
-        # This protects against picking an index that doesn’t exist.
-        if self.robot_pose_index >= len(msg.poses):
-            self.get_logger().warn(
-                f"robot_pose_index {self.robot_pose_index} out of range. "
-                f"PoseArray has {len(msg.poses)} poses."
-            )
-            return
-        
-        pose = msg.poses[self.robot_pose_index]
-        
-        # Save the robot’s current position from Gazebo.
-        self.current_x = pose.position.x
-        self.current_y = pose.position.y
-        self.current_yaw = quaternion_to_yaw(
-            pose.orientation.x,
-            pose.orientation.y,
-            pose.orientation.z,
-            pose.orientation.w
-        )
-        
-        # Store time so I can check later whether pose data has timed out.
+    def gps_callback(self, msg):
+        if self.origin_lat is None:
+            # first fix becomes our origin
+            self.origin_lat = msg.latitude
+            self.origin_lon = msg.longitude
+            self.get_logger().info(f"GPS origin set: {self.origin_lat}, {self.origin_lon}")
+
+        R = 6371000
+        dlat = math.radians(msg.latitude - self.origin_lat)
+        dlon = math.radians(msg.longitude - self.origin_lon)
+        self.current_x = dlon * R * math.cos(math.radians(self.origin_lat))
+        self.current_y = dlat * R
         self.last_pose_time = self.get_clock().now()
+
+    def odom_callback(self, msg):
+        # use odom just for yaw since GPS has no heading
+        q = msg.pose.pose.orientation
+        self.current_yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
+
+    def gps_to_local(self, lat, lon):
+        R = 6371000
+        dlat = math.radians(lat - self.origin_lat)
+        dlon = math.radians(lon - self.origin_lon)
+        x = dlon * R * math.cos(math.radians(self.origin_lat))
+        y = dlat * R
+        return x, y
         
     def scan_callback(self, msg):
         # Store all the scan info I need for sector checks.
@@ -464,9 +484,12 @@ class WaypointController(Node):
             self.get_logger().warn("Pose or scan data timed out")
             return
         
-        # Basic geometry to the current goal.
-        dx = self.goal_x - self.current_x
-        dy = self.goal_y - self.current_y
+        # Convert GPS waypoint (lat, lon) → local x,y
+        goal_x, goal_y = self.gps_to_local(self.goal_x, self.goal_y)
+
+        dx = goal_x - self.current_x
+        dy = goal_y - self.current_y
+
         
         distance_error = math.hypot(dx, dy)
         target_heading = math.atan2(dy, dx)
