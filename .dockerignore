@@ -1,0 +1,6 @@
+.git
+.gitignore
+*.zip
+*.tar
+*.bag
+__pycache__
