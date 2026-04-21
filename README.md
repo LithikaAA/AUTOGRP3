@@ -56,6 +56,9 @@ docker build -t pioneer_jazzy .
 
 ```
 docker run -it --privileged --device=/dev/ttyUSB0 --network=host pioneer_jazzy
+
+# or sometimes (for controller i think?)
+docker run -it --privileged --device=/dev/ttyUSB0 --device=/dev/input/js0 --network=host pioneer_jazzy
 ```
 
 ---
