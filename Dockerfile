@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y \
     # keyboard teleop
     ros-jazzy-teleop-twist-keyboard \
     ros-jazzy-diagnostic-updater \
+    # lidar
+    ros-jazzy-sick-scan-xd \
     && rm -rf /var/lib/apt/lists/*
 
 # Locale
