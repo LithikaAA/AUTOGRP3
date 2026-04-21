@@ -93,5 +93,3 @@ ros2 run ariaNode ariaNode --rp /dev/ttyUSB0
 ```
 
 ---
-
-If you want, I can format this as a proper `README.md` file with headings, code blocks, and optional sections like “Troubleshooting” or “Project Overview.”
