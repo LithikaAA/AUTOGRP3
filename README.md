@@ -10,7 +10,7 @@ ssh team3@192.168.2.101   # Bot 1
 ```
 
 #### **If using hotspot**
-First check the bot’s IP:
+First check the bot’s IP (under the docker flags section I believe) - open terminal on bot from bottom left cog button:
 
 ```
 ifconfig
@@ -19,6 +19,8 @@ ifconfig
 Then SSH in:
 
 ```
+ssh team3@<ip>
+# for example (below is Rosa's phone hotspot)
 ssh team3@172.20.10.4
 ```
 
