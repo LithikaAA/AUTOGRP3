@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-nmea-navsat-driver \
     # keyboard teleop
     ros-jazzy-teleop-twist-keyboard \
+    python3-opencv \
+    ros-jazzy-cv-bridge \
     # lidar
     ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
@@ -41,8 +43,6 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 COPY ros2_ws/src /ros2_ws/src
 COPY ariaNode /ros2_ws/src/ariaNode
 
-# Python deps
-RUN pip3 install --no-cache-dir numpy --break-system-packages
 
 # Build workspace
 WORKDIR /ros2_ws
