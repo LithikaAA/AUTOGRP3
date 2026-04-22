@@ -1,7 +1,7 @@
 # ROS 2 Jazzy on Ubuntu 24.04
 FROM ros:jazzy-ros-core
 
-# Fix apt networking issues
+# Fix apt networking issues (forces IPv4)
 RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
 
 # Basic tools + ROS Jazzy packages
