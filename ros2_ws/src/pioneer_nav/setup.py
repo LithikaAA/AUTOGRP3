@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'distbug_controller = pioneer_nav.distbug_controller:main',
+            'ps4_basic_drive = pioneer_nav.ps4_basic_drive:main',
         ],
     },
 )
