@@ -103,10 +103,10 @@ class Part2MissionController(Node):
         # -------------------------
         self.declare_parameter("gps_topic", "/fix")
         self.declare_parameter("scan_topic", "/scan")
-        self.declare_parameter("image_topic", "/camera/image")
+        self.declare_parameter("image_topic", "/camera/image_raw")
         self.declare_parameter("joy_topic", "/joy")
         self.declare_parameter("imu_topic", "/imu/data")
-        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("cmd_vel_topic", "/cmd_vel_auto")
 
         # waypoint list as lat, lon pairs flattened
         self.declare_parameter(
@@ -123,7 +123,7 @@ class Part2MissionController(Node):
         self.declare_parameter("joy_axis_linear", 1)      # left stick vertical
         self.declare_parameter("joy_axis_angular", 0)     # left stick horizontal
         self.declare_parameter("joy_deadman_axis", 5)     # right trigger / back pedal
-        self.declare_parameter("joy_auto_button", 2)      # X button
+        self.declare_parameter("joy_auto_button", 0)      # X button
         self.declare_parameter("joy_manual_button", 1)    # O button
 
         # control tuning
@@ -595,9 +595,10 @@ class Part2MissionController(Node):
         self.publish_cmd(self.manual_linear, self.manual_angular)
 
     def run_auto(self):
-        if not (self.have_gps and self.have_scan and self.have_image):
+        if not (self.have_gps and self.have_scan):
             self.stop_robot()
             return
+
 
         # dead-man switch required in AUTO mode
         if not self.deadman_pressed:
