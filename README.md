@@ -105,21 +105,27 @@ ros2 run ariaNode ariaNode --rp /dev/ttyUSB0
 (Assuming you’re SSH’d into the robot and inside the Docker container.)
 
 1. **Start ARIA (robot driver)**
-ARIA provides odometry and connects to the Pioneer base.
-`ros2 run ariaNode ariaNode --rp /dev/ttyUSB0`
+ARIA provides odometry and connects to the Pioneer base
+```
+ros2 run ariaNode ariaNode --rp /dev/ttyUSB0
+```
 - Must show **Connected to robot**
 - `/odom` should now publish
 
 2. **Start the SICK TiM7xx LIDAR**
 Your LIDAR is Ethernet-based at IP 192.168.0.1.
-`ros2 launch sick_scan_xd sick_tim_7xx.launch.py hostname:=192.168.0.1`
+```
+ros2 launch sick_scan_xd sick_tim_7xx.launch.py hostname:=192.168.0.1
+```
 - Requires `ros-jazzy-sick-scan-xd` installed in your container
 - `/scan` should begin publishing
 - If package missing, add it to Dockerfile and rebuild
 
 3. **Start the GPS driver**
 GPS provides the `/fix` NavSatFix messages the controller uses for position.
-`ros2 run nmea_navsat_driver nmea_serial_driver --ros-args -p port:=/dev/ttyACM0 -p baud:=9600`
+```
+ros2 run nmea_navsat_driver nmea_serial_driver --ros-args -p port:=/dev/ttyACM0 -p baud:=9600
+```
 - `/fix` should publish at 1–5 Hz
 - First GPS fix becomes the controller’s origin
 
@@ -135,7 +141,9 @@ You MUST see:
 
 5. **Run the DistBug controller (or whatever)**
 Once all sensors are publishing, start your controller.
-`ros2 run pioneer_nav distbug_controller`
+```
+ros2 run pioneer_nav distbug_controller
+```
 - It will load `waypoint.txt`
 - It will print the current waypoint
 - It will switch modes: GO_TO_POINT → WALL_FOLLOW → FIX_YAW
