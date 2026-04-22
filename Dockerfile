@@ -42,7 +42,7 @@ COPY ros2_ws/src /ros2_ws/src
 COPY ariaNode /ros2_ws/src/ariaNode
 
 # Python deps
-RUN pip3 install --no-cache-dir numpy --break-system-packages
+RUN pip3 install --no-cache-dir --break-system-packages
 
 # Build workspace
 WORKDIR /ros2_ws
