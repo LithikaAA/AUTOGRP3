@@ -320,6 +320,7 @@ class WaypointController(Node):
     def odom_callback(self, msg):
         # use odom just for yaw since GPS has no heading
         q = msg.pose.pose.orientation
+        self.last_pose_time = self.get_clock().now()
         self.current_yaw = quaternion_to_yaw(q.x, q.y, q.z, q.w)
 
     def gps_to_local(self, lat, lon):
