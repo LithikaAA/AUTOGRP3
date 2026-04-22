@@ -19,6 +19,8 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-nmea-navsat-driver \
     # keyboard teleop
     ros-jazzy-teleop-twist-keyboard \
+    # lidar
+    ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
     && rm -rf /var/lib/apt/lists/*
 
