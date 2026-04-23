@@ -65,29 +65,34 @@ CMD_VEL_TOPIC  = "/cmd_vel"
 ANNOTATED_TOPIC = "/camera/annotated"   # published back so you can view on laptop
 
 # =============================================================================
-# PS4 BUTTON MAPPING
-# Run: ros2 topic echo /joy   then press each button to verify indices
-# =============================================================================
-BTN_AUTO     = 0    # X     -> AUTO mode
-BTN_MANUAL   = 1    # O     -> MANUAL mode
-BTN_DEADMAN  = 4    # L1    -> hold to move in AUTO
-BTN_FORWARD  = 11   # D-pad up
-BTN_BACK     = 12   # D-pad down
-BTN_LEFT     = 13   # D-pad left
-BTN_RIGHT    = 14   # D-pad right
+# joystick mapping (PS4 defaults)
+        #   axes[0]    = left stick horizontal  (turn)
+        #   axes[1]    = left stick vertical    (forward)
+        #   axes[5]    = R2 trigger             (deadman)
+        #   buttons[0] = X (cross)              -> AUTO
+        #   buttons[1] = O (circle)             -> MANUAL
+        # -------------------------------------------------
+        self.declare_parameter("joy_axis_linear",    1)
+        self.declare_parameter("joy_axis_angular",   0)
+        self.declare_parameter("joy_deadman_axis",   5)
+        self.declare_parameter("joy_auto_button",    0)   # X -> AUTO
+        self.declare_parameter("joy_manual_button",  1)   # O -> MANUAL
 
-# =============================================================================
-# TUNING — adjust these if the robot behaves unexpectedly
-# =============================================================================
-MAX_LINEAR_SPEED         = 0.5    # m/s top speed in auto
-MAX_ANGULAR_SPEED        = 1.0    # rad/s top turn speed
-MANUAL_LINEAR_SPEED      = 0.3    # m/s when holding D-pad
-MANUAL_ANGULAR_SPEED     = 0.6    # rad/s when holding D-pad
-GOAL_RADIUS_M            = 1.5    # metres - how close = waypoint reached
-CONE_STOP_DISTANCE_M     = 1.4    # metres - stop this close to cone
-OBJECT_SEARCH_RADIUS_M   = 4.0    # metres - max range to look for object
-FRONT_OBSTACLE_DIST_M    = 0.9    # metres - soft obstacle avoidance
-CRITICAL_OBSTACLE_DIST_M = 0.5    # metres - hard stop and turn
+        # control tuning
+        self.declare_parameter("max_linear_speed",         0.5)
+        self.declare_parameter("max_angular_speed",        1.0)
+        self.declare_parameter("goal_radius_m",            1.5)
+        self.declare_parameter("cone_stop_distance_m",     1.4)
+        self.declare_parameter("object_search_radius_m",   4.0)
+        self.declare_parameter("front_obstacle_dist_m",    0.9)
+        self.declare_parameter("critical_obstacle_dist_m", 0.5)
+        self.declare_parameter("weave_side_clearance_m",   0.7)
+
+        self.declare_parameter("camera_hfov_rad", 1.089)
+        self.declare_parameter("cone_min_area",   500.0)
+        self.declare_parameter("object_min_area", 350.0)
+        self.declare_parameter("photos_dir",      "mission_photos")
+
 
 # =============================================================================
 # CAMERA / VISION
