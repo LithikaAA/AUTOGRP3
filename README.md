@@ -121,41 +121,32 @@ ros2 launch sick_scan_xd sick_tim_7xx.launch.py hostname:=192.168.0.1
 - `/scan` should begin publishing
 - If package missing, add it to Dockerfile and rebuild
 
-3. **Start the GPS driver**
-GPS provides the `/fix` NavSatFix messages the controller uses for position.
-```
-ros2 run nmea_navsat_driver nmea_serial_driver --ros-args -p port:=/dev/ttyACM0 -p baud:=9600
-```
-- `/fix` should publish at 1–5 Hz
-- First GPS fix becomes the controller’s origin
+3. **Verify all required topics exist**
 
-4. **Verify all required topics exist**
-
-The controller will not run unless all three data streams are alive.
+The controller will not run unless the required data streams are alive.
 `ros2 topic list`
 You MUST see:
 - `/odom`
 - `/scan`
-- `/fix`
+- `/camera/image`
 - `/cmd_vel` (will appear once controller starts)
 
-5. **Run the DistBug controller (or whatever)**
+4. **Run the DistBug controller (or whatever)**
 Once all sensors are publishing, start your controller.
 ```
 ros2 run pioneer_nav distbug_controller
 ```
-- It will load `waypoint.txt`
-- It will print the current waypoint
-- It will switch modes: GO_TO_POINT → WALL_FOLLOW → FIX_YAW
+- It will explore locally using LiDAR and camera detections
+- It only requires local sensors for exploration
 
-6. **Watch the controller output**
+5. **Watch the controller output**
 Confirm the robot is receiving commands.
 `ros2 topic echo /cmd_vel`
 - Values should change as the robot moves
-- If always zero → missing GPS, LIDAR, or odom
+- If always zero, check LIDAR, camera, odom, and deadman
 
-7. **Confirm movement**
+6. **Confirm movement**
 If `/cmd_vel` is non-zero, ARIA will drive the robot.
-- Robot should move toward GPS waypoint
+- Robot should explore locally
 - Will avoid obstacles using LIDAR
-- Will pause at each waypoint
+- Will stop and log camera detections
