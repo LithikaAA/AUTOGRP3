@@ -113,15 +113,15 @@ class Part2MissionController(Node):
         # joystick mapping (PS4 defaults)
         #   axes[0]    = left stick horizontal  (turn)
         #   axes[1]    = left stick vertical    (forward)
-        #   axes[5]    = R2 trigger             (deadman)
         #   buttons[0] = X (cross)              -> AUTO
         #   buttons[1] = O (circle)             -> MANUAL
+        #   buttons[3] = Triangle               -> deadman
         # -------------------------------------------------
         self.declare_parameter("joy_axis_linear",    1)
         self.declare_parameter("joy_axis_angular",   0)
-        self.declare_parameter("joy_deadman_axis",   5)
         self.declare_parameter("joy_auto_button",    0)   # X -> AUTO
         self.declare_parameter("joy_manual_button",  1)   # O -> MANUAL
+        self.declare_parameter("joy_deadman_button", 3)   # Triangle -> deadman
 
         # control tuning
         self.declare_parameter("max_linear_speed",         0.5)
@@ -156,9 +156,9 @@ class Part2MissionController(Node):
 
         self.joy_axis_linear   = int(self.get_parameter("joy_axis_linear").value)
         self.joy_axis_angular  = int(self.get_parameter("joy_axis_angular").value)
-        self.joy_deadman_axis  = int(self.get_parameter("joy_deadman_axis").value)
         self.joy_auto_button   = int(self.get_parameter("joy_auto_button").value)
         self.joy_manual_button = int(self.get_parameter("joy_manual_button").value)
+        self.joy_deadman_button = int(self.get_parameter("joy_deadman_button").value)
 
         self.max_linear_speed         = float(self.get_parameter("max_linear_speed").value)
         self.max_angular_speed        = float(self.get_parameter("max_angular_speed").value)
@@ -244,7 +244,7 @@ class Part2MissionController(Node):
 
         self.get_logger().info("Part 2 mission controller started")
         self.get_logger().info(f"Waypoints loaded: {len(self.gps_waypoints)}")
-        self.get_logger().info("PS4: X=AUTO  O=MANUAL  R2=deadman (hold while in AUTO)")
+        self.get_logger().info("PS4: X=AUTO  O=MANUAL  Triangle=deadman (hold while in AUTO)")
         self.get_logger().info("Keyboard: a=AUTO  m=MANUAL  d=deadman  w/s/q/e/x")
 
         self._keyboard_thread = threading.Thread(target=self.keyboard_thread, daemon=True)
@@ -337,24 +337,24 @@ class Part2MissionController(Node):
             buttons[1] = O (circle)  -> MANUAL
             axes[1]    = left stick up/down  (forward/back)
             axes[0]    = left stick left/right (turn)
-            axes[5]    = R2 trigger  (deadman)
-                         rests at +1.0, fully pressed = -1.0
+            buttons[3] = Triangle -> deadman
         """
         n_buttons = len(msg.buttons)
 
         # guard: log clearly if button indices are wrong
-        max_btn = max(self.joy_auto_button, self.joy_manual_button)
+        max_btn = max(self.joy_auto_button, self.joy_manual_button, self.joy_deadman_button)
         if max_btn >= n_buttons:
             self.get_logger().warn(
                 f"Button index {max_btn} out of range (controller has {n_buttons} buttons). "
-                f"Run 'ros2 topic echo /joy' and check which index is X and O, "
-                f"then update joy_auto_button / joy_manual_button in the launch file.",
+                f"Run 'ros2 topic echo /joy' and check which index is X, O, and Triangle, "
+                f"then update joy_auto_button / joy_manual_button / joy_deadman_button in the launch file.",
                 throttle_duration_sec=5.0
             )
             return
 
         auto_pressed   = bool(msg.buttons[self.joy_auto_button])
         manual_pressed = bool(msg.buttons[self.joy_manual_button])
+        self.deadman_pressed = bool(msg.buttons[self.joy_deadman_button])
 
         # rising edge: X -> AUTO
         if auto_pressed and not self._last_auto_button:
@@ -378,20 +378,6 @@ class Part2MissionController(Node):
 
         self.manual_linear  = clamp(lin_axis, -1.0, 1.0) * self.max_linear_speed
         self.manual_angular = clamp(ang_axis, -1.0, 1.0) * self.max_angular_speed
-
-        # deadman (R2)
-        # handles two common controller types:
-        #   type A (PS4): rests at +1.0, pressed = -1.0
-        #   type B (some generic): rests at 0.0, pressed = +1.0
-        if self.joy_deadman_axis < len(msg.axes):
-            dv = msg.axes[self.joy_deadman_axis]
-            if dv > 0.5:
-                self.deadman_pressed = False   # type A at rest
-            elif dv < -0.1:
-                self.deadman_pressed = True    # type A pressed
-            elif dv > 0.1:
-                self.deadman_pressed = True    # type B pressed
-            # dv == 0.0 means axis hasn't been touched yet - don't change state
 
     # =========================
     # keyboard thread
@@ -622,7 +608,7 @@ class Part2MissionController(Node):
         if not self.deadman_pressed:
             self.stop_robot()
             self.get_logger().warn(
-                "AUTO mode: hold R2 (deadman) to move",
+                "AUTO mode: hold Triangle (deadman) to move",
                 throttle_duration_sec=2.0
             )
             return
