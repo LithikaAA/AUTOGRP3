@@ -1,22 +1,6 @@
 #!/usr/bin/env python3
 
 # AUTO4508 Part 2 - Mission Controller
-# Self-contained - no launch file needed.
-# Run with:
-#   ros2 run pioneer_nav part2_mission_controller
-#
-# PS4 Controller:
-#   X (buttons[0])  = AUTO mode
-#   O (buttons[1])  = MANUAL mode
-#   L1 (buttons[4]) = deadman (hold in AUTO)
-#   D-pad up/down   = forward / back
-#   D-pad left/right = turn left / right
-#
-# Keyboard fallback (if no controller):
-#   a = AUTO    m = MANUAL    d = deadman toggle
-#   w/s = fwd/back    q/e = turn    x = stop
-#
-# Waypoints — edit WAYPOINTS list below to change destinations
 
 import math
 import os
@@ -33,39 +17,100 @@ import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import Twist
 from sensor_msgs.msg import NavSatFix, LaserScan, Image, Joy, Imu
 from cv_bridge import CvBridge
 
 
-# =============================================================================
-# WAYPOINTS — edit these to change where the robot goes
-# Format: (latitude, longitude)
-# Last waypoint should match first to return to start
-# =============================================================================
-WAYPOINTS = [
-    (-31.9804902, 115.8174017),   # WP1
-    (-31.9805027, 115.8174483),   # WP2
-    (-31.9803921, 115.8174755),   # WP3
-    (-31.9804214, 115.8173444),   # WP4
-    (-31.9804902, 115.8174017),   # return to start
-]
+# =========================
+# helper functions
+# =========================
 
-# =============================================================================
-# TOPICS — change these if your robot uses different topic names
-# =============================================================================
-GPS_TOPIC      = "/fix"
-SCAN_TOPIC     = "/scan"
-IMAGE_TOPIC    = "/camera/image"
-IMU_TOPIC      = "/imu/data"
-JOY_TOPIC      = "/joy"
-CMD_VEL_TOPIC  = "/cmd_vel"
-ANNOTATED_TOPIC = "/camera/annotated"   # published back so you can view on laptop
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
-# =============================================================================
-# joystick mapping (PS4 defaults)
+
+def wrap_to_pi(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
+
+
+def bearing_from_image_x(x_px: float, width: int, hfov_rad: float) -> float:
+    norm = (x_px - (width / 2.0)) / (width / 2.0)
+    return norm * (hfov_rad / 2.0)
+
+
+def is_finite_number(x: float) -> bool:
+    return math.isfinite(x) and not math.isnan(x)
+
+
+def hsv_mask_orange(hsv_img: np.ndarray) -> np.ndarray:
+    lower = np.array([5, 100, 100], dtype=np.uint8)
+    upper = np.array([25, 255, 255], dtype=np.uint8)
+    return cv2.inRange(hsv_img, lower, upper)
+
+
+def largest_contour(mask: np.ndarray):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+    return max(contours, key=cv2.contourArea)
+
+
+@dataclass
+class Detection:
+    label: str
+    center_x: float
+    center_y: float
+    area: float
+    bearing_rad: float
+    bbox: Tuple[int, int, int, int]
+
+
+@dataclass
+class WaypointResult:
+    waypoint_index: int
+    cone_photo: Optional[str] = None
+    object_label: Optional[str] = None
+    object_photo: Optional[str] = None
+    object_distance_m: Optional[float] = None
+    object_bearing_rad: Optional[float] = None
+
+
+# =========================
+# main node
+# =========================
+
+class Part2MissionController(Node):
+    def __init__(self):
+        super().__init__("part2_mission_controller")
+
+        # -------------------------
+        # params
+        # -------------------------
+        self.declare_parameter("gps_topic",     "/fix")
+        self.declare_parameter("scan_topic",    "/scan")
+        self.declare_parameter("image_topic",   "/camera/image")
+        self.declare_parameter("joy_topic",     "/joy")
+        self.declare_parameter("imu_topic",     "/imu/data")
+        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+
+        self.declare_parameter(
+            "gps_waypoints",
+            [
+                -31.9804902 115.8174017
+                -31.9805027 115.8174483
+                -31.9803921 115.8174755
+                -31.9804214 115.8173444
+            ]
+        )
+
+        # -------------------------------------------------
+        # joystick mapping (PS4 defaults)
         #   axes[0]    = left stick horizontal  (turn)
         #   axes[1]    = left stick vertical    (forward)
         #   axes[5]    = R2 trigger             (deadman)
@@ -93,341 +138,126 @@ ANNOTATED_TOPIC = "/camera/annotated"   # published back so you can view on lapt
         self.declare_parameter("object_min_area", 350.0)
         self.declare_parameter("photos_dir",      "mission_photos")
 
+        # read params
+        gps_topic     = self.get_parameter("gps_topic").value
+        scan_topic    = self.get_parameter("scan_topic").value
+        image_topic   = self.get_parameter("image_topic").value
+        joy_topic     = self.get_parameter("joy_topic").value
+        imu_topic     = self.get_parameter("imu_topic").value
+        cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
 
-# =============================================================================
-# CAMERA / VISION
-# =============================================================================
-CAMERA_HFOV_RAD  = 1.089    # horizontal field of view (matches OAK-D default)
-CONE_MIN_AREA    = 800.0    # min pixel area to count as a cone
-OBJECT_MIN_AREA  = 500.0    # min pixel area to count as an object
-PHOTOS_DIR       = "/ros2_ws/photos"   # where to save photos on the robot
+        flat_wps = list(self.get_parameter("gps_waypoints").value)
+        if len(flat_wps) % 2 != 0:
+            raise ValueError("gps_waypoints must be [lat1, lon1, lat2, lon2, ...]")
+        self.gps_waypoints: List[Tuple[float, float]] = [
+            (float(flat_wps[i]), float(flat_wps[i + 1]))
+            for i in range(0, len(flat_wps), 2)
+        ]
 
-# HSV colour ranges — tune these if detection is wrong outdoors
-# Use the keyboard shortcut 'v' to toggle debug view
-ORANGE_LOWER = np.array([5,  120,  80], dtype=np.uint8)
-ORANGE_UPPER = np.array([22, 255, 255], dtype=np.uint8)
-BLUE_LOWER   = np.array([95,  80,  60], dtype=np.uint8)
-BLUE_UPPER   = np.array([130, 255, 255], dtype=np.uint8)
-OTHER_RANGES = [
-    (np.array([0,   120, 80]), np.array([10,  255, 255])),   # red low
-    (np.array([165, 120, 80]), np.array([179, 255, 255])),   # red high
-    (np.array([18,  120, 80]), np.array([35,  255, 255])),   # yellow
-    (np.array([38,   80, 50]), np.array([88,  255, 255])),   # green
-]
+        self.joy_axis_linear   = int(self.get_parameter("joy_axis_linear").value)
+        self.joy_axis_angular  = int(self.get_parameter("joy_axis_angular").value)
+        self.joy_deadman_axis  = int(self.get_parameter("joy_deadman_axis").value)
+        self.joy_auto_button   = int(self.get_parameter("joy_auto_button").value)
+        self.joy_manual_button = int(self.get_parameter("joy_manual_button").value)
 
+        self.max_linear_speed         = float(self.get_parameter("max_linear_speed").value)
+        self.max_angular_speed        = float(self.get_parameter("max_angular_speed").value)
+        self.goal_radius_m            = float(self.get_parameter("goal_radius_m").value)
+        self.cone_stop_distance_m     = float(self.get_parameter("cone_stop_distance_m").value)
+        self.object_search_radius_m   = float(self.get_parameter("object_search_radius_m").value)
+        self.front_obstacle_dist_m    = float(self.get_parameter("front_obstacle_dist_m").value)
+        self.critical_obstacle_dist_m = float(self.get_parameter("critical_obstacle_dist_m").value)
+        self.weave_side_clearance_m   = float(self.get_parameter("weave_side_clearance_m").value)
 
-# =============================================================================
-# Data classes
-# =============================================================================
+        self.camera_hfov_rad = float(self.get_parameter("camera_hfov_rad").value)
+        self.cone_min_area   = float(self.get_parameter("cone_min_area").value)
+        self.object_min_area = float(self.get_parameter("object_min_area").value)
 
-@dataclass
-class Detection:
-    label: str
-    center_x: float
-    center_y: float
-    area: float
-    bearing_rad: float
-    bbox: Tuple[int, int, int, int]
-    confidence: float = 1.0
-    distance_hint_m: float = 0.0
+        self.photos_dir = str(self.get_parameter("photos_dir").value)
+        os.makedirs(self.photos_dir, exist_ok=True)
 
-
-@dataclass
-class WaypointResult:
-    waypoint_index: int
-    cone_photo: Optional[str] = None
-    object_label: Optional[str] = None
-    object_photo: Optional[str] = None
-    object_distance_m: Optional[float] = None
-    object_bearing_rad: Optional[float] = None
-
-
-# =============================================================================
-# Helper functions
-# =============================================================================
-
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
-
-def wrap_to_pi(a):
-    while a >  math.pi: a -= 2 * math.pi
-    while a < -math.pi: a += 2 * math.pi
-    return a
-
-def is_finite(x):
-    return math.isfinite(x) and not math.isnan(x)
-
-def bearing_from_x(x_px, width, hfov):
-    return ((x_px - width / 2.0) / (width / 2.0)) * (hfov / 2.0)
-
-def get_btn(msg, idx):
-    return 0 <= idx < len(msg.buttons) and msg.buttons[idx] == 1
-
-def apply_morph(mask, k=7):
-    kernel = np.ones((k, k), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-    return mask
-
-def biggest_contour(mask):
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return max(cnts, key=cv2.contourArea) if cnts else None
-
-def all_contours(mask, min_area):
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    return [c for c in cnts if cv2.contourArea(c) >= min_area]
-
-def shape_name(cnt):
-    peri = cv2.arcLength(cnt, True)
-    approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-    v = len(approx)
-    if v == 3: return "triangle"
-    if v == 4:
-        x, y, w, h = cv2.boundingRect(approx)
-        return "square" if 0.85 <= w/max(h,1) <= 1.15 else "rectangle"
-    if v > 6: return "circle"
-    return "polygon"
-
-def cone_confidence(cnt):
-    x, y, w, h = cv2.boundingRect(cnt)
-    if w == 0 or h == 0: return 0.0
-    aspect = h / float(w)
-    fill   = cv2.contourArea(cnt) / max(w * h, 1)
-    return (1 - min(abs(aspect - 1.7) / 1.5, 1.0)) * 0.6 + \
-           (1 - min(abs(fill   - 0.5) / 0.4, 1.0)) * 0.4
-
-def area_to_dist(area, real_w=0.3, focal=600.0):
-    if area <= 0: return 99.0
-    return (real_w * focal) / max(math.sqrt(area), 1)
-
-def latlon_to_xy(lat, lon, lat0, lon0):
-    R = 6378137.0
-    x = R * math.radians(lon - lon0) * math.cos(math.radians((lat + lat0) / 2))
-    y = R * math.radians(lat - lat0)
-    return x, y
-
-
-# =============================================================================
-# Vision — detect objects
-# =============================================================================
-
-def detect_cone(hsv, width, hfov, min_area=CONE_MIN_AREA):
-    mask = apply_morph(cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER))
-    cnt  = biggest_contour(mask)
-    if cnt is None or cv2.contourArea(cnt) < min_area:
-        return None
-    x, y, w, h = cv2.boundingRect(cnt)
-    cx = x + w / 2.0
-    return Detection(
-        label="orange_cone", center_x=cx, center_y=y + h / 2.0,
-        area=cv2.contourArea(cnt),
-        bearing_rad=bearing_from_x(cx, width, hfov),
-        bbox=(x, y, w, h),
-        confidence=cone_confidence(cnt),
-        distance_hint_m=area_to_dist(cv2.contourArea(cnt)),
-    )
-
-
-def detect_bucket(hsv, width, hfov, min_area=OBJECT_MIN_AREA):
-    mask = apply_morph(cv2.inRange(hsv, BLUE_LOWER, BLUE_UPPER))
-    cnt  = biggest_contour(mask)
-    if cnt is None or cv2.contourArea(cnt) < min_area:
-        return None
-    x, y, w, h = cv2.boundingRect(cnt)
-    cx = x + w / 2.0
-    return Detection(
-        label=f"blue_bucket_{shape_name(cnt)}",
-        center_x=cx, center_y=y + h / 2.0,
-        area=cv2.contourArea(cnt),
-        bearing_rad=bearing_from_x(cx, width, hfov),
-        bbox=(x, y, w, h),
-        confidence=0.8,
-        distance_hint_m=area_to_dist(cv2.contourArea(cnt), real_w=0.35),
-    )
-
-
-def detect_other(hsv, width, hfov, min_area=OBJECT_MIN_AREA):
-    combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
-    for lo, hi in OTHER_RANGES:
-        combined |= cv2.inRange(hsv, lo, hi)
-    # remove orange and blue
-    combined = cv2.bitwise_and(
-        combined,
-        cv2.bitwise_not(
-            cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER) |
-            cv2.inRange(hsv, BLUE_LOWER,   BLUE_UPPER)
-        )
-    )
-    combined = apply_morph(combined)
-    cnt = biggest_contour(combined)
-    if cnt is None or cv2.contourArea(cnt) < min_area:
-        return None
-    x, y, w, h = cv2.boundingRect(cnt)
-    cx = x + w / 2.0
-    return Detection(
-        label=shape_name(cnt),
-        center_x=cx, center_y=y + h / 2.0,
-        area=cv2.contourArea(cnt),
-        bearing_rad=bearing_from_x(cx, width, hfov),
-        bbox=(x, y, w, h),
-        confidence=0.6,
-        distance_hint_m=area_to_dist(cv2.contourArea(cnt)),
-    )
-
-
-def detect_all_cones(hsv, width, hfov, min_area=400.0):
-    mask = apply_morph(cv2.inRange(hsv, ORANGE_LOWER, ORANGE_UPPER), k=5)
-    cnts = all_contours(mask, min_area)
-    dets = []
-    for cnt in cnts:
-        x, y, w, h = cv2.boundingRect(cnt)
-        cx = x + w / 2.0
-        dets.append(Detection(
-            label="orange_cone", center_x=cx, center_y=y + h / 2.0,
-            area=cv2.contourArea(cnt),
-            bearing_rad=bearing_from_x(cx, width, hfov),
-            bbox=(x, y, w, h),
-            confidence=cone_confidence(cnt),
-            distance_hint_m=area_to_dist(cv2.contourArea(cnt)),
-        ))
-    return sorted(dets, key=lambda d: d.bearing_rad)
-
-
-def annotate_frame(bgr, cone, obj, mode, state, wp_idx, total_wps):
-    """Draw detection boxes and status on frame for remote viewing."""
-    out = bgr.copy()
-
-    if cone:
-        x, y, w, h = cone.bbox
-        cv2.rectangle(out, (x, y), (x+w, y+h), (0, 165, 255), 2)
-        cv2.putText(out, f"CONE {cone.confidence:.2f} ~{cone.distance_hint_m:.1f}m",
-                    (x, max(y-8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,165,255), 2)
-
-    if obj:
-        x, y, w, h = obj.bbox
-        col = (255, 80, 0) if "bucket" in obj.label else (0, 220, 0)
-        cv2.rectangle(out, (x, y), (x+w, y+h), col, 2)
-        cv2.putText(out, f"{obj.label} ~{obj.distance_hint_m:.1f}m",
-                    (x, max(y-8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
-
-    # status bar at top
-    status = f"MODE:{mode}  STATE:{state}  WP:{wp_idx+1}/{total_wps}"
-    cv2.rectangle(out, (0, 0), (out.shape[1], 30), (30, 30, 30), -1)
-    cv2.putText(out, status, (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,255), 1)
-
-    return out
-
-
-def save_photo(bgr, detection, photos_dir, prefix):
-    """Save annotated photo to disk. Returns file path."""
-    os.makedirs(photos_dir, exist_ok=True)
-    ts   = time.strftime("%Y%m%d_%H%M%S")
-    path = os.path.join(photos_dir, f"{prefix}_{ts}.png")
-    img  = bgr.copy()
-    if detection:
-        x, y, w, h = detection.bbox
-        col = (0, 165, 255) if "cone" in detection.label else \
-              (255, 80, 0)  if "bucket" in detection.label else (0, 220, 0)
-        cv2.rectangle(img, (x, y), (x+w, y+h), col, 3)
-        cv2.putText(img, f"{detection.label} conf:{detection.confidence:.2f}",
-                    (x, max(y-8, 12)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, col, 2)
-    cv2.imwrite(path, img)
-    return path
-
-
-# =============================================================================
-# Main controller node
-# =============================================================================
-
-class Part2MissionController(Node):
-
-    def __init__(self):
-        super().__init__("part2_mission_controller")
-
-        os.makedirs(PHOTOS_DIR, exist_ok=True)
-
-        # ---- state ----
+        # -------------------------
+        # mode state
+        # -------------------------
         self.mode       = "MANUAL"
         self.auto_state = "NAVIGATE"
-        self.wp_idx     = 0
+        self.current_wp_idx = 0
 
-        self._last_auto_btn   = False
-        self._last_manual_btn = False
+        # rising-edge tracking for buttons (from teammate's joy_mode_switch)
+        self._last_auto_button   = False
+        self._last_manual_button = False
 
-        # sensor data
+        # -------------------------
+        # sensor state
+        # -------------------------
         self.have_gps   = False
         self.have_scan  = False
         self.have_image = False
         self.have_imu   = False
 
-        self.lat = 0.0;  self.lon = 0.0
-        self.origin_lat = None;  self.origin_lon = None
-        self.heading    = 0.0
-        self.last_lat   = None;  self.last_lon  = None
-        self.last_gps_t = None
+        self.current_lat     = 0.0
+        self.current_lon     = 0.0
+        self.current_heading = 0.0
+        self.last_lat        = None
+        self.last_lon        = None
+        self.last_gps_time   = None
+        self.origin_lat      = None
+        self.origin_lon      = None
 
         self.front_min = float("inf")
         self.left_min  = float("inf")
         self.right_min = float("inf")
         self.last_scan = None
 
-        self.latest_bgr  = None
-        self.latest_hsv  = None
-        self.img_w       = None
-        self.img_h       = None
-        self.bridge      = CvBridge()
+        self.latest_bgr   = None
+        self.latest_hsv   = None
+        self.image_width  = None
+        self.image_height = None
+        self.bridge = CvBridge()
 
-        self.cone_det:   Optional[Detection] = None
-        self.obj_det:    Optional[Detection] = None
-        self.all_cones:  List[Detection]     = []
+        self.latest_cone_detection:   Optional[Detection] = None
+        self.latest_object_detection: Optional[Detection] = None
 
-        self.manual_lin  = 0.0
-        self.manual_ang  = 0.0
-        self.deadman     = False
+        self.manual_linear   = 0.0
+        self.manual_angular  = 0.0
+        self.deadman_pressed = False
 
-        self.cone_photo_done = False
-        self.obj_photo_done  = False
-        self._wp_result      = None
+        self.cone_photo_taken   = False
+        self.object_photo_taken = False
+        self._current_wp_result = None
 
-        self.journey: List[WaypointResult] = []
-        self.start_time = time.time()
+        self.journey_log: List[WaypointResult] = []
+        self.mission_start_time = time.time()
 
-        # ---- pubs / subs ----
-        qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=1
-        )
+        # -------------------------
+        # pubs / subs
+        # -------------------------
+        self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
 
-        self.cmd_pub  = self.create_publisher(Twist, CMD_VEL_TOPIC, 10)
-        self.ann_pub  = self.create_publisher(Image, ANNOTATED_TOPIC, 10)
+        self.create_subscription(NavSatFix, gps_topic,   self.gps_callback,   10)
+        self.create_subscription(LaserScan, scan_topic,  self.scan_callback,  10)
+        self.create_subscription(Image,     image_topic, self.image_callback, 10)
+        self.create_subscription(Joy,       joy_topic,   self.joy_callback,   10)
+        self.create_subscription(Imu,       imu_topic,   self.imu_callback,   10)
 
-        self.create_subscription(NavSatFix, GPS_TOPIC,   self._gps_cb,   qos)
-        self.create_subscription(LaserScan, SCAN_TOPIC,  self._scan_cb,  qos)
-        self.create_subscription(Image,     IMAGE_TOPIC, self._image_cb, qos)
-        self.create_subscription(Joy,       JOY_TOPIC,   self._joy_cb,   10)
-        self.create_subscription(Imu,       IMU_TOPIC,   self._imu_cb,   qos)
+        self.timer = self.create_timer(0.1, self.control_loop)
 
-        self.timer = self.create_timer(0.1, self._loop)
+        self.get_logger().info("Part 2 mission controller started")
+        self.get_logger().info(f"Waypoints loaded: {len(self.gps_waypoints)}")
+        self.get_logger().info("PS4: X=AUTO  O=MANUAL  R2=deadman (hold while in AUTO)")
+        self.get_logger().info("Keyboard: a=AUTO  m=MANUAL  d=deadman  w/s/q/e/x")
 
-        self.get_logger().info("=" * 50)
-        self.get_logger().info("Part 2 Mission Controller started")
-        self.get_logger().info(f"Waypoints: {len(WAYPOINTS)}")
-        self.get_logger().info(f"Photos dir: {PHOTOS_DIR}")
-        self.get_logger().info("PS4: X=AUTO  O=MANUAL  L1=deadman")
-        self.get_logger().info("     D-pad = drive in MANUAL")
-        self.get_logger().info("Keyboard:  a=AUTO  m=MANUAL  d=deadman  w/s/q/e/x")
-        self.get_logger().info("=" * 50)
+        self._keyboard_thread = threading.Thread(target=self.keyboard_thread, daemon=True)
+        self._keyboard_thread.start()
 
-        threading.Thread(target=self._kbd_thread, daemon=True).start()
+    # =========================
+    # callbacks
+    # =========================
 
-    # =========================================================================
-    # Sensor callbacks
-    # =========================================================================
-
-    def _gps_cb(self, msg: NavSatFix):
-        if not is_finite(msg.latitude) or not is_finite(msg.longitude):
+    def gps_callback(self, msg: NavSatFix):
+        if not is_finite_number(msg.latitude) or not is_finite_number(msg.longitude):
             return
+
         self.have_gps = True
         now = self.get_clock().now().nanoseconds * 1e-9
 
@@ -435,398 +265,594 @@ class Part2MissionController(Node):
             self.origin_lat = msg.latitude
             self.origin_lon = msg.longitude
             self.get_logger().info(
-                f"GPS origin set: {self.origin_lat:.7f}, {self.origin_lon:.7f}"
+                f"GPS origin: lat={self.origin_lat:.8f}, lon={self.origin_lon:.8f}"
             )
 
-        # heading from GPS motion if no IMU
-        if not self.have_imu and self.last_lat is not None and self.last_gps_t:
-            if now - self.last_gps_t > 0.1:
-                dx, dy = latlon_to_xy(msg.latitude, msg.longitude,
-                                      self.last_lat, self.last_lon)
-                if math.hypot(dx, dy) > 0.05:
-                    self.heading = math.atan2(dy, dx)
+        if not self.have_imu and self.last_lat is not None and self.last_gps_time is not None:
+            dt = now - self.last_gps_time
+            if dt > 0.1:
+                dx, dy = self.latlon_to_local_xy(
+                    msg.latitude, msg.longitude, self.last_lat, self.last_lon
+                )
+                if math.hypot(dx, dy) > 0.08:
+                    self.current_heading = math.atan2(dy, dx)
 
-        self.lat       = msg.latitude
-        self.lon       = msg.longitude
-        self.last_lat  = msg.latitude
-        self.last_lon  = msg.longitude
-        self.last_gps_t = now
+        self.current_lat   = msg.latitude
+        self.current_lon   = msg.longitude
+        self.last_lat      = msg.latitude
+        self.last_lon      = msg.longitude
+        self.last_gps_time = now
 
-    def _imu_cb(self, msg: Imu):
+    def imu_callback(self, msg: Imu):
         q = msg.orientation
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.heading  = math.atan2(siny, cosy)
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.current_heading = math.atan2(siny_cosp, cosy_cosp)
         self.have_imu = True
 
-    def _scan_cb(self, msg: LaserScan):
+    def scan_callback(self, msg: LaserScan):
         self.have_scan = True
         self.last_scan = msg
-        ranges = [r if is_finite(r) else float("inf") for r in msg.ranges]
-        n = len(ranges)
-        if n == 0: return
-        mid = n // 2
-        fw  = max(10, n // 16)
-        self.front_min = min(ranges[max(0,mid-fw):min(n,mid+fw)] or [float("inf")])
-        self.left_min  = min(ranges[min(n-1,mid+fw):]            or [float("inf")])
-        self.right_min = min(ranges[:max(1,mid-fw)]              or [float("inf")])
 
-    def _image_cb(self, msg: Image):
+        ranges = [r if math.isfinite(r) else float("inf") for r in msg.ranges]
+        n = len(ranges)
+        if n == 0:
+            return
+
+        mid = n // 2
+        front_half_width = max(10, n // 16)
+
+        front = ranges[max(0, mid - front_half_width): min(n, mid + front_half_width)]
+        left  = ranges[min(n - 1, mid + front_half_width):]
+        right = ranges[:max(1, mid - front_half_width)]
+
+        self.front_min = min(front) if front else float("inf")
+        self.left_min  = min(left)  if left  else float("inf")
+        self.right_min = min(right) if right else float("inf")
+
+    def image_callback(self, msg: Image):
         try:
             bgr = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
         except Exception as e:
-            self.get_logger().warn(str(e), throttle_duration_sec=2.0)
+            self.get_logger().warn(f"Image conversion failed: {e}", throttle_duration_sec=2.0)
             return
 
         self.have_image = True
         self.latest_bgr = bgr
         self.latest_hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-        self.img_h, self.img_w = bgr.shape[:2]
+        self.image_height, self.image_width = bgr.shape[:2]
 
-        hsv = self.latest_hsv
+        self.latest_cone_detection   = self.detect_cone()
+        self.latest_object_detection = self.detect_other_object()
 
-        self.cone_det  = detect_cone(hsv, self.img_w, CAMERA_HFOV_RAD, CONE_MIN_AREA)
-        bucket         = detect_bucket(hsv, self.img_w, CAMERA_HFOV_RAD, OBJECT_MIN_AREA)
-        self.obj_det   = bucket if bucket else detect_other(hsv, self.img_w, CAMERA_HFOV_RAD, OBJECT_MIN_AREA)
-        self.all_cones = detect_all_cones(hsv, self.img_w, CAMERA_HFOV_RAD, CONE_MIN_AREA * 0.5)
+    def joy_callback(self, msg: Joy):
+        """
+        PS4 controller input with rising-edge detection.
 
-        # publish annotated frame for remote viewing
-        try:
-            ann = annotate_frame(bgr, self.cone_det, self.obj_det,
-                                 self.mode, self.auto_state,
-                                 self.wp_idx, len(WAYPOINTS))
-            ann_msg = self.bridge.cv2_to_imgmsg(ann, encoding="bgr8")
-            ann_msg.header = msg.header
-            self.ann_pub.publish(ann_msg)
-        except Exception:
-            pass
+        Rising-edge detection (from teammate's joy_mode_switch node) means
+        holding a button only triggers the mode change ONCE, not every tick.
 
-    def _joy_cb(self, msg: Joy):
-        # mode switching — rising edge only
-        auto_btn   = get_btn(msg, BTN_AUTO)
-        manual_btn = get_btn(msg, BTN_MANUAL)
+        PS4 default mapping:
+            buttons[0] = X (cross)   -> AUTO
+            buttons[1] = O (circle)  -> MANUAL
+            axes[1]    = left stick up/down  (forward/back)
+            axes[0]    = left stick left/right (turn)
+            axes[5]    = R2 trigger  (deadman)
+                         rests at +1.0, fully pressed = -1.0
+        """
+        n_buttons = len(msg.buttons)
 
-        if auto_btn and not self._last_auto_btn:
-            self.mode       = "AUTO"
-            self.auto_state = "NAVIGATE"
-            self.get_logger().info("PS4 X: AUTO mode")
+        # guard: log clearly if button indices are wrong
+        max_btn = max(self.joy_auto_button, self.joy_manual_button)
+        if max_btn >= n_buttons:
+            self.get_logger().warn(
+                f"Button index {max_btn} out of range (controller has {n_buttons} buttons). "
+                f"Run 'ros2 topic echo /joy' and check which index is X and O, "
+                f"then update joy_auto_button / joy_manual_button in the launch file.",
+                throttle_duration_sec=5.0
+            )
+            return
 
-        if manual_btn and not self._last_manual_btn:
-            self.mode = "MANUAL"
-            self.get_logger().info("PS4 O: MANUAL mode")
+        auto_pressed   = bool(msg.buttons[self.joy_auto_button])
+        manual_pressed = bool(msg.buttons[self.joy_manual_button])
 
-        self._last_auto_btn   = auto_btn
-        self._last_manual_btn = manual_btn
+        # rising edge: X -> AUTO
+        if auto_pressed and not self._last_auto_button:
+            if self.mode != "AUTO":
+                self.mode       = "AUTO"
+                self.auto_state = "NAVIGATE"
+                self.get_logger().info("PS4 X pressed: AUTO mode enabled")
 
-        # deadman — held = active
-        self.deadman = get_btn(msg, BTN_DEADMAN)
+        # rising edge: O -> MANUAL
+        if manual_pressed and not self._last_manual_button:
+            if self.mode != "MANUAL":
+                self.mode = "MANUAL"
+                self.get_logger().info("PS4 O pressed: MANUAL mode enabled")
 
-        # D-pad driving
-        fwd  = get_btn(msg, BTN_FORWARD)
-        back = get_btn(msg, BTN_BACK)
-        left = get_btn(msg, BTN_LEFT)
-        rght = get_btn(msg, BTN_RIGHT)
+        self._last_auto_button   = auto_pressed
+        self._last_manual_button = manual_pressed
 
-        self.manual_lin = MANUAL_LINEAR_SPEED  if fwd  else \
-                         -MANUAL_LINEAR_SPEED  if back else 0.0
-        self.manual_ang = MANUAL_ANGULAR_SPEED if left else \
-                         -MANUAL_ANGULAR_SPEED if rght else 0.0
+        # manual drive
+        lin_axis = msg.axes[self.joy_axis_linear]  if self.joy_axis_linear  < len(msg.axes) else 0.0
+        ang_axis = msg.axes[self.joy_axis_angular] if self.joy_axis_angular < len(msg.axes) else 0.0
 
-    def _kbd_thread(self):
+        self.manual_linear  = clamp(lin_axis, -1.0, 1.0) * self.max_linear_speed
+        self.manual_angular = clamp(ang_axis, -1.0, 1.0) * self.max_angular_speed
+
+        # deadman (R2)
+        # handles two common controller types:
+        #   type A (PS4): rests at +1.0, pressed = -1.0
+        #   type B (some generic): rests at 0.0, pressed = +1.0
+        if self.joy_deadman_axis < len(msg.axes):
+            dv = msg.axes[self.joy_deadman_axis]
+            if dv > 0.5:
+                self.deadman_pressed = False   # type A at rest
+            elif dv < -0.1:
+                self.deadman_pressed = True    # type A pressed
+            elif dv > 0.1:
+                self.deadman_pressed = True    # type B pressed
+            # dv == 0.0 means axis hasn't been touched yet - don't change state
+
+    # =========================
+    # keyboard thread
+    # =========================
+
+    def keyboard_thread(self):
+        """Background keyboard fallback - useful in sim without a physical controller."""
         settings = termios.tcgetattr(sys.stdin)
         try:
             tty.setcbreak(sys.stdin.fileno())
             while rclpy.ok():
-                k = sys.stdin.read(1)
-                if   k == 'a': self.mode = "AUTO";   self.auto_state = "NAVIGATE"; self.get_logger().info("KB: AUTO")
-                elif k == 'm': self.mode = "MANUAL";                                self.get_logger().info("KB: MANUAL")
-                elif k == 'd': self.deadman = not self.deadman;                     self.get_logger().info(f"KB: deadman={'ON' if self.deadman else 'OFF'}")
-                elif k == 'w': self.manual_lin =  MANUAL_LINEAR_SPEED;  self.manual_ang = 0.0
-                elif k == 's': self.manual_lin = -MANUAL_LINEAR_SPEED;  self.manual_ang = 0.0
-                elif k == 'q': self.manual_lin = 0.0; self.manual_ang =  MANUAL_ANGULAR_SPEED
-                elif k == 'e': self.manual_lin = 0.0; self.manual_ang = -MANUAL_ANGULAR_SPEED
-                elif k == 'x': self.manual_lin = 0.0; self.manual_ang = 0.0
+                key = sys.stdin.read(1)
+                if key == 'm':
+                    self.mode = "MANUAL"
+                    self.get_logger().info("Keyboard: MANUAL mode")
+                elif key == 'a':
+                    self.mode       = "AUTO"
+                    self.auto_state = "NAVIGATE"
+                    self.get_logger().info("Keyboard: AUTO mode")
+                elif key == 'd':
+                    self.deadman_pressed = not self.deadman_pressed
+                    self.get_logger().info(f"Keyboard: deadman={'ON' if self.deadman_pressed else 'OFF'}")
+                elif key == 'w':
+                    self.manual_linear  =  0.3
+                    self.manual_angular =  0.0
+                elif key == 's':
+                    self.manual_linear  = -0.3
+                    self.manual_angular =  0.0
+                elif key == 'q':
+                    self.manual_linear  =  0.0
+                    self.manual_angular =  0.5
+                elif key == 'e':
+                    self.manual_linear  =  0.0
+                    self.manual_angular = -0.5
+                elif key == 'x':
+                    self.manual_linear  = 0.0
+                    self.manual_angular = 0.0
         finally:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
 
-    # =========================================================================
-    # Geometry helpers
-    # =========================================================================
+    # =========================
+    # perception
+    # =========================
 
-    def _current_xy(self):
-        if self.origin_lat is None: return 0.0, 0.0
-        return latlon_to_xy(self.lat, self.lon, self.origin_lat, self.origin_lon)
+    def detect_cone(self) -> Optional[Detection]:
+        if self.latest_hsv is None or self.image_width is None:
+            return None
 
-    def _waypoint_xy(self, idx):
-        lat, lon = WAYPOINTS[idx]
-        return latlon_to_xy(lat, lon, self.origin_lat, self.origin_lon)
+        mask = hsv_mask_orange(self.latest_hsv)
+        kernel = np.ones((5, 5), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    def _dist_to_wp(self):
-        if self.origin_lat is None or self.wp_idx >= len(WAYPOINTS):
+        cnt = largest_contour(mask)
+        if cnt is None:
+            return None
+
+        area = cv2.contourArea(cnt)
+        if area < self.cone_min_area:
+            return None
+
+        x, y, w, h = cv2.boundingRect(cnt)
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        bearing = bearing_from_image_x(cx, self.image_width, self.camera_hfov_rad)
+
+        return Detection(
+            label="orange_cone",
+            center_x=cx, center_y=cy,
+            area=area, bearing_rad=bearing,
+            bbox=(x, y, w, h),
+        )
+
+    def detect_other_object(self) -> Optional[Detection]:
+        if self.latest_hsv is None or self.image_width is None:
+            return None
+
+        hsv = self.latest_hsv
+
+        color_ranges = [
+            ("red1",   np.array([0,   100, 100]), np.array([10,  255, 255])),
+            ("red2",   np.array([160, 100, 100]), np.array([179, 255, 255])),
+            ("yellow", np.array([20,  100, 100]), np.array([35,  255, 255])),
+            ("green",  np.array([40,   80,  80]), np.array([85,  255, 255])),
+            ("blue",   np.array([90,   80,  80]), np.array([130, 255, 255])),
+        ]
+
+        combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        for _, low, high in color_ranges:
+            combined |= cv2.inRange(hsv, low, high)
+
+        # exclude orange so the waypoint cone is never detected as the object
+        combined = cv2.bitwise_and(combined, cv2.bitwise_not(hsv_mask_orange(hsv)))
+
+        kernel = np.ones((5, 5), np.uint8)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN, kernel)
+        combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, kernel)
+
+        cnt = largest_contour(combined)
+        if cnt is None:
+            return None
+
+        area = cv2.contourArea(cnt)
+        if area < self.object_min_area:
+            return None
+
+        shape_label = self.classify_shape(cnt)
+        x, y, w, h = cv2.boundingRect(cnt)
+        cx = x + w / 2.0
+        cy = y + h / 2.0
+        bearing = bearing_from_image_x(cx, self.image_width, self.camera_hfov_rad)
+
+        return Detection(
+            label=shape_label,
+            center_x=cx, center_y=cy,
+            area=area, bearing_rad=bearing,
+            bbox=(x, y, w, h),
+        )
+
+    def classify_shape(self, contour) -> str:
+        peri   = cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, 0.04 * peri, True)
+        v = len(approx)
+        if v == 3:
+            return "triangle"
+        if v == 4:
+            x, y, w, h = cv2.boundingRect(approx)
+            aspect = w / float(h) if h > 0 else 0.0
+            return "square" if 0.85 <= aspect <= 1.15 else "rectangle"
+        if v > 6:
+            return "circle"
+        return "unknown_shape"
+
+    # =========================
+    # geometry
+    # =========================
+
+    def latlon_to_local_xy(self, lat, lon, lat0, lon0) -> Tuple[float, float]:
+        r = 6378137.0
+        dlat = math.radians(lat - lat0)
+        dlon = math.radians(lon - lon0)
+        x = r * dlon * math.cos(math.radians((lat + lat0) / 2.0))
+        y = r * dlat
+        return x, y
+
+    def current_xy(self) -> Tuple[float, float]:
+        if self.origin_lat is None:
+            return 0.0, 0.0
+        return self.latlon_to_local_xy(
+            self.current_lat, self.current_lon,
+            self.origin_lat, self.origin_lon
+        )
+
+    def waypoint_xy(self, idx: int) -> Tuple[float, float]:
+        lat, lon = self.gps_waypoints[idx]
+        return self.latlon_to_local_xy(lat, lon, self.origin_lat, self.origin_lon)
+
+    def distance_to_current_waypoint(self) -> float:
+        if self.origin_lat is None or self.current_wp_idx >= len(self.gps_waypoints):
             return float("inf")
-        x, y   = self._current_xy()
-        gx, gy = self._waypoint_xy(self.wp_idx)
+        x, y   = self.current_xy()
+        gx, gy = self.waypoint_xy(self.current_wp_idx)
         return math.hypot(gx - x, gy - y)
 
-    def _heading_to_wp(self):
-        if self.origin_lat is None or self.wp_idx >= len(WAYPOINTS):
-            return self.heading
-        x, y   = self._current_xy()
-        gx, gy = self._waypoint_xy(self.wp_idx)
+    def heading_to_current_waypoint(self) -> float:
+        if self.origin_lat is None or self.current_wp_idx >= len(self.gps_waypoints):
+            return self.current_heading
+        x, y   = self.current_xy()
+        gx, gy = self.waypoint_xy(self.current_wp_idx)
         return math.atan2(gy - y, gx - x)
 
-    def _lidar_at(self, bearing):
-        if self.last_scan is None: return None
+    def lidar_range_at_bearing(self, bearing_rad: float) -> Optional[float]:
+        if self.last_scan is None:
+            return None
+        angle_min = self.last_scan.angle_min
+        angle_inc = self.last_scan.angle_increment
         n   = len(self.last_scan.ranges)
-        idx = int(round((bearing - self.last_scan.angle_min) /
-                         self.last_scan.angle_increment))
-        if idx < 0 or idx >= n: return None
-        vals = [self.last_scan.ranges[i]
-                for i in range(max(0, idx-4), min(n, idx+5))
-                if is_finite(self.last_scan.ranges[i])]
+        idx = int(round((bearing_rad - angle_min) / angle_inc))
+        if idx < 0 or idx >= n:
+            return None
+        vals = [
+            self.last_scan.ranges[i]
+            for i in range(max(0, idx - 4), min(n, idx + 5))
+            if math.isfinite(self.last_scan.ranges[i])
+        ]
         return min(vals) if vals else None
 
-    # =========================================================================
-    # Drive helpers
-    # =========================================================================
+    # =========================
+    # actions
+    # =========================
 
-    def _stop(self):   self._cmd(0.0, 0.0)
-    def _cmd(self, lin, ang):
-        m = Twist()
-        m.linear.x  = float(lin)
-        m.angular.z = float(ang)
-        self.cmd_pub.publish(m)
+    def stop_robot(self):
+        self.publish_cmd(0.0, 0.0)
 
-    def _save_photo(self, prefix, detection=None):
-        if self.latest_bgr is None: return None
-        path = save_photo(self.latest_bgr, detection, PHOTOS_DIR, prefix)
+    def publish_cmd(self, linear_x: float, angular_z: float):
+        msg = Twist()
+        msg.linear.x  = linear_x
+        msg.angular.z = angular_z
+        self.cmd_pub.publish(msg)
+
+    def save_current_image(self, prefix: str) -> Optional[str]:
+        if self.latest_bgr is None:
+            return None
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(self.photos_dir, f"{prefix}_{timestamp}.png")
+        cv2.imwrite(path, self.latest_bgr)
         self.get_logger().info(f"Photo saved: {path}")
         return path
 
-    # =========================================================================
-    # Main control loop
-    # =========================================================================
+    # =========================
+    # control loop
+    # =========================
 
-    def _loop(self):
+    def control_loop(self):
         if self.mode == "MANUAL":
-            self._cmd(self.manual_lin, self.manual_ang)
-            return
+            self.run_manual()
+        else:
+            self.run_auto()
 
-        # AUTO mode
+    def run_manual(self):
+        self.publish_cmd(self.manual_linear, self.manual_angular)
+
+    def run_auto(self):
         if not (self.have_gps and self.have_scan and self.have_image):
-            self._stop()
-            self.get_logger().info("Waiting for sensors...", throttle_duration_sec=3.0)
+            self.stop_robot()
             return
 
-        if not self.deadman:
-            self._stop()
-            self.get_logger().warn("Hold L1 (deadman) to move in AUTO",
-                                   throttle_duration_sec=2.0)
+        if not self.deadman_pressed:
+            self.stop_robot()
+            self.get_logger().warn(
+                "AUTO mode: hold R2 (deadman) to move",
+                throttle_duration_sec=2.0
+            )
             return
 
-        if self.wp_idx >= len(WAYPOINTS):
+        if self.current_wp_idx >= len(self.gps_waypoints):
             self.auto_state = "DONE"
 
         if self.auto_state == "DONE":
-            self._stop()
+            self.stop_robot()
             return
 
-        # hard safety stop
-        if self.front_min < CRITICAL_OBSTACLE_DIST_M:
-            turn = -1.0 if self.left_min < self.right_min else 1.0
-            self._cmd(0.0, 0.8 * turn)
+        if self.front_min < self.critical_obstacle_dist_m:
+            turn_dir = -1.0 if self.left_min < self.right_min else 1.0
+            self.publish_cmd(0.0, 0.8 * turn_dir)
             return
 
-        {
-            "NAVIGATE":       self._navigate,
-            "WEAVE":          self._weave,
-            "APPROACH_CONE":  self._approach_cone,
-            "CAPTURE_CONE":   self._capture_cone,
-            "FIND_OBJECT":    self._find_object,
-            "CAPTURE_OBJECT": self._capture_object,
-        }.get(self.auto_state, self._stop)()
+        if self.auto_state == "NAVIGATE":
+            self.do_navigate()
+        elif self.auto_state == "WEAVE":
+            self.do_weave()
+        elif self.auto_state == "APPROACH_CONE":
+            self.do_approach_cone()
+        elif self.auto_state == "CAPTURE_CONE":
+            self.do_capture_cone()
+        elif self.auto_state == "FIND_OBJECT":
+            self.do_find_object()
+        elif self.auto_state == "CAPTURE_OBJECT":
+            self.do_capture_object()
+        else:
+            self.stop_robot()
 
-    # =========================================================================
-    # Behaviour states
-    # =========================================================================
+    # =========================
+    # behaviour states
+    # =========================
 
-    def _navigate(self):
-        dist = self._dist_to_wp()
-        herr = wrap_to_pi(self._heading_to_wp() - self.heading)
+    def do_navigate(self):
+        dist          = self.distance_to_current_waypoint()
+        goal_heading  = self.heading_to_current_waypoint()
+        heading_error = wrap_to_pi(goal_heading - self.current_heading)
 
-        if dist < GOAL_RADIUS_M:
-            self.auto_state      = "APPROACH_CONE"
-            self.cone_photo_done = False
-            self.obj_photo_done  = False
-            self._stop()
-            self.get_logger().info(f"Near WP{self.wp_idx+1} -> APPROACH_CONE")
-            return
-
-        # weave on first leg (WP0 -> WP1) if cones detected ahead
-        if self.wp_idx == 1 and self.cone_det:
-            cr = self._lidar_at(self.cone_det.bearing_rad)
-            if cr and cr < FRONT_OBSTACLE_DIST_M * 2.0:
-                self.auto_state = "WEAVE"
-                self.get_logger().info("Entering WEAVE mode")
-                return
-
-        if self.front_min < FRONT_OBSTACLE_DIST_M:
-            turn = -1.0 if self.left_min < self.right_min else 1.0
-            self._cmd(0.08, 0.6 * turn)
-            return
-
-        if abs(herr) > 0.35:
-            self._cmd(0.0, clamp(1.4 * herr, -0.8, 0.8))
-            return
-
-        self._cmd(clamp(0.3 + 0.15 * dist, 0.0, MAX_LINEAR_SPEED),
-                  clamp(1.2 * herr, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
-
-    def _weave(self):
-        cone = self.cone_det
-        if cone is None:
-            self.auto_state = "NAVIGATE"; return
-
-        cr = self._lidar_at(cone.bearing_rad)
-        if cr is None or cr > FRONT_OBSTACLE_DIST_M * 2.5:
-            self.auto_state = "NAVIGATE"; return
-
-        if self._dist_to_wp() < GOAL_RADIUS_M:
-            self.auto_state      = "APPROACH_CONE"
-            self.cone_photo_done = False
-            self.obj_photo_done  = False
-            self._stop(); return
-
-        desired = 0.3 if self.left_min >= self.right_min else -0.3
-        err = wrap_to_pi(cone.bearing_rad - desired)
-        self._cmd(0.15 if cr > 1.0 else 0.08,
-                  clamp(-1.8 * err, -MAX_ANGULAR_SPEED, MAX_ANGULAR_SPEED))
-
-    def _approach_cone(self):
-        cone = self.cone_det
-        if cone is None:
-            self._cmd(0.0, 0.35); return   # spin to find cone
-
-        berr = wrap_to_pi(cone.bearing_rad - 0.18)  # keep cone slightly right
-        cr   = self._lidar_at(cone.bearing_rad)
-
-        if cr is not None and cr < CONE_STOP_DISTANCE_M:
-            self.auto_state = "CAPTURE_CONE"
-            self._stop()
-            self.get_logger().info("Cone reached")
-            return
-
-        if self.front_min < FRONT_OBSTACLE_DIST_M * 0.9:
-            turn = -1.0 if self.left_min < self.right_min else 1.0
-            self._cmd(0.0, 0.5 * turn); return
-
-        self._cmd(0.12 if abs(berr) < 0.35 else 0.04,
-                  clamp(1.5 * berr, -0.6, 0.6))
-
-    def _capture_cone(self):
-        result = WaypointResult(waypoint_index=self.wp_idx + 1)
-        if not self.cone_photo_done:
-            path = self._save_photo(f"wp{self.wp_idx+1}_cone", self.cone_det)
-            result.cone_photo    = path
-            self.cone_photo_done = True
-            self._wp_result      = result
+        if dist < self.goal_radius_m:
+            self.auto_state         = "APPROACH_CONE"
+            self.cone_photo_taken   = False
+            self.object_photo_taken = False
+            self.stop_robot()
             self.get_logger().info(
-                f"Cone photo taken. "
-                f"conf={self.cone_det.confidence:.2f} "
-                f"~{self.cone_det.distance_hint_m:.1f}m"
-                if self.cone_det else "Cone photo taken."
+                f"Near waypoint {self.current_wp_idx + 1}, switching to APPROACH_CONE"
             )
+            return
+
+        # Task 3: weave between WP0 and WP1
+        if self.current_wp_idx == 1:
+            cone = self.latest_cone_detection
+            if cone is not None:
+                cone_range = self.lidar_range_at_bearing(cone.bearing_rad)
+                if cone_range is not None and cone_range < self.front_obstacle_dist_m * 2.0:
+                    self.auto_state = "WEAVE"
+                    self.get_logger().info("Cone on leg 1->2, entering WEAVE mode")
+                    return
+
+        if self.front_min < self.front_obstacle_dist_m:
+            turn_dir = -1.0 if self.left_min < self.right_min else 1.0
+            self.publish_cmd(0.08, 0.6 * turn_dir)
+            return
+
+        if abs(heading_error) > 0.35:
+            self.publish_cmd(0.0, clamp(1.4 * heading_error, -0.8, 0.8))
+            return
+
+        lin = clamp(0.3 + 0.15 * dist, 0.0, self.max_linear_speed)
+        ang = clamp(1.2 * heading_error, -self.max_angular_speed, self.max_angular_speed)
+        self.publish_cmd(lin, ang)
+
+    def do_weave(self):
+        cone = self.latest_cone_detection
+        if cone is None:
+            self.auto_state = "NAVIGATE"
+            return
+
+        cone_range = self.lidar_range_at_bearing(cone.bearing_rad)
+        if cone_range is None or cone_range > self.front_obstacle_dist_m * 2.5:
+            self.auto_state = "NAVIGATE"
+            return
+
+        if self.distance_to_current_waypoint() < self.goal_radius_m:
+            self.auto_state         = "APPROACH_CONE"
+            self.cone_photo_taken   = False
+            self.object_photo_taken = False
+            self.stop_robot()
+            return
+
+        go_left = self.left_min >= self.right_min
+        desired_cone_bearing = 0.3 if go_left else -0.3
+        bearing_error = wrap_to_pi(cone.bearing_rad - desired_cone_bearing)
+        lin = 0.15 if cone_range > 1.0 else 0.08
+        ang = clamp(-1.8 * bearing_error, -self.max_angular_speed, self.max_angular_speed)
+        self.publish_cmd(lin, ang)
+
+    def do_approach_cone(self):
+        cone = self.latest_cone_detection
+        if cone is None:
+            self.publish_cmd(0.0, 0.35)
+            return
+
+        desired_bearing = 0.18
+        bearing_error   = wrap_to_pi(cone.bearing_rad - desired_bearing)
+        cone_range = self.lidar_range_at_bearing(cone.bearing_rad)
+
+        if cone_range is not None and cone_range < self.cone_stop_distance_m:
+            self.auto_state = "CAPTURE_CONE"
+            self.stop_robot()
+            self.get_logger().info("Cone reached - capturing photo")
+            return
+
+        if self.front_min < self.front_obstacle_dist_m * 0.9:
+            turn_dir = -1.0 if self.left_min < self.right_min else 1.0
+            self.publish_cmd(0.0, 0.5 * turn_dir)
+            return
+
+        lin = 0.12 if abs(bearing_error) < 0.35 else 0.04
+        ang = clamp(1.5 * bearing_error, -0.6, 0.6)
+        self.publish_cmd(lin, ang)
+
+    def do_capture_cone(self):
+        wp_result = WaypointResult(waypoint_index=self.current_wp_idx + 1)
+        if not self.cone_photo_taken:
+            photo_path            = self.save_current_image(f"waypoint_{self.current_wp_idx + 1}_cone")
+            wp_result.cone_photo  = photo_path
+            self.cone_photo_taken = True
+            self._current_wp_result = wp_result
         self.auto_state = "FIND_OBJECT"
-        self._stop()
-        self.get_logger().info("Searching for coloured object...")
+        self.stop_robot()
+        self.get_logger().info("Searching for nearby coloured object...")
 
-    def _find_object(self):
-        obj = self.obj_det
-        if obj:
-            r = self._lidar_at(obj.bearing_rad)
-            if r and r <= OBJECT_SEARCH_RADIUS_M:
+    def do_find_object(self):
+        obj = self.latest_object_detection
+        if obj is not None:
+            obj_range = self.lidar_range_at_bearing(obj.bearing_rad)
+            if obj_range is not None and obj_range <= self.object_search_radius_m:
                 self.auto_state = "CAPTURE_OBJECT"
-                self._stop(); return
-            # also accept area-based distance if lidar angle misses it
-            if obj.distance_hint_m <= OBJECT_SEARCH_RADIUS_M:
-                self.auto_state = "CAPTURE_OBJECT"
-                self._stop(); return
-        self._cmd(0.0, 0.3)   # sweep slowly
+                self.stop_robot()
+                return
+        self.publish_cmd(0.0, 0.3)
 
-    def _capture_object(self):
-        obj = self.obj_det
+    def do_capture_object(self):
+        obj = self.latest_object_detection
         if obj is None:
-            self.auto_state = "FIND_OBJECT"; return
+            self.auto_state = "FIND_OBJECT"
+            return
 
-        lidar_r = self._lidar_at(obj.bearing_rad)
-        dist    = lidar_r if lidar_r else obj.distance_hint_m
-        result  = self._wp_result or WaypointResult(waypoint_index=self.wp_idx + 1)
-
-        if not self.obj_photo_done:
-            path = self._save_photo(f"wp{self.wp_idx+1}_{obj.label}", obj)
-            result.object_label       = obj.label
-            result.object_photo       = path
-            result.object_distance_m  = dist
-            result.object_bearing_rad = obj.bearing_rad
-            self.obj_photo_done = True
-            self.journey.append(result)
-
-        self.get_logger().info(
-            f"WP{self.wp_idx+1}: {obj.label} "
-            f"conf={obj.confidence:.2f} "
-            f"dist={dist:.2f}m "
-            f"bearing={math.degrees(obj.bearing_rad):.1f}deg"
+        obj_range = self.lidar_range_at_bearing(obj.bearing_rad)
+        wp_result = self._current_wp_result or WaypointResult(
+            waypoint_index=self.current_wp_idx + 1
         )
 
-        self.wp_idx += 1
-        if self.wp_idx >= len(WAYPOINTS):
+        if not self.object_photo_taken:
+            photo_path = self.save_current_image(
+                f"waypoint_{self.current_wp_idx + 1}_{obj.label}"
+            )
+            wp_result.object_label       = obj.label
+            wp_result.object_photo       = photo_path
+            wp_result.object_distance_m  = obj_range
+            wp_result.object_bearing_rad = obj.bearing_rad
+            self.object_photo_taken = True
+            self.journey_log.append(wp_result)
+
+        self.get_logger().info(
+            f"WP {self.current_wp_idx + 1}: object={obj.label}, "
+            f"distance={obj_range:.2f}m, bearing={math.degrees(obj.bearing_rad):.1f}deg"
+        )
+
+        self.current_wp_idx += 1
+
+        if self.current_wp_idx >= len(self.gps_waypoints):
             self.auto_state = "DONE"
-            self._stop()
-            self._summary()
+            self.stop_robot()
+            self.print_journey_summary()
         else:
             self.auto_state = "NAVIGATE"
-            self._stop()
-            self.get_logger().info(f"Heading to WP{self.wp_idx+1}")
+            self.stop_robot()
+            self.get_logger().info(f"Heading to waypoint {self.current_wp_idx + 1}")
 
-    # =========================================================================
-    # Journey summary
-    # =========================================================================
+    # =========================
+    # journey summary
+    # =========================
 
-    def _summary(self):
-        elapsed = time.time() - self.start_time
-        m, s = divmod(int(elapsed), 60)
+    def print_journey_summary(self):
+        elapsed = time.time() - self.mission_start_time
+        minutes, seconds = divmod(int(elapsed), 60)
+
         lines = [
-            "", "=" * 55,
-            "        MISSION COMPLETE — JOURNEY SUMMARY",
+            "",
             "=" * 55,
-            f"  Waypoints visited : {len(self.journey)} / {len(WAYPOINTS)}",
-            f"  Mission time      : {m}m {s}s",
-            f"  Photos saved to   : {os.path.abspath(PHOTOS_DIR)}",
+            "           MISSION COMPLETE - JOURNEY SUMMARY",
+            "=" * 55,
+            f"  Total waypoints visited : {len(self.journey_log)} / {len(self.gps_waypoints)}",
+            f"  Total mission time      : {minutes}m {seconds}s",
+            f"  Photos saved to         : {os.path.abspath(self.photos_dir)}",
             "-" * 55,
         ]
-        for r in self.journey:
-            lines.append(f"  WP {r.waypoint_index}:")
-            lines.append(f"    Cone photo   : {r.cone_photo or 'NOT TAKEN'}")
-            if r.object_label:
-                lines.append(f"    Object       : {r.object_label}")
-                lines.append(f"    Distance     : {r.object_distance_m:.2f}m" if r.object_distance_m else "    Distance     : unknown")
-                lines.append(f"    Object photo : {r.object_photo or 'NOT TAKEN'}")
+
+        for result in self.journey_log:
+            lines.append(f"  Waypoint {result.waypoint_index}:")
+            lines.append(f"    Cone photo   : {result.cone_photo or 'NOT TAKEN'}")
+            if result.object_label:
+                dist_str = f"{result.object_distance_m:.2f}m" if result.object_distance_m else "unknown"
+                brng_str = (
+                    f"{math.degrees(result.object_bearing_rad):.1f}deg"
+                    if result.object_bearing_rad is not None else "unknown"
+                )
+                lines.append(f"    Object shape : {result.object_label}")
+                lines.append(f"    Object dist  : {dist_str} at {brng_str}")
+                lines.append(f"    Object photo : {result.object_photo or 'NOT TAKEN'}")
             else:
                 lines.append("    Object       : NOT FOUND")
             lines.append("")
+
         lines.append("=" * 55)
         summary = "\n".join(lines)
         self.get_logger().info(summary)
         print(summary)
 
+    # =========================
+    # cleanup
+    # =========================
+
     def destroy_node(self):
-        self._stop()
+        self.stop_robot()
         super().destroy_node()
 
-
-# =============================================================================
-# Entry point
-# =============================================================================
 
 def main(args=None):
     rclpy.init(args=args)
@@ -836,8 +862,8 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
-        node._stop()
-        node._summary()
+        node.stop_robot()
+        node.print_journey_summary()
         node.destroy_node()
         rclpy.shutdown()
 
