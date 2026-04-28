@@ -242,7 +242,8 @@ class ColourDetectorNode(Node):
     def _start_oakd(self):
         # v3 API — queues are returned directly from build_oakd_pipeline
         pipeline, self.q_rgb, self.q_depth = build_oakd_pipeline()
-        self.device = dai.Device(pipeline)
+        self.device = dai.Device()  # v3 — no pipeline argument
+        self.device.start(pipeline)
         self.use_oakd = True
         self.get_logger().info("OAK-D pipeline started (depthai v3)")
 
