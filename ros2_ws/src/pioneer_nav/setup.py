@@ -25,6 +25,8 @@ setup(
         'console_scripts': [
             'distbug_controller = pioneer_nav.distbug_controller:main',
             'ps4_basic_drive = pioneer_nav.ps4_basic_drive:main',
+            'mission_manager = pioneer_nav.mission_manager:main',
+            'colour_detector = pioneer_nav.colour_detector_node:main',
         ],
     },
 )

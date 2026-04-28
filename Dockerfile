@@ -33,6 +33,9 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-cv-bridge \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python packages
+RUN pip install depthai --break-system-packages 
+
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
     update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
