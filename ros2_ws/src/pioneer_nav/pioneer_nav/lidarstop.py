@@ -16,7 +16,7 @@ from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 
 STOP_DISTANCE = 0.5   # metres
-FORWARD_SPEED = 0.3   # m/s
+FORWARD_SPEED = 0.2   # m/s
 
 
 class LidarStop(Node):
