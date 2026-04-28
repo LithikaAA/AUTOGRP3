@@ -93,18 +93,18 @@ def build_oakd_pipeline():
     """
     pipeline = dai.Pipeline()
 
-    # RGB camera (v3 API)
+    # RGB camera
     cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
 
-    # Stereo depth (v3 API)
+    # Stereo depth — v3 correct signature
     stereo = pipeline.create(dai.node.StereoDepth).build(
-        align=cam_rgb,
-        fps=15,
-        monoResolution=dai.MonoCameraProperties.SensorResolution.THE_400_P,
+        autoCreateCameras=True,
+        presetMode=dai.node.StereoDepth.PresetMode.FAST_ACCURACY,
+        size=(640, 400),
+        fps=15.0,
     )
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_ACCURACY)
 
-    # Output queues (v3 uses createOutputQueue, not XLinkOut)
+    # Output queues
     q_rgb   = cam_rgb.requestOutput((640, 480), dai.ImgFrame.Type.BGR888p).createOutputQueue()
     q_depth = stereo.depth.createOutputQueue()
 
