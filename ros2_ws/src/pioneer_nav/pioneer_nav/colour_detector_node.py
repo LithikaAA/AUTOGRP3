@@ -86,22 +86,20 @@ class ColourDetection:
 # =============================================================================
 
 def build_oakd_pipeline():
-    """
-    Build a DepthAI v3 pipeline that gives us:
-    - RGB frame (640x480 for detection)
-    - Depth map aligned to RGB (for real distance measurement)
-    """
     pipeline = dai.Pipeline()
 
     # RGB camera
     cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
 
-    # Stereo depth — v3 correct signature
+    # Mono cameras for stereo
+    mono_left  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    mono_right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+
+    # Stereo depth — explicitly pass left and right
     stereo = pipeline.create(dai.node.StereoDepth).build(
-        autoCreateCameras=True,
+        left=mono_left.requestOutput((640, 400)),
+        right=mono_right.requestOutput((640, 400)),
         presetMode=dai.node.StereoDepth.PresetMode.FAST_ACCURACY,
-        size=(640, 400),
-        fps=15.0,
     )
 
     # Output queues
