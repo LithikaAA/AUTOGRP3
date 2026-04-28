@@ -110,7 +110,7 @@ def build_oakd_pipeline():
     mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
     mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
 
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.HIGH_DENSITY)
+    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
     stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # align depth to RGB
     stereo.setOutputSize(640, 480)
 
