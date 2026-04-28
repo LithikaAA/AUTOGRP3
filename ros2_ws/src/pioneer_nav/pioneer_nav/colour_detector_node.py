@@ -376,13 +376,10 @@ class ColourDetectorNode(Node):
 
 def debug_standalone():
     print("Colour detector debug mode")
-    print("  R = red mask    Y = yellow mask    Q = quit")
-
     if DEPTHAI_AVAILABLE:
-        pipeline = build_oakd_pipeline()
-        with dai.Device(pipeline) as device:
-            q_rgb   = device.getOutputQueue("rgb",   maxSize=1, blocking=False)
-            q_depth = device.getOutputQueue("depth", maxSize=1, blocking=False)
+        pipeline, q_rgb, q_depth = build_oakd_pipeline()  # unpack the 3 values
+        with dai.Device() as device:
+            device.start(pipeline)
             _debug_loop_oakd(q_rgb, q_depth)
     else:
         cap = cv2.VideoCapture(0)
