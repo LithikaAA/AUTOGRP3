@@ -87,45 +87,28 @@ class ColourDetection:
 
 def build_oakd_pipeline():
     """
-    Build a DepthAI pipeline that gives us:
-    - RGB frame (1080p, passthrough for detection)
+    Build a DepthAI v3 pipeline that gives us:
+    - RGB frame (640x480 for detection)
     - Depth map aligned to RGB (for real distance measurement)
     """
     pipeline = dai.Pipeline()
 
-    # RGB camera
-    cam_rgb = pipeline.create(dai.node.ColorCamera)
-    cam_rgb.setPreviewSize(640, 480)
-    cam_rgb.setInterleaved(False)
-    cam_rgb.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
-    cam_rgb.setFps(15)
+    # RGB camera (v3 API)
+    cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
 
-    # Stereo depth
-    mono_left  = pipeline.create(dai.node.MonoCamera)
-    mono_right = pipeline.create(dai.node.MonoCamera)
-    stereo     = pipeline.create(dai.node.StereoDepth)
+    # Stereo depth (v3 API)
+    stereo = pipeline.create(dai.node.StereoDepth).build(
+        align=cam_rgb,
+        fps=15,
+        monoResolution=dai.MonoCameraProperties.SensorResolution.THE_400_P,
+    )
+    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_ACCURACY)
 
-    mono_left.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-    mono_right.setResolution(dai.MonoCameraProperties.SensorResolution.THE_400_P)
-    mono_left.setBoardSocket(dai.CameraBoardSocket.CAM_B)
-    mono_right.setBoardSocket(dai.CameraBoardSocket.CAM_C)
+    # Output queues (v3 uses createOutputQueue, not XLinkOut)
+    q_rgb   = cam_rgb.requestOutput((640, 480), dai.ImgFrame.Type.BGR888p).createOutputQueue()
+    q_depth = stereo.depth.createOutputQueue()
 
-    stereo.setDefaultProfilePreset(dai.node.StereoDepth.PresetMode.FAST_DENSITY)
-    stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # align depth to RGB
-    stereo.setOutputSize(640, 480)
-
-    # Outputs
-    xout_rgb   = pipeline.create(dai.node.XLinkOut)
-    xout_depth = pipeline.create(dai.node.XLinkOut)
-    xout_rgb.setStreamName("rgb")
-    xout_depth.setStreamName("depth")
-
-    cam_rgb.preview.link(xout_rgb.input)
-    mono_left.out.link(stereo.left)
-    mono_right.out.link(stereo.right)
-    stereo.depth.link(xout_depth.input)
-
-    return pipeline
+    return pipeline, q_rgb, q_depth
 
 
 # =============================================================================
@@ -259,12 +242,11 @@ class ColourDetectorNode(Node):
     # ------------------------------------------------------------------
 
     def _start_oakd(self):
-        pipeline = build_oakd_pipeline()
+        # v3 API — queues are returned directly from build_oakd_pipeline
+        pipeline, self.q_rgb, self.q_depth = build_oakd_pipeline()
         self.device = dai.Device(pipeline)
-        self.q_rgb   = self.device.getOutputQueue("rgb",   maxSize=1, blocking=False)
-        self.q_depth = self.device.getOutputQueue("depth", maxSize=1, blocking=False)
         self.use_oakd = True
-        self.get_logger().info("OAK-D V2 pipeline started")
+        self.get_logger().info("OAK-D pipeline started (depthai v3)")
 
     def _start_webcam_fallback(self):
         """Fallback for testing on laptop without OAK-D."""
