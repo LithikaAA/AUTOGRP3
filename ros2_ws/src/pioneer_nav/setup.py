@@ -24,6 +24,7 @@ setup(
     entry_points={
         'console_scripts': [
             'distbug_controller = pioneer_nav.distbug_controller:main',
+            'lidarstop = pioneer_nav.lidarstop:main',
             'ps4_basic_drive = pioneer_nav.ps4_basic_drive:main',
             'mission_manager = pioneer_nav.mission_manager:main',
             'colour_detector = pioneer_nav.colour_detector_node:main',
