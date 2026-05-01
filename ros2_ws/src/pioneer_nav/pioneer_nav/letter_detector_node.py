@@ -66,7 +66,7 @@ class LetterDetectorNode(Node):
         best_area = 0
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if h*w*0.03 < area < h*w*0.5:
+            if h*w*0.01 < area < h*w*0.5:
                 x, y, cw, ch = cv2.boundingRect(cnt)
                 aspect = cw/ch if ch > 0 else 0
                 if 0.3 < aspect < 2.5 and area > best_area:
