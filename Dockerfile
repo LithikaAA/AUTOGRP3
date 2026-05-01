@@ -24,14 +24,15 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-teleop-twist-joy \
     ros-jazzy-nmea-navsat-driver \
     ros-jazzy-teleop-twist-keyboard \
-    python3-opencv \
     ros-jazzy-cv-bridge \
-    # lidar
     ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
-    ros-jazzy-sick-scan-xd \
-    ros-jazzy-cv-bridge \
+    ros-jazzy-depthai-ros \
+    usbutils \
     && rm -rf /var/lib/apt/lists/*
+
+# Install onnxruntime for Greek letter detection
+RUN pip install onnxruntime --break-system-packages
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
@@ -43,7 +44,6 @@ RUN git clone https://github.com/reedhedges/AriaCoda.git /opt/AriaCoda && \
     cd /opt/AriaCoda && \
     make -j2 && \
     make install
-
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # Copy your project
