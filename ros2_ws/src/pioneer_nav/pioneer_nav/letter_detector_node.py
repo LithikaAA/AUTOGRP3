@@ -12,7 +12,8 @@ CLASSES = {}
 _class_file = os.path.join(os.path.dirname(__file__), 'greek_classes.txt')
 with open(_class_file) as f:
     for line in f:
-        idx, name, letter = line.strip().split(',')
+        parts = line.strip().split(',')
+        idx, name = parts[0], parts[1]
         CLASSES[int(idx)] = name
 
 class LetterDetectorNode(Node):
