@@ -14,8 +14,8 @@ echo "Starting LIDAR..."
 ros2 launch sick_scan_xd sick_tim_7xx.launch.py &
 sleep 2
 
-echo "Starting DistBug controller..."
-ros2 run pioneer_nav distbug_controller &
+echo "Starting control node..."
+ros2 run pioneer_nav control_node &
 sleep 2
 
 echo "System running. Press CTRL+C to stop."
