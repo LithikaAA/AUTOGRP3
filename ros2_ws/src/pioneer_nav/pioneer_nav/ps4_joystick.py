@@ -81,6 +81,7 @@ class PS4JoystickController(Node):
         self.manual_linear   = 0.0
         self.manual_angular  = 0.0
         self.enabled = False
+        self.keyboard_override = False
         self.deadman_pressed = not self.use_deadman  # Default ON if deadman not used
         self._last_enable_button = False
         self._last_disable_button = False
@@ -207,6 +208,7 @@ class PS4JoystickController(Node):
                     self.get_logger().info("Keyboard: joystick driving enabled")
                 elif key == 'm':
                     self.enabled = False
+                    self.keyboard_override = False
                     self.manual_linear = 0.0
                     self.manual_angular = 0.0
                     self.get_logger().info("Keyboard: joystick driving disabled")
@@ -217,18 +219,23 @@ class PS4JoystickController(Node):
                             f"Keyboard: deadman={'ON' if self.deadman_pressed else 'OFF'}"
                         )
                 elif key == 'w':
+                    self.keyboard_override = True
                     self.manual_linear  =  0.3
                     self.manual_angular =  0.0
                 elif key == 's':
+                    self.keyboard_override = True
                     self.manual_linear  = -0.3
                     self.manual_angular =  0.0
                 elif key == 'q':
+                    self.keyboard_override = True
                     self.manual_linear  =  0.0
                     self.manual_angular =  0.5
                 elif key == 'e':
+                    self.keyboard_override = True
                     self.manual_linear  =  0.0
                     self.manual_angular = -0.5
                 elif key == 'x':
+                    self.keyboard_override = False
                     self.manual_linear  = 0.0
                     self.manual_angular = 0.0
         except Exception as e:
@@ -242,6 +249,10 @@ class PS4JoystickController(Node):
 
     def control_loop(self):
         """Main control loop - publishes cmd_vel based on joystick input."""
+        if self.keyboard_override:
+            self.publish_cmd(self.manual_linear, self.manual_angular)
+            return
+
         if not self.enabled:
             self.publish_cmd(0.0, 0.0)
             return
