@@ -43,14 +43,18 @@ class PS4JoystickController(Node):
         # joystick mapping (PS4 defaults)
         #   axes[0]    = left stick horizontal  (turn)
         #   axes[1]    = left stick vertical    (forward)
-        #   buttons[0] = X (cross)              -> not used in standalone
-        #   buttons[1] = O (circle)             -> not used in standalone
-        #   buttons[3] = Triangle               -> deadman (optional, default off)
+        #   buttons[0] = X (cross)              -> enable driving
+        #   buttons[1] = O (circle)             -> disable/stop driving
+        #   buttons[2] = Square                 -> emergency stop
+        #   buttons[3] = Triangle               -> deadman (optional, default on)
         # -------------------------------------------------
         self.declare_parameter("joy_axis_linear",    1)
         self.declare_parameter("joy_axis_angular",   0)
+        self.declare_parameter("joy_enable_button",  0)   # X
+        self.declare_parameter("joy_disable_button", 1)   # Circle
+        self.declare_parameter("joy_stop_button",    2)   # Square
         self.declare_parameter("joy_deadman_button", 3)   # Triangle
-        self.declare_parameter("use_deadman",        False)  # Enable deadman switch
+        self.declare_parameter("use_deadman",        True)  # Hold Triangle to move
 
         # control tuning
         self.declare_parameter("max_linear_speed",  0.5)
@@ -62,6 +66,9 @@ class PS4JoystickController(Node):
 
         self.joy_axis_linear   = int(self.get_parameter("joy_axis_linear").value)
         self.joy_axis_angular  = int(self.get_parameter("joy_axis_angular").value)
+        self.joy_enable_button = int(self.get_parameter("joy_enable_button").value)
+        self.joy_disable_button = int(self.get_parameter("joy_disable_button").value)
+        self.joy_stop_button = int(self.get_parameter("joy_stop_button").value)
         self.joy_deadman_button = int(self.get_parameter("joy_deadman_button").value)
         self.use_deadman       = bool(self.get_parameter("use_deadman").value)
 
@@ -73,7 +80,11 @@ class PS4JoystickController(Node):
         # -------------------------
         self.manual_linear   = 0.0
         self.manual_angular  = 0.0
+        self.enabled = False
         self.deadman_pressed = not self.use_deadman  # Default ON if deadman not used
+        self._last_enable_button = False
+        self._last_disable_button = False
+        self._last_stop_button = False
 
         # -------------------------
         # pubs / subs
@@ -85,12 +96,13 @@ class PS4JoystickController(Node):
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info("PS4 Joystick controller started")
+        self.get_logger().info("PS4: X=enable  O=disable/stop  Square=emergency stop")
         if self.use_deadman:
             self.get_logger().info(f"Hold Triangle (button {self.joy_deadman_button}) to enable movement")
         else:
             self.get_logger().info("Deadman switch disabled - joystick will control movement directly")
         self.get_logger().info(f"Linear axis: {self.joy_axis_linear}, Angular axis: {self.joy_axis_angular}")
-        self.get_logger().info("Keyboard: w/s/q/e/x for manual control, ESC/d to toggle deadman")
+        self.get_logger().info("Keyboard: a=enable  m=disable  x=stop  w/s/q/e to move  ESC/d to toggle deadman")
 
         # Start keyboard fallback thread
         self._keyboard_thread = threading.Thread(target=self.keyboard_thread, daemon=True)
@@ -107,6 +119,9 @@ class PS4JoystickController(Node):
         PS4 default mapping:
             axes[1]    = left stick up/down    (forward/back)
             axes[0]    = left stick left/right (turn)
+            buttons[0] = X                     -> enable driving
+            buttons[1] = O                     -> disable/stop driving
+            buttons[2] = Square                -> emergency stop
             buttons[3] = Triangle              -> deadman (if enabled)
         """
         n_axes    = len(msg.axes)
@@ -122,16 +137,49 @@ class PS4JoystickController(Node):
             )
             return
 
+        max_button = max(
+            self.joy_enable_button,
+            self.joy_disable_button,
+            self.joy_stop_button,
+            self.joy_deadman_button,
+        )
+        if max_button >= n_buttons:
+            self.get_logger().warn(
+                f"Button index {max_button} out of range (controller has {n_buttons} buttons). "
+                "Run 'ros2 topic echo /joy' to check button mapping.",
+                throttle_duration_sec=5.0
+            )
+            return
+
+        enable_pressed = bool(msg.buttons[self.joy_enable_button])
+        disable_pressed = bool(msg.buttons[self.joy_disable_button])
+        stop_pressed = bool(msg.buttons[self.joy_stop_button])
+
+        if enable_pressed and not self._last_enable_button:
+            self.enabled = True
+            self.get_logger().info("PS4 X pressed: joystick driving enabled")
+
+        if disable_pressed and not self._last_disable_button:
+            self.enabled = False
+            self.manual_linear = 0.0
+            self.manual_angular = 0.0
+            self.publish_cmd(0.0, 0.0)
+            self.get_logger().info("PS4 O pressed: joystick driving disabled")
+
+        if stop_pressed and not self._last_stop_button:
+            self.enabled = False
+            self.manual_linear = 0.0
+            self.manual_angular = 0.0
+            self.publish_cmd(0.0, 0.0)
+            self.get_logger().warn("PS4 Square pressed: emergency stop")
+
+        self._last_enable_button = enable_pressed
+        self._last_disable_button = disable_pressed
+        self._last_stop_button = stop_pressed
+
         # Update deadman state if enabled
         if self.use_deadman:
-            if self.joy_deadman_button < n_buttons:
-                self.deadman_pressed = bool(msg.buttons[self.joy_deadman_button])
-            else:
-                self.get_logger().warn(
-                    f"Deadman button {self.joy_deadman_button} out of range "
-                    f"(controller has {n_buttons} buttons).",
-                    throttle_duration_sec=5.0
-                )
+            self.deadman_pressed = bool(msg.buttons[self.joy_deadman_button])
 
         # Extract and clamp joystick input
         lin_axis = msg.axes[self.joy_axis_linear]  if self.joy_axis_linear  < len(msg.axes) else 0.0
@@ -154,6 +202,14 @@ class PS4JoystickController(Node):
                 key = sys.stdin.read(1)
                 if key == '\x1b':  # ESC
                     break
+                elif key == 'a':
+                    self.enabled = True
+                    self.get_logger().info("Keyboard: joystick driving enabled")
+                elif key == 'm':
+                    self.enabled = False
+                    self.manual_linear = 0.0
+                    self.manual_angular = 0.0
+                    self.get_logger().info("Keyboard: joystick driving disabled")
                 elif key == 'd':
                     if self.use_deadman:
                         self.deadman_pressed = not self.deadman_pressed
@@ -186,6 +242,10 @@ class PS4JoystickController(Node):
 
     def control_loop(self):
         """Main control loop - publishes cmd_vel based on joystick input."""
+        if not self.enabled:
+            self.publish_cmd(0.0, 0.0)
+            return
+
         # Check deadman before publishing
         if self.use_deadman and not self.deadman_pressed:
             self.publish_cmd(0.0, 0.0)
