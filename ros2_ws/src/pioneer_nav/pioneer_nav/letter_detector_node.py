@@ -55,21 +55,21 @@ class LetterDetectorNode(Node):
             f'Confidence: {self.conf_thresh}')
 
     def find_sign_region(self, gray):
-    _, bright = cv2.threshold(gray, self.bright_thresh, 255, cv2.THRESH_BINARY)
-    kernel = np.ones((5,5), np.uint8)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel)
-    bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, kernel)
-    contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL,
+       _, bright = cv2.threshold(gray, self.bright_thresh, 255, cv2.THRESH_BINARY)
+       kernel = np.ones((5,5), np.uint8)
+       bright = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel)
+       bright = cv2.morphologyEx(bright, cv2.MORPH_OPEN, kernel)
+       contours, _ = cv2.findContours(bright, cv2.RETR_EXTERNAL,
                         cv2.CHAIN_APPROX_SIMPLE)
-    h, w = gray.shape
-    img_cx, img_cy = w // 2, h // 2
+       h, w = gray.shape
+       img_cx, img_cy = w // 2, h // 2
 
-    best = None
-    best_score = 0
+       best = None
+       best_score = 0
 
-    for cnt in contours:
-        area = cv2.contourArea(cnt)
-        if h*w*0.01 < area < h*w*0.5:
+       for cnt in contours:
+         area = cv2.contourArea(cnt)
+         if h*w*0.01 < area < h*w*0.5:
             x, y, cw, ch = cv2.boundingRect(cnt)
             aspect = cw/ch if ch > 0 else 0
             if 0.3 < aspect < 2.5:
@@ -84,8 +84,8 @@ class LetterDetectorNode(Node):
                 if score > best_score:
                     best_score = score
                     best = (x, y, cw, ch)
-    return best
-
+       return best
+        
     def extract_letter(self, region):
         _, dark = cv2.threshold(region, 100, 255, cv2.THRESH_BINARY_INV)
         conts, _ = cv2.findContours(
