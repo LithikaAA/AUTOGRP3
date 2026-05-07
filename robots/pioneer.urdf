@@ -652,7 +652,7 @@ Overall, these changes make the robot behave more like a real system where senso
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/> <!-- Mesh at origin -->
       <geometry>
-        <mesh filename="/mnt/c/Users/Lithi/Desktop/AUTO4408/Project 1/robots/meshes/hokuyo1.dae"/> <!-- Hokuyo mesh -->
+        <mesh filename="/home/rahma/AUTOGRP3/robots/meshes/hokuyo1.dae"/>
       </geometry>
     </visual>
 
