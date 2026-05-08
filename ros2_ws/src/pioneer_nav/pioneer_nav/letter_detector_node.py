@@ -118,44 +118,60 @@ class LetterDetectorNode(Node):
         return best
 
     def extract_letter(self, region):
-      # Use adaptive threshold to handle grey backgrounds
-      # better than a fixed value of 100
+      IMG_SIZE = 64
+
+      # Step 1 — same adaptive threshold as training
       blur = cv2.GaussianBlur(region, (5, 5), 0)
       thresh = cv2.adaptiveThreshold(
-         blur, 255,
+        blur, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
         11, 4
       )
 
+      # Step 2 — find bounding box of letter
       conts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.CHAIN_APPROX_SIMPLE)
       lx, ly = region.shape[1], region.shape[0]
       lw, lh = 0, 0
       for cnt in conts:
-        if cv2.contourArea(cnt) > 50:
+        if cv2.contourArea(cnt) > 20:
             bx, by, bw, bh = cv2.boundingRect(cnt)
             lx = min(lx, bx)
             ly = min(ly, by)
             lw = max(lw, bx+bw)
             lh = max(lh, by+bh)
-        lw = lw - lx
-        lh = lh - ly
-        if lw > 0 and lh > 0:
-           return region[ly:ly+lh, lx:lx+lw]
-      return region
+      lw = lw - lx
+      lh = lh - ly
+
+      if lw > 0 and lh > 0:
+        letter = region[ly:ly+lh, lx:lx+lw]
+      else:
+        letter = region
+
+      # Step 3 — resize maintaining aspect ratio with padding
+      # exactly as in preprocess() during training
+      scale = (IMG_SIZE - 8) / max(letter.shape)
+      new_w = int(letter.shape[1] * scale)
+      new_h = int(letter.shape[0] * scale)
+      resized = cv2.resize(letter, (new_w, new_h))
+      result = np.ones((IMG_SIZE, IMG_SIZE), dtype=np.uint8) * 255
+      y_off = (IMG_SIZE - new_h) // 2
+      x_off = (IMG_SIZE - new_w) // 2
+      result[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+      return result
 
     def classify(self, letter_region):
-        resized = cv2.resize(letter_region, (64, 64))
-        inp = resized.astype(np.float32) / 255.0
-        inp = inp[np.newaxis, np.newaxis, :, :]
-        outputs = self.session.run(None, {self.input_name: inp})
-        probs = outputs[0][0]
-        probs = np.exp(probs - probs.max())
-        probs = probs / probs.sum()
-        class_id = int(np.argmax(probs))
-        confidence = float(probs[class_id])
-        return CLASSES[class_id], confidence
+      # letter_region is already 64x64 from extract_letter
+      inp = letter_region.astype(np.float32) / 255.0
+      inp = inp[np.newaxis, np.newaxis, :, :]
+      outputs = self.session.run(None, {self.input_name: inp})
+      probs = outputs[0][0]
+      probs = np.exp(probs - probs.max())
+      probs = probs / probs.sum()
+      class_id = int(np.argmax(probs))
+      confidence = float(probs[class_id])
+      return CLASSES[class_id], confidence
 
     def image_callback(self, msg):
         self.frame_count += 1
