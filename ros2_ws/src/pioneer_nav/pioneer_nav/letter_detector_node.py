@@ -118,32 +118,32 @@ class LetterDetectorNode(Node):
         return best
 
     def extract_letter(self, region):
-       # Use adaptive threshold to handle grey backgrounds
-       # better than a fixed value of 100
-       blur = cv2.GaussianBlur(region, (5, 5), 0)
-       thresh = cv2.adaptiveThreshold(
-          blur, 255,
-          cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-          cv2.THRESH_BINARY_INV,
-          11, 4
-       )
+      # Use adaptive threshold to handle grey backgrounds
+      # better than a fixed value of 100
+      blur = cv2.GaussianBlur(region, (5, 5), 0)
+      thresh = cv2.adaptiveThreshold(
+         blur, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        11, 4
+      )
 
-       conts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                    cv2.CHAIN_APPROX_SIMPLE)
-       lx, ly = region.shape[1], region.shape[0]
-       lw, lh = 0, 0
-       for cnt in conts:
-          if cv2.contourArea(cnt) > 50:
-              bx, by, bw, bh = cv2.boundingRect(cnt)
-              lx = min(lx, bx)
-              ly = min(ly, by)
-              lw = max(lw, bx+bw)
-              lh = max(lh, by+bh)
+      conts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE)
+      lx, ly = region.shape[1], region.shape[0]
+      lw, lh = 0, 0
+      for cnt in conts:
+        if cv2.contourArea(cnt) > 50:
+            bx, by, bw, bh = cv2.boundingRect(cnt)
+            lx = min(lx, bx)
+            ly = min(ly, by)
+            lw = max(lw, bx+bw)
+            lh = max(lh, by+bh)
         lw = lw - lx
         lh = lh - ly
         if lw > 0 and lh > 0:
            return region[ly:ly+lh, lx:lx+lw]
-        return region
+      return region
 
     def classify(self, letter_region):
         resized = cv2.resize(letter_region, (64, 64))
