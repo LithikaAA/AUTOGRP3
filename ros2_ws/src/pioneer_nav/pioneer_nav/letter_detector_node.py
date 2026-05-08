@@ -182,7 +182,7 @@ class LetterDetectorNode(Node):
         letter = self.extract_letter(region)
         if letter.size == 0:
             return
-            
+        cv2.imwrite(f'/tmp/live_{self.frame_count}.png', letter)   
         cv2.imwrite('/tmp/letter_input.png', letter)
         name, confidence = self.classify(letter)
 
