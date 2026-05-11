@@ -30,6 +30,7 @@ Topics used:
 import math
 import subprocess
 import os
+import time
 from datetime import datetime
 
 import rclpy
@@ -45,6 +46,10 @@ fwdspeed = 0.2 # m/s
 
 # motion detection threshold
 movethres = 0.18 # metres
+
+# how long to hold estop before allowing resume (seconds)
+# stops it from instantly clearing when something is close but briefly still
+estop_hold = 2.0
 
 # rosbag settings
 bagdirect = "/ros2_ws/bags" # where to save bags
@@ -63,6 +68,10 @@ class LidarEstop(Node):
 
         # stores whether a moving obstacle is currently detected
         self.obstacle_detected = False
+
+        # timestamp of when estop last triggered
+        # used to hold estop for estop_hold seconds before clearing
+        self.estop_time = 0.0
 
         # stores the previous scan so we can compare
         self.prev_ranges = None
@@ -103,9 +112,9 @@ class LidarEstop(Node):
     # rosbag helpers
 
     def startbag(self):
-        # name each bag by timestamp so they dont overwrite each other
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        bagpath  = os.path.join(bagdirect, f"rolling_{timestamp}")
+        # name each bag by timestamp (with microseconds so rapid restarts don't clash)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        bagpath = os.path.join(bagdirect, f"rolling_{timestamp}")
 
         try:
             self.bag_proc = subprocess.Popen(
@@ -199,6 +208,7 @@ class LidarEstop(Node):
             if not self.obstacle_detected:
                 self.get_logger().info(f"EMERGENCY STOP - moving obstacle at {hitclosest:.2f}m")
                 self.obstacle_detected = True
+                self.estop_time = time.time()  # record when estop triggered
                 # log incident to file
                 self.log_incident(hitclosest, movehits_estop)
                 # save the rosbag
@@ -211,11 +221,14 @@ class LidarEstop(Node):
             if not self.obstacle_detected:
                 self.get_logger().info(f"Moving obstacle in warning zone at {hitclosest:.2f}m — stopping")
                 self.obstacle_detected = True
+                self.estop_time = time.time()  # record when stop triggered
 
-        # all clear
+        # all clear — but only resume if we've held long enough
         elif self.obstacle_detected:
-            self.get_logger().info("Path clear - resuming")
-            self.obstacle_detected = False
+            held_for = time.time() - self.estop_time
+            if held_for >= estop_hold:
+                self.get_logger().info("Path clear - resuming")
+                self.obstacle_detected = False
 
         # save current scan for next comparison
         self.prev_ranges = curr
