@@ -6,8 +6,8 @@ LiDAR E-STOP -> moving obstacle detection
 - Robot drives forward continuously (will be replaced with usual drive)
 - Checks ALL directions for moving obstacles
 - Two zones:
-      -> within 4m: slow stop, wait until clear, then resume
-      -> within 1m: emergency stop, log incident to file + save rosbag
+      -> within 4m: warning, stop and wait until clear
+      -> within 1m: EMERGENCY STOP, immediate halt, log incident + save rosbag
 
 How moving detection works (THIS WILL NEED TO BE ALTERED because when robot is moving things move)
 - We save the previous lidar scan
@@ -48,12 +48,11 @@ fwdspeed = 0.2 # m/s
 movethres = 0.18 # metres
 
 # how long to hold estop before allowing resume (seconds)
-# stops it from instantly clearing when something is close but briefly still
 estop_hold = 4.0
 
 # rosbag settings
 bagdirect = "/ros2_ws/bags" # where to save bags
-bagtime = 10 # seconds before restarting the rolling bag (might switch to 5 for requirements)
+bagtime = 10 # seconds before restarting the rolling bag
 bagtops = ["/scan", "/cmd_vel"] # what topics to record
 
 # where to save incident logs
@@ -66,11 +65,13 @@ class LidarEstop(Node):
         # create ROS2 node
         super().__init__("estoplidar")
 
-        # stores whether a moving obstacle is currently detected
-        self.obstacle_detected = False
+        # two separate states now:
+        # estop_active -> full emergency stop (1m), latches for estop_hold seconds
+        # warn_active  -> warning zone stop (4m), clears as soon as path is clear
+        self.estop_active = False
+        self.warn_active  = False
 
         # timestamp of when estop last triggered
-        # used to hold estop for estop_hold seconds before clearing
         self.estop_time = 0.0
 
         # stores the previous scan so we can compare
@@ -133,7 +134,6 @@ class LidarEstop(Node):
 
     def restartbag(self):
         # rolling restart: stop current bag, start a fresh one
-        # keeps file sizes small, always have recent data ready
         self.stopbag()
         self.startbag()
 
@@ -149,8 +149,7 @@ class LidarEstop(Node):
 
         curr = msg.ranges
 
-        # first scan ever
-        # nothing to compare against yet, just save and wait
+        # first scan ever — nothing to compare against yet, just save and wait
         if self.prev_ranges is None:
             self.prev_ranges = curr
             return
@@ -201,34 +200,48 @@ class LidarEstop(Node):
         estop_trig = movehits_estop >= 5
         warn_trig  = movehits_warn  >= 5
 
-        # emergency stop (1m)
+        # --- EMERGENCY STOP (within 1m) ---
         if estop_trig:
             print(f"[ESTOP] moving object detected (hits={movehits_estop}, closest={hitclosest:.2f}m)")
 
-            if not self.obstacle_detected:
+            # send stop immediately right here, dont wait for controloop
+            self.sendvelo(0.0)
+
+            if not self.estop_active:
                 self.get_logger().info(f"EMERGENCY STOP - moving obstacle at {hitclosest:.2f}m")
-                self.obstacle_detected = True
-                self.estop_time = time.time()
+                self.estop_active = True
+                self.warn_active  = False  # estop overrides warn
+                self.estop_time   = time.time()
                 # log incident to file
                 self.log_incident(hitclosest, movehits_estop)
                 # save the rosbag
                 self.save_incident_bag()
 
-        # warning zone (4m)
-        elif warn_trig:
+        # --- WARNING ZONE (within 4m) ---
+        # only applies if not already in estop
+        elif warn_trig and not self.estop_active:
             print(f"[WARN] moving object in warning zone (hits={movehits_warn}, closest={hitclosest:.2f}m)")
 
-            if not self.obstacle_detected:
-                self.get_logger().info(f"Moving obstacle in warning zone at {hitclosest:.2f}m — stopping")
-                self.obstacle_detected = True
-                self.estop_time = time.time()
+            # stop immediately too
+            self.sendvelo(0.0)
 
-        # all clear — but only resume if we've held long enough
-        elif self.obstacle_detected:
-            held_for = time.time() - self.estop_time
-            if held_for >= estop_hold:
-                self.get_logger().info("Path clear - resuming")
-                self.obstacle_detected = False
+            if not self.warn_active:
+                self.get_logger().info(f"Moving obstacle in warning zone at {hitclosest:.2f}m — stopping")
+                self.warn_active = True
+
+        # --- ALL CLEAR ---
+        else:
+            # clear warn zone immediately
+            if self.warn_active:
+                self.get_logger().info("Warning zone clear - resuming")
+                self.warn_active = False
+
+            # only clear estop after hold time has passed
+            if self.estop_active:
+                held_for = time.time() - self.estop_time
+                if held_for >= estop_hold:
+                    self.get_logger().info("Path clear - resuming")
+                    self.estop_active = False
 
         # save current scan for next comparison
         self.prev_ranges = curr
@@ -246,9 +259,15 @@ class LidarEstop(Node):
             self.get_logger().warn(f"Could not write incident log: {e}")
 
     # control loop, runs on the timer
+    # handles steady state — the immediate stops happen in lidarcb
     def controloop(self):
-        # stopped: moving obstacle in either zone
-        if self.obstacle_detected:
+
+        # estop overrides everything
+        if self.estop_active:
+            self.sendvelo(0.0)
+
+        # warning zone — stop and wait
+        elif self.warn_active:
             self.sendvelo(0.0)
 
         # all clear, go forward
