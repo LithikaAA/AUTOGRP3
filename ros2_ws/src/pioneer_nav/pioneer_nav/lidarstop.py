@@ -95,15 +95,19 @@ class LidarStop(Node):
 
         # find closest object in front area
         closest = min(frontranges)
+        # debug print
+        print(min(frontranges))
 
         # obstacle exist? t/f
         if closest <= stopdist:
-            # obstacle detected
-            self.obstacle_detected = True
 
-            self.get_logger().info(
-                f"Obstacle ahead: {closest:.2f} m"
-            )
+            # only print once when state changes
+            if not self.obstacle_detected:
+                self.get_logger().info(
+                    f"Obstacle ahead: {closest:.2f} m"
+                )
+
+            self.obstacle_detected = True
 
         else:
             # front is clear
