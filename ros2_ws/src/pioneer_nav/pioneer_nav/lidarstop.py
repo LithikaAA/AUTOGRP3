@@ -85,6 +85,7 @@ class LidarStop(Node):
                 if (
                     not math.isnan(distance)
                     and not math.isinf(distance)
+                    and distance > 0.1
                 ):
                     frontranges.append(distance)
 
