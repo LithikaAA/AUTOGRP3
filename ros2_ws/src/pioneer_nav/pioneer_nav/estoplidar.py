@@ -49,7 +49,7 @@ movethres = 0.18 # metres
 
 # how long to hold estop before allowing resume (seconds)
 # stops it from instantly clearing when something is close but briefly still
-estop_hold = 2.0
+estop_hold = 4.0
 
 # rosbag settings
 bagdirect = "/ros2_ws/bags" # where to save bags
@@ -208,7 +208,7 @@ class LidarEstop(Node):
             if not self.obstacle_detected:
                 self.get_logger().info(f"EMERGENCY STOP - moving obstacle at {hitclosest:.2f}m")
                 self.obstacle_detected = True
-                self.estop_time = time.time()  # record when estop triggered
+                self.estop_time = time.time()
                 # log incident to file
                 self.log_incident(hitclosest, movehits_estop)
                 # save the rosbag
@@ -221,7 +221,7 @@ class LidarEstop(Node):
             if not self.obstacle_detected:
                 self.get_logger().info(f"Moving obstacle in warning zone at {hitclosest:.2f}m — stopping")
                 self.obstacle_detected = True
-                self.estop_time = time.time()  # record when stop triggered
+                self.estop_time = time.time()
 
         # all clear — but only resume if we've held long enough
         elif self.obstacle_detected:
@@ -277,7 +277,11 @@ def main():
 
     finally:
         # safety stop before shutdown
-        node.sendvelo(0.0)
+        # wrapped in try/except so a timing issue on ctrl+c doesn't crash it
+        try:
+            node.sendvelo(0.0)
+        except Exception:
+            pass
         # stop the rosbag cleanly
         node.stopbag()
         # clean up
