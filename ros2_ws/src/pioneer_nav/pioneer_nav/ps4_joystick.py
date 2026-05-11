@@ -82,6 +82,7 @@ class PS4JoystickController(Node):
         self.manual_angular  = 0.0
         self.enabled = False
         self.keyboard_override = False
+        self.emergency_stop = False
         self.deadman_pressed = not self.use_deadman  # Default ON if deadman not used
         self._last_enable_button = False
         self._last_disable_button = False
@@ -157,18 +158,22 @@ class PS4JoystickController(Node):
         stop_pressed = bool(msg.buttons[self.joy_stop_button])
 
         if enable_pressed and not self._last_enable_button:
+            self.emergency_stop = False
             self.enabled = True
             self.get_logger().info("PS4 X pressed: joystick driving enabled")
 
         if disable_pressed and not self._last_disable_button:
+            self.emergency_stop = False
             self.enabled = False
             self.manual_linear = 0.0
             self.manual_angular = 0.0
             self.publish_cmd(0.0, 0.0)
-            self.get_logger().info("PS4 O pressed: joystick driving disabled")
+            self.get_logger().info("PS4 O pressed: joystick disabled, autonomous mode can drive")
 
         if stop_pressed and not self._last_stop_button:
+            self.emergency_stop = True
             self.enabled = False
+            self.keyboard_override = False
             self.manual_linear = 0.0
             self.manual_angular = 0.0
             self.publish_cmd(0.0, 0.0)
@@ -204,9 +209,11 @@ class PS4JoystickController(Node):
                 if key == '\x1b':  # ESC
                     break
                 elif key == 'a':
+                    self.emergency_stop = False
                     self.enabled = True
                     self.get_logger().info("Keyboard: joystick driving enabled")
                 elif key == 'm':
+                    self.emergency_stop = False
                     self.enabled = False
                     self.keyboard_override = False
                     self.manual_linear = 0.0
@@ -249,12 +256,15 @@ class PS4JoystickController(Node):
 
     def control_loop(self):
         """Main control loop - publishes cmd_vel based on joystick input."""
+        if self.emergency_stop:
+            self.publish_cmd(0.0, 0.0)
+            return
+
         if self.keyboard_override:
             self.publish_cmd(self.manual_linear, self.manual_angular)
             return
 
         if not self.enabled:
-            self.publish_cmd(0.0, 0.0)
             return
 
         # Check deadman before publishing

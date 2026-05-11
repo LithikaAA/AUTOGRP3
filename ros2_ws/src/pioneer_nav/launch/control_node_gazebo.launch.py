@@ -19,17 +19,34 @@ def generate_launch_description():
     # Path to existing Pioneer URDF
     robot_file = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/AUTOGRP3/robots/pioneer.urdf'
     mesh_dir = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/AUTOGRP3/robots/meshes'
-    world_file = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/worlds/basic_urdf.sdf'
-    
+    source_world_file = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/worlds/basic_urdf.sdf'
+
     with open(robot_file, 'r') as infp:
         robot_desc = infp.read()
-    
+
     # Fix mesh paths to be absolute
     robot_desc = robot_desc.replace('filename="meshes/', f'filename="{mesh_dir}/')
     robot_desc = robot_desc.replace('/home/rahma/AUTOGRP3/robots/meshes', mesh_dir)
+    robot_desc = robot_desc.replace('<topic>cmd_vel</topic>', '<topic>/cmd_vel</topic>')
+    robot_desc = robot_desc.replace('<odom_topic>odom</odom_topic>', '<odom_topic>/odom</odom_topic>')
+    robot_desc = robot_desc.replace('<topic>scan</topic>', '<topic>/scan</topic>')
     processed_robot_file = os.path.join(tempfile.gettempdir(), 'pioneer_gazebo.urdf')
     with open(processed_robot_file, 'w') as outfp:
         outfp.write(robot_desc)
+
+    with open(source_world_file, 'r') as infp:
+        world_desc = infp.read()
+    world_desc = world_desc.replace(
+        '''            <include>
+        <uri>file:///mnt/c/Users/rahma/Downloads/Resources/robots/pioneer.urdf</uri>
+        <name>pioneer</name>
+        <pose>0 0 0.2 0 0 0</pose>
+        </include>''',
+        ''
+    )
+    world_file = os.path.join(tempfile.gettempdir(), 'pioneer_world_no_robot.sdf')
+    with open(world_file, 'w') as outfp:
+        outfp.write(world_desc)
 
     # ==================== Launch Arguments ====================
     rviz_launch_arg = DeclareLaunchArgument(
@@ -96,6 +113,11 @@ def generate_launch_description():
             {'scan_topic': '/scan'},
             {'odom_topic': '/odom'},
             {'cmd_vel_topic': '/cmd_vel'},
+            {'forward_speed': 0.3},
+            {'reverse_speed': -0.25},
+            {'turn_speed_deg': 35.0},
+            {'return_to_center_speed': 0.25},
+            {'return_to_center_turn_speed_deg': 30.0},
         ]
     )
 
@@ -106,9 +128,10 @@ def generate_launch_description():
         name='gazebo_ros_bridge',
         output='screen',
         arguments=[
-            '/cmd_vel@geometry_msgs/msg/Twist@gz.msgs.Twist',
-            '/odom@nav_msgs/msg/Odometry@gz.msgs.Odometry',
-            '/scan@sensor_msgs/msg/LaserScan@gz.msgs.LaserScan',
+            '/clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock',
+            '/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist',
+            '/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry',
+            '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
         ],
         parameters=[
             {'use_sim_time': True},

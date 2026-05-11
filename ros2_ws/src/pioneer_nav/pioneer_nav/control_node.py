@@ -16,7 +16,8 @@ INITIAL_TURN_ANGLE = 45
 INITIAL_DRIVE_DISTANCE = 5.0
 BOUNDARY_BUFFER = 1.0
 MAP_SIZE = 15.0
-MAP_CENTER = (MAP_SIZE / 2, MAP_SIZE / 2)
+MAP_HALF_SIZE = MAP_SIZE / 2
+MAP_CENTER = (0.0, 0.0)
 
 OBSTACLE_BUFFER = 0.6
 EMERGENCY_STOP_DISTANCE = 0.3
@@ -26,10 +27,12 @@ OBSTACLE_REVERSE_DURATION = 0.7
 OBSTACLE_TURN_DURATION = 1.5
 PREDICTIVE_BUFFER = 4.0
 
-TURN_SPEED_DEG = 70
-FORWARD_SPEED = 0.8
-REVERSE_SPEED = -0.7
+TURN_SPEED_DEG = 35.0
+FORWARD_SPEED = 0.3
+REVERSE_SPEED = -0.25
 ANGLE_TOLERANCE = 7.0
+TURN_TIMEOUT_MARGIN = 2.0
+ODOM_STALE_TIMEOUT = 1.0
 TRANSITION_STOP_DURATION = 0.3
 REVERSE_DURATION = 2.0
 MIN_TURN_SPEED_FACTOR = 0.2
@@ -41,8 +44,8 @@ BOUNDARY_ESCAPE_DRIVE_DISTANCE = 3.0
 CENTER_BIAS_STRENGTH = 0.7
 MIN_CENTER_ANGLE = -45
 MAX_CENTER_ANGLE = 45
-RETURN_TO_CENTER_SPEED = 0.5
-RETURN_TO_CENTER_TURN_SPEED_DEG = 45
+RETURN_TO_CENTER_SPEED = 0.25
+RETURN_TO_CENTER_TURN_SPEED_DEG = 30.0
 RETURN_TO_CENTER_MIN_DISTANCE = 0.5
 
 
@@ -74,6 +77,14 @@ def quaternion_to_yaw(orientation):
     return math.degrees(math.atan2(siny_cosp, cosy_cosp)) % 360
 
 
+def signed_angle_diff(target_yaw, current_yaw):
+    """Return shortest signed yaw error in degrees."""
+    angle_diff = (target_yaw - current_yaw + 360) % 360
+    if angle_diff > 180:
+        angle_diff -= 360
+    return angle_diff
+
+
 class ControlNode(Node):
     def __init__(self):
         super().__init__('pioneer_control_node')
@@ -83,8 +94,15 @@ class ControlNode(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('joy_deadman_axis', 5)
-        self.declare_parameter('joy_auto_button', 0)
-        self.declare_parameter('joy_manual_button', 1)
+        self.declare_parameter('joy_manual_button', 0)  # X: external joystick/manual control
+        self.declare_parameter('joy_auto_button', 1)    # O: autonomous control
+        self.declare_parameter('joy_stop_button', 2)    # Square: emergency stop
+        self.declare_parameter('external_manual_control', True)
+        self.declare_parameter('forward_speed', FORWARD_SPEED)
+        self.declare_parameter('reverse_speed', REVERSE_SPEED)
+        self.declare_parameter('turn_speed_deg', TURN_SPEED_DEG)
+        self.declare_parameter('return_to_center_speed', RETURN_TO_CENTER_SPEED)
+        self.declare_parameter('return_to_center_turn_speed_deg', RETURN_TO_CENTER_TURN_SPEED_DEG)
 
         joy_topic = self.get_parameter('joy_topic').value
         scan_topic = self.get_parameter('scan_topic').value
@@ -94,6 +112,13 @@ class ControlNode(Node):
         self.joy_deadman_axis = int(self.get_parameter('joy_deadman_axis').value)
         self.joy_auto_button = int(self.get_parameter('joy_auto_button').value)
         self.joy_manual_button = int(self.get_parameter('joy_manual_button').value)
+        self.joy_stop_button = int(self.get_parameter('joy_stop_button').value)
+        self.external_manual_control = bool(self.get_parameter('external_manual_control').value)
+        self.forward_speed = float(self.get_parameter('forward_speed').value)
+        self.reverse_speed = float(self.get_parameter('reverse_speed').value)
+        self.turn_speed_deg = float(self.get_parameter('turn_speed_deg').value)
+        self.return_to_center_speed = float(self.get_parameter('return_to_center_speed').value)
+        self.return_to_center_turn_speed_deg = float(self.get_parameter('return_to_center_turn_speed_deg').value)
 
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
 
@@ -106,18 +131,27 @@ class ControlNode(Node):
         self.current_yaw = 0.0
         self.current_x = 0.0
         self.current_y = 0.0
+        self.map_origin_x = None
+        self.map_origin_y = None
+        self.have_odom = False
+        self.last_odom_time = None
         self.target_yaw = None
         self.start_position = (0.0, 0.0)
         self.drive_distance = 0.0
         self.wandering_target_yaw = None
 
         self.turn_start_time = None
+        self.turn_start_yaw = None
         self.reverse_start_time = 0.0
         self.obstacle_maneuver_start_time = 0.0
         self.transition_stop_end_time = 0.0
         self.last_linear = 0.0
         self.last_angular = 0.0
         self.trigger = False
+        self.emergency_stop = False
+        self._last_auto_button = False
+        self._last_manual_button = False
+        self._last_stop_button = False
 
         self.front_min_distance = float('inf')
         self.left_min_distance = float('inf')
@@ -128,21 +162,60 @@ class ControlNode(Node):
 
         self.get_logger().info('Pioneer control node started')
         self.get_logger().info(f'Joy: {joy_topic}, scan: {scan_topic}, odom: {odom_topic}, cmd_vel: {cmd_vel_topic}')
+        self.get_logger().info(
+            f'Speeds: forward={self.forward_speed:.2f} m/s, reverse={self.reverse_speed:.2f} m/s, '
+            f'turn={self.turn_speed_deg:.1f} deg/s'
+        )
 
     def joy_cb(self, msg: Joy):
         with self.mutex:
-            if self.joy_auto_button < len(msg.buttons) and msg.buttons[self.joy_auto_button]:
-                if self.drive_mode != DRIVE_MODE.AUTO:
-                    self.drive_mode = DRIVE_MODE.AUTO
-                    self.auto_state = AUTO_STATE.INITIAL_TURN
-                    self.target_yaw = None
-                    self.get_logger().info('Auto mode activated')
+            max_button = max(self.joy_auto_button, self.joy_manual_button, self.joy_stop_button)
+            if max_button >= len(msg.buttons):
+                self.get_logger().warn(
+                    f'Button index {max_button} out of range (controller has {len(msg.buttons)} buttons).',
+                    throttle_duration_sec=5.0
+                )
+                return
 
-            elif self.joy_manual_button < len(msg.buttons) and msg.buttons[self.joy_manual_button]:
-                if self.drive_mode != DRIVE_MODE.MANUAL:
-                    self.drive_mode = DRIVE_MODE.MANUAL
-                    self.publish_twist(0.0, 0.0)
-                    self.get_logger().info('Manual mode activated')
+            manual_pressed = bool(msg.buttons[self.joy_manual_button])
+            auto_pressed = bool(msg.buttons[self.joy_auto_button])
+            stop_pressed = bool(msg.buttons[self.joy_stop_button])
+
+            if stop_pressed and not self._last_stop_button:
+                self.emergency_stop = True
+                self.drive_mode = DRIVE_MODE.MANUAL
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().warn('PS4 Square pressed: emergency stop latched')
+
+            if manual_pressed and not self._last_manual_button:
+                self.emergency_stop = False
+                self.drive_mode = DRIVE_MODE.MANUAL
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().info('PS4 X pressed: control node paused for joystick/manual control')
+
+            if auto_pressed and not self._last_auto_button:
+                self.emergency_stop = False
+                self.drive_mode = DRIVE_MODE.AUTO
+                self.auto_state = AUTO_STATE.INITIAL_TURN
+                if self.have_odom:
+                    self.map_origin_x = self.current_x
+                    self.map_origin_y = self.current_y
+                self.target_yaw = None
+                self.turn_start_time = None
+                self.turn_start_yaw = None
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().info('PS4 O pressed: autonomous mode activated')
+
+            self._last_manual_button = manual_pressed
+            self._last_auto_button = auto_pressed
+            self._last_stop_button = stop_pressed
+
+            if self.emergency_stop:
+                self.publish_twist(0.0, 0.0)
+                return
+
+            if self.drive_mode == DRIVE_MODE.MANUAL and self.external_manual_control:
+                return
 
             deadman_pressed = False
             if self.joy_deadman_axis < len(msg.axes):
@@ -202,10 +275,37 @@ class ControlNode(Node):
             self.current_x = msg.pose.pose.position.x
             self.current_y = msg.pose.pose.position.y
             self.current_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+            if self.map_origin_x is None or self.map_origin_y is None:
+                self.map_origin_x = self.current_x
+                self.map_origin_y = self.current_y
+                self.get_logger().info(
+                    f'15x15 arena centered at odom ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+                )
+            self.have_odom = True
+            self.last_odom_time = time.time()
+
+    def relative_position(self):
+        if self.map_origin_x is None or self.map_origin_y is None:
+            return 0.0, 0.0
+        return self.current_x - self.map_origin_x, self.current_y - self.map_origin_y
 
     def control_loop(self):
         with self.mutex:
+            if self.emergency_stop:
+                self.publish_twist(0.0, 0.0)
+                return
+
             if self.drive_mode != DRIVE_MODE.AUTO:
+                return
+
+            if not self.have_odom:
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().warn('Waiting for odometry before autonomous movement.', throttle_duration_sec=2.0)
+                return
+
+            if self.last_odom_time is None or time.time() - self.last_odom_time > ODOM_STALE_TIMEOUT:
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().warn('Odometry is stale; stopping autonomous movement.', throttle_duration_sec=2.0)
                 return
 
             if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
@@ -229,8 +329,9 @@ class ControlNode(Node):
                 self.publish_twist(0.0, 0.0)
                 return
 
-            if not (0 <= self.current_x <= MAP_SIZE and 0 <= self.current_y <= MAP_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
-                self.get_logger().warn(f'Robot outside map bounds at ({self.current_x:.2f}, {self.current_y:.2f}). Returning to center.')
+            rel_x, rel_y = self.relative_position()
+            if not (-MAP_HALF_SIZE <= rel_x <= MAP_HALF_SIZE and -MAP_HALF_SIZE <= rel_y <= MAP_HALF_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
+                self.get_logger().warn(f'Robot outside 15x15 arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
                 self.auto_state = AUTO_STATE.RETURN_TO_CENTER
                 self.target_yaw = None
                 self.publish_twist(0.0, 0.0)
@@ -271,7 +372,7 @@ class ControlNode(Node):
 
     def handle_obstacle_reverse(self):
         if time.time() - self.obstacle_maneuver_start_time < OBSTACLE_REVERSE_DURATION:
-            self.publish_twist(REVERSE_SPEED, 0.0)
+            self.publish_twist(self.reverse_speed, 0.0)
         else:
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
@@ -282,31 +383,33 @@ class ControlNode(Node):
             else:
                 turn_angle = -90
             self.target_yaw = (self.current_yaw + turn_angle) % 360
+            self._start_turn_timer()
             self.get_logger().info(f'Finished obstacle reverse. Initiating obstacle turn to {self.target_yaw:.1f}°.')
 
     def handle_obstacle_turn(self):
-        angle_diff = (self.target_yaw - self.current_yaw + 360) % 360
-        if angle_diff > 180:
-            angle_diff -= 360
+        angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
         abs_angle_diff = abs(angle_diff)
-        if abs_angle_diff < ANGLE_TOLERANCE or (time.time() - self.obstacle_maneuver_start_time > OBSTACLE_TURN_DURATION):
+        if abs_angle_diff < ANGLE_TOLERANCE or self._turn_timed_out():
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.auto_state = AUTO_STATE.WANDERING_DRIVE
             self.target_yaw = None
+            self.turn_start_time = None
+            self.turn_start_yaw = None
             self.get_logger().info('Finished obstacle turn. Resuming wandering drive.')
         else:
-            angular_speed = math.copysign(math.radians(TURN_SPEED_DEG), angle_diff)
+            angular_speed = math.copysign(math.radians(self.turn_speed_deg), angle_diff)
             self.publish_twist(0.0, angular_speed)
 
     def handle_initial_turn(self):
         if self.target_yaw is None:
             self.target_yaw = (self.current_yaw + INITIAL_TURN_ANGLE) % 360
+            self._start_turn_timer()
             self.get_logger().info(f'Initial turn to {self.target_yaw:.1f}° from {self.current_yaw:.1f}°')
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             return
-        self.execute_smooth_turn(AUTO_STATE.INITIAL_DRIVE, FORWARD_SPEED)
+        self.execute_smooth_turn(AUTO_STATE.INITIAL_DRIVE)
 
     def handle_initial_drive(self):
         distance = math.hypot(self.current_x - self.start_position[0], self.current_y - self.start_position[1])
@@ -316,7 +419,7 @@ class ControlNode(Node):
             self.target_yaw = None
             self.get_logger().info('Initial drive complete. Starting wandering turn.')
         else:
-            self.publish_twist(FORWARD_SPEED, 0.0)
+            self.publish_twist(self.forward_speed, 0.0)
 
     def handle_wandering_turn(self):
         if self.target_yaw is None:
@@ -328,11 +431,12 @@ class ControlNode(Node):
                 random_angle = random.uniform(-MAX_WANDERING_TURN_ANGLE, MAX_WANDERING_TURN_ANGLE)
                 self.target_yaw = (self.current_yaw + random_angle) % 360
                 self.get_logger().info(f'Wandering turn (random) to {self.target_yaw:.1f}° from {self.current_yaw:.1f}°.')
+            self._start_turn_timer()
             self.drive_distance = random.uniform(MIN_DRIVE_DISTANCE, MAX_DRIVE_DISTANCE)
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             return
-        self.execute_smooth_turn(AUTO_STATE.WANDERING_DRIVE, FORWARD_SPEED)
+        self.execute_smooth_turn(AUTO_STATE.WANDERING_DRIVE)
 
     def handle_wandering_drive(self):
         if self.predictive_boundary_check():
@@ -350,11 +454,11 @@ class ControlNode(Node):
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.get_logger().info('Wandering drive distance met. Starting next wandering turn.')
         else:
-            self.publish_twist(FORWARD_SPEED, 0.0)
+            self.publish_twist(self.forward_speed, 0.0)
 
     def handle_boundary_reverse(self):
         if time.time() - self.reverse_start_time < REVERSE_DURATION:
-            self.publish_twist(REVERSE_SPEED, 0.0)
+            self.publish_twist(self.reverse_speed, 0.0)
         else:
             self.publish_twist(0.0, 0.0)
             self.auto_state = AUTO_STATE.BOUNDARY_ESCAPE_TURN
@@ -362,30 +466,53 @@ class ControlNode(Node):
             self.target_yaw = None
             self.get_logger().info('Reverse complete. Initiating boundary escape turn.')
 
+    def _start_turn_timer(self):
+        self.turn_start_time = time.time()
+        self.turn_start_yaw = self.current_yaw
+
+    def _turn_timed_out(self):
+        if self.turn_start_time is None or self.turn_start_yaw is None or self.target_yaw is None:
+            return False
+
+        requested_angle = abs(signed_angle_diff(self.target_yaw, self.turn_start_yaw))
+        expected_duration = requested_angle / max(self.turn_speed_deg, 1.0)
+        timeout = max(OBSTACLE_TURN_DURATION, expected_duration + TURN_TIMEOUT_MARGIN)
+
+        if time.time() - self.turn_start_time <= timeout:
+            return False
+
+        remaining = abs(signed_angle_diff(self.target_yaw, self.current_yaw))
+        self.get_logger().warn(
+            f'Turn timed out with {remaining:.1f} deg remaining. Continuing to avoid spinning forever.',
+            throttle_duration_sec=2.0
+        )
+        return True
+
     def execute_aggressive_turn(self, next_state):
-        angle_diff = (self.target_yaw - self.current_yaw + 360) % 360
-        if angle_diff > 180:
-            angle_diff -= 360
+        angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
         abs_angle_diff = abs(angle_diff)
-        if abs_angle_diff < ANGLE_TOLERANCE:
+        if abs_angle_diff < ANGLE_TOLERANCE or self._turn_timed_out():
             self.publish_twist(0.0, 0.0)
             if self.auto_state != AUTO_STATE.OBSTACLE_TURN:
                 self.auto_state = next_state
                 self.start_position = (self.current_x, self.current_y)
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.target_yaw = None
+                self.turn_start_time = None
+                self.turn_start_yaw = None
                 self.get_logger().info(f'Aggressive turn complete. Transitioning to {next_state.name}.')
             return
-        angular_speed = math.copysign(math.radians(TURN_SPEED_DEG), angle_diff)
+        angular_speed = math.copysign(math.radians(self.turn_speed_deg), angle_diff)
         self.publish_twist(0.0, angular_speed)
 
     def handle_boundary_escape_turn(self):
         if self.target_yaw is None:
+            rel_x, rel_y = self.relative_position()
             boundaries = {
-                'east': MAP_SIZE - self.current_x,
-                'west': self.current_x,
-                'north': MAP_SIZE - self.current_y,
-                'south': self.current_y,
+                'east': MAP_HALF_SIZE - rel_x,
+                'west': rel_x + MAP_HALF_SIZE,
+                'north': MAP_HALF_SIZE - rel_y,
+                'south': rel_y + MAP_HALF_SIZE,
             }
             closest_boundary = min(boundaries, key=boundaries.get)
             if closest_boundary == 'east':
@@ -399,6 +526,7 @@ class ControlNode(Node):
             center_yaw = self._calculate_general_inward_direction()
             angle_offset = random.uniform(MIN_CENTER_ANGLE, MAX_CENTER_ANGLE)
             self.target_yaw = (base_angle * (1 - CENTER_BIAS_STRENGTH) + center_yaw * CENTER_BIAS_STRENGTH + angle_offset) % 360
+            self._start_turn_timer()
             self.get_logger().info(f'Boundary escape: Facing {closest_boundary} boundary, turning to {self.target_yaw:.1f}°')
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
@@ -413,10 +541,11 @@ class ControlNode(Node):
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.get_logger().info('Boundary escape drive complete. Now returning to wandering.')
         else:
-            self.publish_twist(FORWARD_SPEED, 0.0)
+            self.publish_twist(self.forward_speed, 0.0)
 
     def handle_return_to_center(self):
-        distance_to_center = math.hypot(self.current_x - MAP_CENTER[0], self.current_y - MAP_CENTER[1])
+        rel_x, rel_y = self.relative_position()
+        distance_to_center = math.hypot(rel_x - MAP_CENTER[0], rel_y - MAP_CENTER[1])
         if distance_to_center < RETURN_TO_CENTER_MIN_DISTANCE:
             self.get_logger().info('Successfully returned to map center. Resuming wandering.')
             self.auto_state = AUTO_STATE.WANDERING_TURN
@@ -424,8 +553,8 @@ class ControlNode(Node):
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.publish_twist(0.0, 0.0)
             return
-        vec_x = MAP_CENTER[0] - self.current_x
-        vec_y = MAP_CENTER[1] - self.current_y
+        vec_x = MAP_CENTER[0] - rel_x
+        vec_y = MAP_CENTER[1] - rel_y
         target_yaw_to_center_rad = math.atan2(vec_y, vec_x)
         target_yaw_to_center_deg = math.degrees(target_yaw_to_center_rad)
         target_yaw_to_center_norm = (target_yaw_to_center_deg + 360) % 360
@@ -435,23 +564,22 @@ class ControlNode(Node):
             if self.transition_stop_end_time <= time.time():
                 self.publish_twist(0.0, 0.0)
                 self.transition_stop_end_time = time.time() + 0.1
-        angle_diff = (self.target_yaw - self.current_yaw + 360) % 360
-        if angle_diff > 180:
-            angle_diff -= 360
+        angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
         abs_angle_diff = abs(angle_diff)
         if abs_angle_diff > ANGLE_TOLERANCE:
-            angular_speed = math.copysign(math.radians(RETURN_TO_CENTER_TURN_SPEED_DEG), angle_diff)
-            linear_speed = RETURN_TO_CENTER_SPEED * 0.1
+            angular_speed = math.copysign(math.radians(self.return_to_center_turn_speed_deg), angle_diff)
+            linear_speed = self.return_to_center_speed * 0.1
         else:
             angular_speed = 0.0
-            linear_speed = RETURN_TO_CENTER_SPEED
+            linear_speed = self.return_to_center_speed
         self.publish_twist(linear_speed, angular_speed)
 
     def near_boundary(self, buffer_distance):
-        return (self.current_x < buffer_distance or
-                self.current_x > MAP_SIZE - buffer_distance or
-                self.current_y < buffer_distance or
-                self.current_y > MAP_SIZE - buffer_distance)
+        rel_x, rel_y = self.relative_position()
+        return (rel_x < -MAP_HALF_SIZE + buffer_distance or
+                rel_x > MAP_HALF_SIZE - buffer_distance or
+                rel_y < -MAP_HALF_SIZE + buffer_distance or
+                rel_y > MAP_HALF_SIZE - buffer_distance)
 
     def predictive_boundary_check(self):
         if self.near_boundary(PREDICTIVE_BUFFER) and not self.near_boundary(BOUNDARY_BUFFER):
@@ -460,17 +588,18 @@ class ControlNode(Node):
 
     def _calculate_predictive_avoidance_yaw(self):
         angle_to_center = self._calculate_general_inward_direction()
+        rel_x, rel_y = self.relative_position()
         yaw_rad = math.radians(self.current_yaw)
         dir_x = math.cos(yaw_rad)
         dir_y = math.sin(yaw_rad)
         escape_angle = None
-        if self.current_x < PREDICTIVE_BUFFER and dir_x < 0:
+        if rel_x < -MAP_HALF_SIZE + PREDICTIVE_BUFFER and dir_x < 0:
             escape_angle = (self.current_yaw + random.uniform(90, 180)) % 360
-        elif self.current_x > MAP_SIZE - PREDICTIVE_BUFFER and dir_x > 0:
+        elif rel_x > MAP_HALF_SIZE - PREDICTIVE_BUFFER and dir_x > 0:
             escape_angle = (self.current_yaw - random.uniform(90, 180)) % 360
-        elif self.current_y < PREDICTIVE_BUFFER and dir_y < 0:
+        elif rel_y < -MAP_HALF_SIZE + PREDICTIVE_BUFFER and dir_y < 0:
             escape_angle = (self.current_yaw - random.uniform(90, 180)) % 360
-        elif self.current_y > MAP_SIZE - PREDICTIVE_BUFFER and dir_y > 0:
+        elif rel_y > MAP_HALF_SIZE - PREDICTIVE_BUFFER and dir_y > 0:
             escape_angle = (self.current_yaw + random.uniform(90, 180)) % 360
         if escape_angle is not None:
             angle_diff_to_center = (angle_to_center - escape_angle + 360) % 360
@@ -480,36 +609,38 @@ class ControlNode(Node):
         return (self.current_yaw + random.uniform(-MAX_WANDERING_TURN_ANGLE, MAX_WANDERING_TURN_ANGLE)) % 360
 
     def _calculate_general_inward_direction(self):
-        vec_x = MAP_CENTER[0] - self.current_x
-        vec_y = MAP_CENTER[1] - self.current_y
+        rel_x, rel_y = self.relative_position()
+        vec_x = MAP_CENTER[0] - rel_x
+        vec_y = MAP_CENTER[1] - rel_y
         angle_rad = math.atan2(vec_y, vec_x)
         return (math.degrees(angle_rad) + 360) % 360
 
     def is_heading_towards_boundary(self, check_buffer):
+        rel_x, rel_y = self.relative_position()
         yaw_rad = math.radians(self.current_yaw)
         dir_x = math.cos(yaw_rad)
         dir_y = math.sin(yaw_rad)
-        if self.current_y < check_buffer and dir_y < 0:
+        if rel_y < -MAP_HALF_SIZE + check_buffer and dir_y < 0:
             return True
-        if self.current_y > MAP_SIZE - check_buffer and dir_y > 0:
+        if rel_y > MAP_HALF_SIZE - check_buffer and dir_y > 0:
             return True
-        if self.current_x < check_buffer and dir_x < 0:
+        if rel_x < -MAP_HALF_SIZE + check_buffer and dir_x < 0:
             return True
-        if self.current_x > MAP_SIZE - check_buffer and dir_x > 0:
+        if rel_x > MAP_HALF_SIZE - check_buffer and dir_x > 0:
             return True
         return False
 
-    def execute_smooth_turn(self, next_state, linear_speed):
-        angle_diff = (self.target_yaw - self.current_yaw + 360) % 360
-        if angle_diff > 180:
-            angle_diff -= 360
+    def execute_smooth_turn(self, next_state):
+        angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
         abs_angle_diff = abs(angle_diff)
-        if abs_angle_diff < ANGLE_TOLERANCE:
+        if abs_angle_diff < ANGLE_TOLERANCE or self._turn_timed_out():
             self.publish_twist(0.0, 0.0)
             self.auto_state = next_state
             self.start_position = (self.current_x, self.current_y)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.target_yaw = None
+            self.turn_start_time = None
+            self.turn_start_yaw = None
             self.get_logger().info(f'Turn complete. Transitioning to {next_state.name}.')
             return
         if abs_angle_diff > MAX_TURN_ANGLE_FOR_FULL_SPEED:
@@ -517,8 +648,8 @@ class ControlNode(Node):
         else:
             normalized_diff = abs_angle_diff / MAX_TURN_ANGLE_FOR_FULL_SPEED
             turn_factor = max(MIN_TURN_SPEED_FACTOR, normalized_diff ** 1.5)
-        angular_speed = math.copysign(TURN_SPEED_DEG * turn_factor, angle_diff)
-        self.publish_twist(linear_speed, math.radians(angular_speed))
+        angular_speed = math.copysign(self.turn_speed_deg * turn_factor, angle_diff)
+        self.publish_twist(0.0, math.radians(angular_speed))
 
     def publish_twist(self, linear, angular):
         cmd = Twist()
