@@ -96,7 +96,7 @@ class LidarStop(Node):
         # find closest object in front area
         closest = min(frontranges)
         # debug print
-        print(min(frontranges))
+        print(closest)
 
         # obstacle exist? t/f
         if closest <= stopdist:
