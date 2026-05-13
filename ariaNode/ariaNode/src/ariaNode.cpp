@@ -7,6 +7,7 @@
 */
 
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <string>
@@ -14,6 +15,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
+#include <nav_msgs/msg/odometry.hpp>
 
 # include "Aria/Aria.h"
 
@@ -21,6 +23,7 @@
 bool stopRunning = false;
 
 using namespace std::chrono_literals;
+constexpr double PI = 3.14159265358979323846;
 /*
 *   Basic ROS node that updates velocity of pioneer robot, Aria doesn't like
 *   being spun as a node therefore we just use a single subscriber
@@ -30,13 +33,19 @@ using namespace std::chrono_literals;
 */
 class ariaNode : public rclcpp::Node {
     public:
-        ariaNode(float* forwardSpeed, float* rotationSpeed) : Node("Aria_node") {
+        ariaNode(float* forwardSpeed, float* rotationSpeed, ArRobot* robotHandle) : Node("Aria_node") {
             currentForwardSpeed = forwardSpeed;
             currentRotationSpeed = rotationSpeed;
+            robot = robotHandle;
 
             cmdVelSub = create_subscription<geometry_msgs::msg::Twist> (
                 "cmd_vel", 10, std::bind(&ariaNode::cmdVelCallback, this, std::placeholders::_1)
-            );    
+            );
+
+            odomPub = create_publisher<nav_msgs::msg::Odometry>("odom", 20);
+            odomTimer = create_wall_timer(
+                50ms, std::bind(&ariaNode::publishOdom, this)
+            );
         }
 
     private:
@@ -53,8 +62,49 @@ class ariaNode : public rclcpp::Node {
         }
 
         rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmdVelSub;
+        rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odomPub;
+        rclcpp::TimerBase::SharedPtr odomTimer;
         float* currentForwardSpeed;
         float* currentRotationSpeed;
+        ArRobot* robot;
+
+        void publishOdom() {
+            if (robot == nullptr) {
+                return;
+            }
+
+            robot->lock();
+            const double x_m = robot->getX() / 1000.0;
+            const double y_m = robot->getY() / 1000.0;
+            const double yaw_rad = robot->getTh() * PI / 180.0;
+            const double linear_mps = robot->getVel() / 1000.0;
+            const double angular_radps = robot->getRotVel() * PI / 180.0;
+            robot->unlock();
+
+            nav_msgs::msg::Odometry odom;
+            odom.header.stamp = now();
+            odom.header.frame_id = "odom";
+            odom.child_frame_id = "base_link";
+
+            odom.pose.pose.position.x = x_m;
+            odom.pose.pose.position.y = y_m;
+            odom.pose.pose.position.z = 0.0;
+            odom.pose.pose.orientation.x = 0.0;
+            odom.pose.pose.orientation.y = 0.0;
+            odom.pose.pose.orientation.z = std::sin(yaw_rad * 0.5);
+            odom.pose.pose.orientation.w = std::cos(yaw_rad * 0.5);
+
+            odom.twist.twist.linear.x = linear_mps;
+            odom.twist.twist.angular.z = angular_radps;
+
+            odom.pose.covariance[0] = 0.02;
+            odom.pose.covariance[7] = 0.02;
+            odom.pose.covariance[35] = 0.05;
+            odom.twist.covariance[0] = 0.02;
+            odom.twist.covariance[35] = 0.05;
+
+            odomPub->publish(odom);
+        }
     
 };
 
@@ -96,7 +146,7 @@ int main(int argc, char** argv) {
     // RCLCPP_DEBUG(aNode->get_logger(),"Enable Motors");
     robot->enableMotors();
 
-    auto aNode = std::make_shared<ariaNode>(&forwardSpeed, &rotationSpeed);
+    auto aNode = std::make_shared<ariaNode>(&forwardSpeed, &rotationSpeed, robot);
     RCLCPP_DEBUG(aNode->get_logger(),"Before Spin!...");
 
     /*
