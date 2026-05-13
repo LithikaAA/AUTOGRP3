@@ -17,6 +17,7 @@ def generate_launch_description():
     scan_frame = LaunchConfiguration('scan_frame')
     odom_tf_stamp_with_current_time = LaunchConfiguration('odom_tf_stamp_with_current_time')
     rviz_config = LaunchConfiguration('rviz_config')
+    slam_start_delay = LaunchConfiguration('slam_start_delay')
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -57,6 +58,11 @@ def generate_launch_description():
             ]),
             description='RViz config to load for mapping.',
         ),
+        DeclareLaunchArgument(
+            'slam_start_delay',
+            default_value='5.0',
+            description='Seconds to wait for odom and scan TF before starting slam_toolbox.',
+        ),
         Node(
             package='pioneer_nav',
             executable='odom_tf_broadcaster',
@@ -86,18 +92,23 @@ def generate_launch_description():
                 '--child-frame-id', scan_frame,
             ],
         ),
-        Node(
-            package='slam_toolbox',
-            executable='async_slam_toolbox_node',
-            name='slam_toolbox',
-            output='screen',
-            parameters=[
-                slam_params,
-                {'use_sim_time': use_sim_time},
+        TimerAction(
+            period=slam_start_delay,
+            actions=[
+                Node(
+                    package='slam_toolbox',
+                    executable='async_slam_toolbox_node',
+                    name='slam_toolbox',
+                    output='screen',
+                    parameters=[
+                        slam_params,
+                        {'use_sim_time': use_sim_time},
+                    ],
+                ),
             ],
         ),
         TimerAction(
-            period=5.0,
+            period=slam_start_delay,
             actions=[
                 Node(
                     package='nav2_lifecycle_manager',
