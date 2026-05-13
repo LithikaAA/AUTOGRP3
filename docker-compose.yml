@@ -13,6 +13,7 @@ services:
     volumes:
       - /dev/input:/dev/input
       - /dev:/dev
+      - ./ros2_ws/maps:/ros2_ws/maps
     environment:
       - ROS_DOMAIN_ID=0
     command: /bin/bash

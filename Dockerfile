@@ -10,29 +10,36 @@ RUN apt-get update && apt-get install -y \
     git \
     build-essential \
     cmake \
+    iputils-ping \
+    net-tools \
     python3-pip \
     python3-opencv \
     doxygen \
     python3-colcon-common-extensions \
     ros-jazzy-ros-base \
     ros-jazzy-rviz2 \
+    ros-jazzy-robot-state-publisher \
     ros-jazzy-tf2-ros \
+    ros-jazzy-tf2-tools \
+    ros-jazzy-tf2-msgs \
     ros-jazzy-nav-msgs \
     ros-jazzy-sensor-msgs \
     ros-jazzy-geometry-msgs \
+    ros-jazzy-slam-toolbox \
+    ros-jazzy-nav2-map-server \
+    ros-jazzy-nav2-lifecycle-manager \
     ros-jazzy-joy \
     ros-jazzy-teleop-twist-joy \
     ros-jazzy-nmea-navsat-driver \
     ros-jazzy-teleop-twist-keyboard \
     ros-jazzy-cv-bridge \
+    # lidar
     ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
-    ros-jazzy-depthai-ros \
-    usbutils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages
-RUN pip install depthai onnxruntime --break-system-packages
+RUN pip install depthai --break-system-packages 
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
@@ -44,6 +51,7 @@ RUN git clone https://github.com/reedhedges/AriaCoda.git /opt/AriaCoda && \
     cd /opt/AriaCoda && \
     make -j2 && \
     make install
+
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # Copy your project
@@ -54,6 +62,10 @@ COPY ariaNode /ros2_ws/src/ariaNode
 WORKDIR /ros2_ws
 RUN . /opt/ros/jazzy/setup.sh && \
     colcon build --symlink-install
+
+# Default location for saved occupancy maps. Bind-mount this path when running
+# the container if you want maps to persist on the host.
+RUN mkdir -p /ros2_ws/maps
 
 # Auto-source environment
 RUN echo "source /opt/ros/jazzy/setup.bash" >> /root/.bashrc && \
