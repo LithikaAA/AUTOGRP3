@@ -17,9 +17,13 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-ros-base \
     ros-jazzy-rviz2 \
     ros-jazzy-tf2-ros \
+    ros-jazzy-tf2-msgs \
     ros-jazzy-nav-msgs \
     ros-jazzy-sensor-msgs \
     ros-jazzy-geometry-msgs \
+    ros-jazzy-slam-toolbox \
+    ros-jazzy-nav2-map-server \
+    ros-jazzy-nav2-lifecycle-manager \
     ros-jazzy-joy \
     ros-jazzy-teleop-twist-joy \
     ros-jazzy-nmea-navsat-driver \

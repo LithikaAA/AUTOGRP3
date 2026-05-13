@@ -3,6 +3,7 @@
 
 import os
 import tempfile
+import xml.etree.ElementTree as ET
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, ExecuteProcess
@@ -34,19 +35,16 @@ def generate_launch_description():
     with open(processed_robot_file, 'w') as outfp:
         outfp.write(robot_desc)
 
-    with open(source_world_file, 'r') as infp:
-        world_desc = infp.read()
-    world_desc = world_desc.replace(
-        '''            <include>
-        <uri>file:///mnt/c/Users/rahma/Downloads/Resources/robots/pioneer.urdf</uri>
-        <name>pioneer</name>
-        <pose>0 0 0.2 0 0 0</pose>
-        </include>''',
-        ''
-    )
     world_file = os.path.join(tempfile.gettempdir(), 'pioneer_world_no_robot.sdf')
-    with open(world_file, 'w') as outfp:
-        outfp.write(world_desc)
+    world_tree = ET.parse(source_world_file)
+    world = world_tree.getroot().find('world')
+    for include in list(world.findall('include')):
+        name = include.findtext('name', default='')
+        uri = include.findtext('uri', default='')
+        if name == 'pioneer' or 'pioneer.urdf' in uri:
+            world.remove(include)
+    ET.indent(world_tree, space='    ')
+    world_tree.write(world_file, encoding='unicode', xml_declaration=True)
 
     # ==================== Launch Arguments ====================
     rviz_launch_arg = DeclareLaunchArgument(
@@ -118,6 +116,13 @@ def generate_launch_description():
             {'turn_speed_deg': 35.0},
             {'return_to_center_speed': 0.25},
             {'return_to_center_turn_speed_deg': 30.0},
+            {'center_arena_on_start': False},
+            {'arena_origin_x': 0.0},
+            {'arena_origin_y': 0.0},
+            {'use_gazebo_tf_pose': True},
+            {'gazebo_tf_topic': '/world/pioneer_world/dynamic_pose/info'},
+            {'gazebo_tf_frame_match': 'pioneer'},
+            {'gazebo_tf_allow_unmatched': True},
         ]
     )
 
@@ -132,6 +137,8 @@ def generate_launch_description():
             '/cmd_vel@geometry_msgs/msg/Twist]gz.msgs.Twist',
             '/odom@nav_msgs/msg/Odometry[gz.msgs.Odometry',
             '/scan@sensor_msgs/msg/LaserScan[gz.msgs.LaserScan',
+            '/model/pioneer/tf@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
+            '/world/pioneer_world/dynamic_pose/info@tf2_msgs/msg/TFMessage[gz.msgs.Pose_V',
         ],
         parameters=[
             {'use_sim_time': True},

@@ -10,6 +10,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Joy, LaserScan
+from tf2_msgs.msg import TFMessage
 
 # Configuration defaults
 INITIAL_TURN_ANGLE = 45
@@ -103,6 +104,13 @@ class ControlNode(Node):
         self.declare_parameter('turn_speed_deg', TURN_SPEED_DEG)
         self.declare_parameter('return_to_center_speed', RETURN_TO_CENTER_SPEED)
         self.declare_parameter('return_to_center_turn_speed_deg', RETURN_TO_CENTER_TURN_SPEED_DEG)
+        self.declare_parameter('center_arena_on_start', True)
+        self.declare_parameter('arena_origin_x', 0.0)
+        self.declare_parameter('arena_origin_y', 0.0)
+        self.declare_parameter('use_gazebo_tf_pose', False)
+        self.declare_parameter('gazebo_tf_topic', '/model/pioneer/tf')
+        self.declare_parameter('gazebo_tf_frame_match', 'pioneer')
+        self.declare_parameter('gazebo_tf_allow_unmatched', False)
 
         joy_topic = self.get_parameter('joy_topic').value
         scan_topic = self.get_parameter('scan_topic').value
@@ -119,22 +127,35 @@ class ControlNode(Node):
         self.turn_speed_deg = float(self.get_parameter('turn_speed_deg').value)
         self.return_to_center_speed = float(self.get_parameter('return_to_center_speed').value)
         self.return_to_center_turn_speed_deg = float(self.get_parameter('return_to_center_turn_speed_deg').value)
+        self.center_arena_on_start = bool(self.get_parameter('center_arena_on_start').value)
+        self.configured_arena_origin_x = float(self.get_parameter('arena_origin_x').value)
+        self.configured_arena_origin_y = float(self.get_parameter('arena_origin_y').value)
+        self.use_gazebo_tf_pose = bool(self.get_parameter('use_gazebo_tf_pose').value)
+        self.gazebo_tf_topic = self.get_parameter('gazebo_tf_topic').value
+        self.gazebo_tf_frame_match = self.get_parameter('gazebo_tf_frame_match').value
+        self.gazebo_tf_allow_unmatched = bool(self.get_parameter('gazebo_tf_allow_unmatched').value)
 
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
 
         self.create_subscription(Joy, joy_topic, self.joy_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.create_subscription(LaserScan, scan_topic, self.lidar_cb, 10)
+        if self.use_gazebo_tf_pose:
+            self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_cb, 10)
 
         self.drive_mode = DRIVE_MODE.AUTO
         self.auto_state = AUTO_STATE.INITIAL_TURN
         self.current_yaw = 0.0
         self.current_x = 0.0
         self.current_y = 0.0
-        self.map_origin_x = None
-        self.map_origin_y = None
+        self.map_origin_x = None if self.center_arena_on_start else self.configured_arena_origin_x
+        self.map_origin_y = None if self.center_arena_on_start else self.configured_arena_origin_y
         self.have_odom = False
         self.last_odom_time = None
+        self.have_gazebo_tf_pose = False
+        self.last_gazebo_tf_time = None
+        self._reported_gazebo_tf_pose = False
+        self.pose_source = 'odom'
         self.target_yaw = None
         self.start_position = (0.0, 0.0)
         self.drive_distance = 0.0
@@ -166,6 +187,15 @@ class ControlNode(Node):
             f'Speeds: forward={self.forward_speed:.2f} m/s, reverse={self.reverse_speed:.2f} m/s, '
             f'turn={self.turn_speed_deg:.1f} deg/s'
         )
+        if not self.center_arena_on_start:
+            self.get_logger().info(
+                f'15x15 arena fixed at odom/world ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+            )
+        if self.use_gazebo_tf_pose:
+            self.get_logger().info(
+                f'Gazebo sim: using {self.gazebo_tf_topic} for world pose when available '
+                f'(match="{self.gazebo_tf_frame_match}"), otherwise falling back to {odom_topic}.'
+            )
 
     def joy_cb(self, msg: Joy):
         with self.mutex:
@@ -197,7 +227,7 @@ class ControlNode(Node):
                 self.emergency_stop = False
                 self.drive_mode = DRIVE_MODE.AUTO
                 self.auto_state = AUTO_STATE.INITIAL_TURN
-                if self.have_odom:
+                if self.have_odom and self.center_arena_on_start:
                     self.map_origin_x = self.current_x
                     self.map_origin_y = self.current_y
                 self.target_yaw = None
@@ -272,10 +302,14 @@ class ControlNode(Node):
 
     def odom_cb(self, msg: Odometry):
         with self.mutex:
+            if self.use_gazebo_tf_pose and self.have_gazebo_tf_pose:
+                self.last_odom_time = time.time()
+                return
             self.current_x = msg.pose.pose.position.x
             self.current_y = msg.pose.pose.position.y
             self.current_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
-            if self.map_origin_x is None or self.map_origin_y is None:
+            self.pose_source = 'odom'
+            if self.center_arena_on_start and (self.map_origin_x is None or self.map_origin_y is None):
                 self.map_origin_x = self.current_x
                 self.map_origin_y = self.current_y
                 self.get_logger().info(
@@ -284,10 +318,79 @@ class ControlNode(Node):
             self.have_odom = True
             self.last_odom_time = time.time()
 
+    def gazebo_tf_cb(self, msg: TFMessage):
+        with self.mutex:
+            if not msg.transforms:
+                return
+
+            selected = None
+            match = self.gazebo_tf_frame_match
+            for transform in msg.transforms:
+                child = transform.child_frame_id or ''
+                parent = transform.header.frame_id or ''
+                if match in child or match in parent:
+                    selected = transform
+                    break
+
+            if selected is None and (len(msg.transforms) == 1 or self.gazebo_tf_allow_unmatched):
+                selected = msg.transforms[0]
+                if len(msg.transforms) > 1:
+                    self.get_logger().warn(
+                        f'Gazebo TF frames are unnamed; using first transform from {self.gazebo_tf_topic}.',
+                        throttle_duration_sec=5.0
+                    )
+
+            if selected is None:
+                frames = ', '.join(
+                    (t.child_frame_id or t.header.frame_id or '<blank>') for t in msg.transforms[:8]
+                )
+                self.get_logger().warn(
+                    f'Gazebo TF topic active, but no frame matched "{match}". Frames seen: {frames}',
+                    throttle_duration_sec=5.0
+                )
+                return
+
+            self.current_x = selected.transform.translation.x
+            self.current_y = selected.transform.translation.y
+            self.current_yaw = quaternion_to_yaw(selected.transform.rotation)
+            self.pose_source = 'gazebo_tf'
+            if self.center_arena_on_start and (self.map_origin_x is None or self.map_origin_y is None):
+                self.map_origin_x = self.current_x
+                self.map_origin_y = self.current_y
+                self.get_logger().info(
+                    f'15x15 arena centered at Gazebo world pose ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+                )
+
+            self.have_gazebo_tf_pose = True
+            self.have_odom = True
+            self.last_gazebo_tf_time = time.time()
+            self.last_odom_time = self.last_gazebo_tf_time
+            if not self._reported_gazebo_tf_pose:
+                self._reported_gazebo_tf_pose = True
+                frame = selected.child_frame_id or selected.header.frame_id or '<blank>'
+                self.get_logger().info(f'Using Gazebo world pose from {self.gazebo_tf_topic}, frame "{frame}".')
+
     def relative_position(self):
         if self.map_origin_x is None or self.map_origin_y is None:
             return 0.0, 0.0
         return self.current_x - self.map_origin_x, self.current_y - self.map_origin_y
+
+    def log_arena_status(self, rel_x, rel_y):
+        distance_from_center = math.hypot(rel_x, rel_y)
+        outside_x = max(0.0, abs(rel_x) - MAP_HALF_SIZE)
+        outside_y = max(0.0, abs(rel_y) - MAP_HALF_SIZE)
+        outside_distance = math.hypot(outside_x, outside_y)
+        clearance_to_edge = min(MAP_HALF_SIZE - abs(rel_x), MAP_HALF_SIZE - abs(rel_y))
+        self.get_logger().info(
+            f'Arena status: state={self.auto_state.name} '
+            f'rel=({rel_x:.2f}, {rel_y:.2f})m '
+            f'center_dist={distance_from_center:.2f}m '
+            f'edge_clearance={clearance_to_edge:.2f}m '
+            f'outside={outside_distance:.2f}m '
+            f'yaw={self.current_yaw:.1f}deg '
+            f'pose_source={self.pose_source}',
+            throttle_duration_sec=1.0
+        )
 
     def control_loop(self):
         with self.mutex:
@@ -330,6 +433,7 @@ class ControlNode(Node):
                 return
 
             rel_x, rel_y = self.relative_position()
+            self.log_arena_status(rel_x, rel_y)
             if not (-MAP_HALF_SIZE <= rel_x <= MAP_HALF_SIZE and -MAP_HALF_SIZE <= rel_y <= MAP_HALF_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
                 self.get_logger().warn(f'Robot outside 15x15 arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
                 self.auto_state = AUTO_STATE.RETURN_TO_CENTER
@@ -338,8 +442,8 @@ class ControlNode(Node):
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 return
 
-            if self.auto_state not in [AUTO_STATE.INITIAL_TURN, AUTO_STATE.INITIAL_DRIVE, AUTO_STATE.RETURN_TO_CENTER] and self.near_boundary(BOUNDARY_BUFFER) and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE]:
-                self.get_logger().warn(f'HARD BOUNDARY hit at ({self.current_x:.2f}, {self.current_y:.2f}) with yaw {self.current_yaw:.1f}°. Initiating boundary REVERSE.')
+            if self.auto_state not in [AUTO_STATE.INITIAL_TURN, AUTO_STATE.RETURN_TO_CENTER] and self.near_boundary(BOUNDARY_BUFFER) and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE]:
+                self.get_logger().warn(f'HARD BOUNDARY hit at relative ({rel_x:.2f}, {rel_y:.2f}) with yaw {self.current_yaw:.1f} deg. Initiating boundary REVERSE.')
                 self.auto_state = AUTO_STATE.BOUNDARY_REVERSE
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.reverse_start_time = time.time()
