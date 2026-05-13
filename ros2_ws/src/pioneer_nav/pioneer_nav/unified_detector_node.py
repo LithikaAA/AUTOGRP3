@@ -30,6 +30,15 @@ Both letters and colour objects use the same rule:
       robot_x, robot_y, robot_yaw_deg, timestamp
   - Once logged, won't log again until the object disappears and reappears
   - Photos saved to ~/part3_logs/colour_detections/ for colour detections
+
+HSV tuning notes
+----------------
+Red:   tightened saturation min to 150 and value min to 100 to reject skin tones
+       (skin is low-saturation red, typically S < 100)
+Yellow: raised saturation min to 150 and value min to 120, narrowed hue to 22-32
+       to reject gold/tan (gold has lower saturation and sits around hue 20-25
+       but with S ~80-120 — raising S floor to 150 pushes it out)
+Both:  min_colour_area raised to 3000 px to ignore small stray blobs
 """
 
 import json
@@ -47,12 +56,18 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 # ── HSV colour ranges ────────────────────────────────────────────────────────
-RED_LOWER_1  = np.array([  0, 120,  80], dtype=np.uint8)
+# Red wraps around 0/180 in HSV.
+# Tightened: S >= 150, V >= 100  →  rejects skin (low S) and dark reds
+RED_LOWER_1  = np.array([  0, 150, 100], dtype=np.uint8)
 RED_UPPER_1  = np.array([ 10, 255, 255], dtype=np.uint8)
-RED_LOWER_2  = np.array([165, 120,  80], dtype=np.uint8)
+RED_LOWER_2  = np.array([168, 150, 100], dtype=np.uint8)
 RED_UPPER_2  = np.array([179, 255, 255], dtype=np.uint8)
-YELLOW_LOWER = np.array([ 18, 120,  80], dtype=np.uint8)
-YELLOW_UPPER = np.array([ 35, 255, 255], dtype=np.uint8)
+
+# Yellow: narrowed hue to 22–32, S >= 150, V >= 150
+# Gold/tan sits at hue ~20-25 but with S 80-130 → pushed out by S floor
+# Bright safety-yellow obstacles have S > 180, V > 180 → well inside range
+YELLOW_LOWER = np.array([ 22, 150, 150], dtype=np.uint8)
+YELLOW_UPPER = np.array([ 32, 255, 255], dtype=np.uint8)
 
 # OAK-D horizontal field of view
 HFOV_RAD = math.radians(71.0)
@@ -71,11 +86,11 @@ def depth_at_point(depth_image: np.ndarray, cx: int, cy: int,
     Uses the median of a small patch to avoid noisy single-pixel reads.
     Returns metres, or None if the value is zero/invalid.
     """
-    h, w  = depth_image.shape
-    x0, x1 = max(0, cx - patch), min(w, cx + patch)
-    y0, y1 = max(0, cy - patch), min(h, cy + patch)
-    region = depth_image[y0:y1, x0:x1].astype(np.float32)
-    valid  = region[region > 0]
+    h, w    = depth_image.shape
+    x0, x1  = max(0, cx - patch), min(w, cx + patch)
+    y0, y1  = max(0, cy - patch), min(h, cy + patch)
+    region  = depth_image[y0:y1, x0:x1].astype(np.float32)
+    valid   = region[region > 0]
     if valid.size == 0:
         return None
     return float(np.median(valid)) / 1000.0   # mm → m
@@ -83,7 +98,6 @@ def depth_at_point(depth_image: np.ndarray, cx: int, cy: int,
 
 def world_position(robot_x: float, robot_y: float, robot_yaw: float,
                    distance_m: float, bearing_rad: float):
-    """Estimate world (x, y) of detected object given robot pose and bearing."""
     angle = robot_yaw + bearing_rad
     return (round(robot_x + distance_m * math.cos(angle), 3),
             round(robot_y + distance_m * math.sin(angle), 3))
@@ -98,12 +112,10 @@ class DetectionTracker:
         self.last_photo: float = 0.0
 
     def seen(self, now: float):
-        """Call each frame the label is present."""
         if self.first_seen == 0.0:
             self.first_seen = now
 
     def reset(self):
-        """Call when the label disappears."""
         self.first_seen = 0.0
         self.logged     = False
 
@@ -123,7 +135,7 @@ class UnifiedDetectorNode(Node):
         self.declare_parameter("confidence_threshold",   0.5)
         self.declare_parameter("process_every_n_frames", 3)
         self.declare_parameter("confirmations_required", 3)
-        self.declare_parameter("min_colour_area",        800.0)
+        self.declare_parameter("min_colour_area",        3000.0)
         self.declare_parameter("require_mapping_state",  False)
         self.declare_parameter("confident_duration_s",   2.0)
         self.declare_parameter("photo_cooldown_s",       5.0)
@@ -170,7 +182,7 @@ class UnifiedDetectorNode(Node):
         self.letter_cy          : int        = 0
         self.letter_tracker = DetectionTracker()
 
-        # Colour tracking — one tracker + stored bbox centre per label
+        # Colour tracking
         self.colour_trackers: dict[str, DetectionTracker] = {
             "red_obstacle":    DetectionTracker(),
             "yellow_obstacle": DetectionTracker(),
@@ -235,19 +247,21 @@ class UnifiedDetectorNode(Node):
         self._publish_image(bgr, msg)
         cv2.imwrite("/tmp/unified_detection.png", bgr)
 
+    # ── Shared depth sample ───────────────────────────────────────────────────
+
+    def _get_depth(self, cx: int, cy: int) -> float | None:
+        if self.depth_image is None:
+            return None
+        d = depth_at_point(self.depth_image, cx, cy)
+        return d if (d is not None and d > 0.05) else None
+
     # ── Shared log helper ─────────────────────────────────────────────────────
 
     def _log_detection(self, kind: str, name: str, confidence: float,
                        cx: int, cy: int, img_width: int):
-        """Sample depth, compute world position, write to log file."""
         bearing_rad = self._bearing_from_x(cx, img_width)
         bearing_deg = math.degrees(bearing_rad)
-
-        distance_m = None
-        if self.depth_image is not None:
-            d = depth_at_point(self.depth_image, cx, cy)
-            if d is not None and d > 0.05:
-                distance_m = d
+        distance_m  = self._get_depth(cx, cy)
 
         obj_x = obj_y = None
         if distance_m is not None:
@@ -280,6 +294,12 @@ class UnifiedDetectorNode(Node):
             f"obj=({obj_x},{obj_y})"
         )
 
+    # ── Overlay helper — shows depth if available, else '?' ──────────────────
+
+    def _depth_label(self, cx: int, cy: int) -> str:
+        d = self._get_depth(cx, cy)
+        return f"{d:.2f}m" if d is not None else "?m"
+
     # ── Letter pipeline ───────────────────────────────────────────────────────
 
     def _process_letter(self, gray: np.ndarray, bgr: np.ndarray,
@@ -308,33 +328,28 @@ class UnifiedDetectorNode(Node):
             self.letter_tracker.reset()
             return
 
-        # Frame-count streak (fast publish gate)
         if name == self.letter_last_label:
             self.letter_frame_count += 1
         else:
             self.letter_last_label  = name
             self.letter_frame_count = 1
-            self.letter_tracker.reset()   # new label — restart timer
+            self.letter_tracker.reset()
 
-        # Store centre for depth sampling
         self.letter_cx = x + cw // 2
         self.letter_cy = y + ch // 2
-
-        # Advance time tracker
         self.letter_tracker.seen(now)
 
-        # Fast publish once frame-count confirmed
         if self.letter_frame_count >= self.confirms_req:
             out      = String()
             out.data = name
             self.letter_pub.publish(out)
             cv2.rectangle(bgr, (x, y), (x + cw, y + ch), (0, 255, 0), 2)
-            elapsed = self.letter_tracker.elapsed(now)
-            cv2.putText(bgr, f"{name} ({confidence:.2f})  {elapsed:.1f}s",
+            depth_str = self._depth_label(self.letter_cx, self.letter_cy)
+            cv2.putText(bgr,
+                        f"{name} ({confidence:.2f})  {depth_str}",
                         (x, max(y - 10, 0)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        # Log once after confident_duration_s
         if (self.letter_tracker.elapsed(now) >= self.confident_dur
                 and not self.letter_tracker.logged):
             self._log_detection("letter", name, confidence,
@@ -365,17 +380,16 @@ class UnifiedDetectorNode(Node):
             self.colour_centres[label] = (cx_px, cy_px)
 
             tracker.seen(now)
-            elapsed     = tracker.elapsed(now)
             bearing_rad = self._bearing_from_x(cx_px, img_width)
+            depth_str   = self._depth_label(cx_px, cy_px)
 
-            # Annotate frame
             colour = (0, 0, 255) if "red" in label else (0, 255, 255)
             cv2.rectangle(bgr, (bx, by), (bx + bw, by + bh), colour, 3)
-            cv2.putText(bgr, f"{label}  {elapsed:.1f}s",
+            cv2.putText(bgr,
+                        f"{label}  {depth_str}",
                         (bx, max(by - 10, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2)
 
-            # Always publish current JSON
             payload      = String()
             payload.data = json.dumps({
                 "label":         label,
@@ -385,18 +399,16 @@ class UnifiedDetectorNode(Node):
                 "robot_x":       self.robot_x,
                 "robot_y":       self.robot_y,
                 "robot_yaw_deg": round(math.degrees(self.robot_yaw), 2),
-                "elapsed_s":     round(elapsed, 2),
+                "elapsed_s":     round(tracker.elapsed(now), 2),
                 "timestamp":     time.strftime("%Y-%m-%dT%H:%M:%S"),
             })
             self.colour_pub.publish(payload)
 
-            # Log with depth once confident
-            if elapsed >= self.confident_dur and not tracker.logged:
+            if tracker.elapsed(now) >= self.confident_dur and not tracker.logged:
                 self._log_detection(label, label, 1.0,
                                     cx_px, cy_px, img_width)
                 tracker.logged = True
 
-                # Save photo on confident log
                 if now - tracker.last_photo >= self.photo_cooldown:
                     fname = f"{label}_{time.strftime('%Y%m%d_%H%M%S')}.png"
                     cv2.imwrite(os.path.join(self.photo_dir, fname), bgr)
