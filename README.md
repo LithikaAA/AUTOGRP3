@@ -150,3 +150,95 @@ If `/cmd_vel` is non-zero, ARIA will drive the robot.
 - Robot should explore locally
 - Will avoid obstacles using LIDAR
 - Will stop and log camera detections
+
+
+FOR WANDERING + MAPPING + SAVING MAP: 
+1. Aria Node needs to be activated:
+ros2 run ariaNode ariaNode --rp /dev/ttyUSB0
+
+2. Lidar has to be activated:
+ros2 launch sick_scan_xd sick_tim_7xx.launch.py hostname:=192.168.0.1 frame_id:=sick_laser
+
+Lidar checks - if there is an issue and map says can't subscribe/subscribing to "cloud": 
+Issues that you may enounter is that the lidar link frame_id shows up as cloud - to fix this you need to kill it and check. 
+pkill -f sick_scan
+
+ros2 launch sick_scan_xd sick_tim_7xx.launch.py \
+  hostname:=192.168.0.1 \
+  frame_id:=sick_laser \
+  tf_publish_rate:=0.0
+
+
+3. Start the controller node - for 15x15 wandering
+ros2 run pioneer_nav control_node --ros-args \
+  -p forward_speed:=0.15 \
+  -p reverse_speed:=-0.12 \
+  -p turn_speed_deg:=20.0 \
+  -p return_to_center_speed:=0.12 \
+  -p return_to_center_turn_speed_deg:=20.0
+
+
+4. Start SLAM
+cd /ros2_ws
+source install/setup.bash
+ros2 launch pioneer_nav slam_mapping.launch.py \
+  use_sim_time:=false \
+  rviz:=false \
+  scan_frame:=sick_laser \
+  odom_tf_stamp_with_current_time:=true \
+  slam_start_delay:=8.0
+
+CHECKS: if you need to kill existing slam: 
+pkill -f slam_toolbox
+pkill -f lifecycle_manager
+pkill -f odom_tf_broadcaster
+pkill -f static_transform_publisher
+
+
+5. Saving the map (potentially change this later)
+save map
+mkdir -p maps
+ros2 run nav2_map_server map_saver_cli -f maps/pioneer_map --fmt png
+
+6. (This will change later to integrate but for now) opening the map file/saving on your local:
+a. checking that it saved/what it saved as:
+ls -lh /ros2_ws/maps
+
+(should get something like this:
+total 12K
+-rw-r--r-- 1 root root 6.4K May 13 10:51 pioneer_map.png
+-rw-r--r-- 1 root root  133 May 13 10:51 pioneer_map.yaml
+root@pioneer1-NUC11PHi7:/ros2_ws#
+)
+
+b. getting it locally
+inside docker:
+docker cp wizardly_gates:/ros2_ws/maps/pioneer_map.png ~/pioneer_map.png
+docker cp wizardly_gates:/ros2_ws/maps/pioneer_map.yaml ~/pioneer_map.yaml
+ls -lh ~/pioneer_map.*
+
+then outside docker: 
+scp team3@192.168.2.101:~/pioneer_map.png .
+scp team3@192.168.2.101:~/pioneer_map.yaml .
+will get something like this: 
+rahma@MSI:~$ scp team3@192.168.2.101:~/pioneer_map.png .
+scp team3@192.168.2.101:~/pioneer_map.yaml .
+team3@192.168.2.101's password:
+pioneer_map.png                                                  100% 6529   427.0KB/s   00:00
+team3@192.168.2.101's password:
+pioneer_map.yaml                                                 100%  133    12.3KB/s   00:00
+
+c. then to open it: 
+explorer.exe 
+this will take you to the file to open 
+
+
+
+(need to figure out where this should go but this is the convertor to pbm) 
+cd /mnt/c/Users/rahma/Downloads/AUTOGRP3-main/AUTOGRP3
+python3 ros2_ws/src/pioneer_nav/scripts/map_to_binary.py \
+  ros2_ws/maps/my_map.pgm \
+  --pbm ros2_ws/maps/my_map_binary.pbm \
+  --csv ros2_ws/maps/my_map_binary.csv
+
+
