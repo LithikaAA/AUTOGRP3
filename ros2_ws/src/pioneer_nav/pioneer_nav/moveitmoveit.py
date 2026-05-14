@@ -23,7 +23,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Int8
 
-# mirror the same constants from lidar_estop (we use estoptest for now) so its obvious what we're checking
+# mirror the same constants from estoplidar (we use estoptest for now) so its obvious what we're checking
 clearstate = 0
 warnstate  = 1
 estopstate = 2
