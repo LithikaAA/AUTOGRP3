@@ -236,13 +236,6 @@ class LidarEstop(Node):
                 self.get_logger().info("Warning zone clear - resuming")
                 self.warn_active = False
 
-            # only clear estop after hold time has passed
-            if self.estop_active:
-                held_for = time.time() - self.estop_time
-                if held_for >= estop_hold:
-                    self.get_logger().info("Path clear - resuming")
-                    self.estop_active = False
-
         # save current scan for next comparison
         self.prev_ranges = curr
 
