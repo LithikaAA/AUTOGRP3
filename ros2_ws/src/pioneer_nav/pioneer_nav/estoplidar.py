@@ -10,6 +10,12 @@ LiDAR E-STOP -> moving obstacle detection
       -> within 1m: EMERGENCY STOP, immediate halt, log incident + save rosbag
 
 How moving detection works (THIS WILL NEED TO BE ALTERED because when robot is moving things move)
+ok ok ok new tech
+we do similar, except not ego motion where we 
+but we usee a threshold and ignore things that are moving at a constant rate
+not specifically at the like wall
+also only FRONT CONE cuz side kinda useless bruh
+
 - We save the previous lidar scan
 - We compare it to the current scan
 - If multiple readings changed significantly, something moved
