@@ -1,269 +1,455 @@
 #!/usr/bin/env python3
+"""
+AUTO4508 Part 3 - Colour Detector Node (OAK-D V2)
+Detects red and yellow obstacles, saves photos + logs location.
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import Image
-from std_msgs.msg import String
-from geometry_msgs.msg import Pose
+Publishes:
+  /detections/colour   (std_msgs/String)  JSON with label, distance, bearing, location
+  /detections/image    (sensor_msgs/Image) annotated frame for UI
 
-import cv2
-import numpy as np
+Subscribes:
+  /robot_state         (std_msgs/String)   only runs when MAPPING
+  /robot/pose          (geometry_msgs/Pose) current robot position for logging
+
+Saves photos to ~/part3_logs/colour_detections/
+"""
+
 import json
 import math
 import os
 import time
+from dataclasses import asdict, dataclass
+from typing import Optional
+
+import cv2
+import numpy as np
+import rclpy
+from cv_bridge import CvBridge
+from geometry_msgs.msg import Pose
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from std_msgs.msg import String
+
+# DepthAI — OAK-D V2
+try:
+    import depthai as dai
+    DEPTHAI_AVAILABLE = True
+except ImportError:
+    DEPTHAI_AVAILABLE = False
+    print("[colour_detector] WARNING: depthai not installed. Run: pip install depthai")
 
 
-# ---------------- HSV COLOUR RANGES ----------------
-# Red wraps around HSV, so it needs two ranges
-RED_LOWER_1 = np.array([0, 120, 80], dtype=np.uint8)
-RED_UPPER_1 = np.array([10, 255, 255], dtype=np.uint8)
+# =============================================================================
+# HSV ranges for Part 3 targets (outdoor daylight)
+# Tune these first if detection is off — run debug mode standalone
+# =============================================================================
 
-RED_LOWER_2 = np.array([165, 120, 80], dtype=np.uint8)
-RED_UPPER_2 = np.array([179, 255, 255], dtype=np.uint8)
+# Red has two ranges because it wraps around 0/180 in HSV
+RED_LOWER_1  = np.array([0,   120,  80], dtype=np.uint8)
+RED_UPPER_1  = np.array([10,  255, 255], dtype=np.uint8)
+RED_LOWER_2  = np.array([165, 120,  80], dtype=np.uint8)
+RED_UPPER_2  = np.array([179, 255, 255], dtype=np.uint8)
 
-YELLOW_LOWER = np.array([18, 120, 80], dtype=np.uint8)
-YELLOW_UPPER = np.array([35, 255, 255], dtype=np.uint8)
+YELLOW_LOWER = np.array([18,  120,  80], dtype=np.uint8)
+YELLOW_UPPER = np.array([35,  255, 255], dtype=np.uint8)
 
+# Minimum contour area in pixels — increase if getting false positives outdoors
+MIN_AREA = 800.0
+
+# OAK-D V2 horizontal FOV in radians (~71 degrees)
+HFOV_RAD = math.radians(71.0)
+
+# How often to save a photo of the same object (seconds) — avoids duplicates
+PHOTO_COOLDOWN_S = 5.0
+
+
+# =============================================================================
+# Detection result
+# =============================================================================
+
+@dataclass
+class ColourDetection:
+    label: str           # "red_obstacle" or "yellow_obstacle"
+    center_x: float      # pixels
+    center_y: float      # pixels
+    area: float          # pixels squared
+    bearing_rad: float   # negative = left, positive = right
+    distance_m: float    # from OAK-D depth (or area estimate if depth unavailable)
+    robot_x: float       # robot world position when detected
+    robot_y: float
+    photo_path: str      # path to saved photo
+    timestamp: str
+
+
+# =============================================================================
+# OAK-D pipeline setup
+# =============================================================================
+
+def build_oakd_pipeline():
+    pipeline = dai.Pipeline()
+
+    # RGB camera
+    cam_rgb = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
+
+    # Mono cameras for stereo
+    mono_left  = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_B)
+    mono_right = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_C)
+
+    # Stereo depth — explicitly pass left and right
+    stereo = pipeline.create(dai.node.StereoDepth).build(
+        left=mono_left.requestOutput((640, 400)),
+        right=mono_right.requestOutput((640, 400)),
+        presetMode=dai.node.StereoDepth.PresetMode.FAST_ACCURACY,
+    )
+
+    # Output queues
+    q_rgb   = cam_rgb.requestOutput((640, 480), dai.ImgFrame.Type.BGR888p).createOutputQueue()
+    q_depth = stereo.depth.createOutputQueue()
+
+    return pipeline, q_rgb, q_depth
+
+
+# =============================================================================
+# Detection helpers
+# =============================================================================
+
+def apply_morphology(mask: np.ndarray, kernel_size: int = 7) -> np.ndarray:
+    k = np.ones((kernel_size, kernel_size), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k)
+    return mask
+
+
+def bearing_from_x(x_px: float, width: int) -> float:
+    norm = (x_px - width / 2.0) / (width / 2.0)
+    return norm * (HFOV_RAD / 2.0)
+
+
+def depth_at_bbox(depth_frame: np.ndarray, bbox, margin: int = 10) -> float:
+    """
+    Get median depth in metres within a bounding box.
+    Uses median to ignore noise/holes in depth map.
+    Returns inf if depth unavailable.
+    """
+    if depth_frame is None:
+        return float("inf")
+    x, y, w, h = bbox
+    x1 = max(0, x + margin)
+    y1 = max(0, y + margin)
+    x2 = min(depth_frame.shape[1], x + w - margin)
+    y2 = min(depth_frame.shape[0], y + h - margin)
+    roi = depth_frame[y1:y2, x1:x2]
+    valid = roi[roi > 0]
+    if valid.size == 0:
+        return float("inf")
+    # OAK-D depth is in mm, convert to metres
+    return float(np.median(valid)) / 1000.0
+
+
+def area_distance_estimate(area_px: float, known_width_m: float = 0.3,
+                            focal_px: float = 600.0) -> float:
+    """Fallback distance estimate when depth is unavailable."""
+    if area_px <= 0:
+        return float("inf")
+    return (known_width_m * focal_px) / math.sqrt(area_px)
+
+
+def detect_colour(hsv: np.ndarray, depth: np.ndarray,
+                  lower1, upper1, label: str,
+                  lower2=None, upper2=None) -> Optional[tuple]:
+    """
+    Detect a colour blob. Returns (contour, bbox, distance_m) or None.
+    Supports two HSV ranges (needed for red).
+    """
+    mask = cv2.inRange(hsv, lower1, upper1)
+    if lower2 is not None:
+        mask |= cv2.inRange(hsv, lower2, upper2)
+
+    mask = apply_morphology(mask, kernel_size=7)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    if not contours:
+        return None
+
+    cnt = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(cnt)
+    if area < MIN_AREA:
+        return None
+
+    bbox = cv2.boundingRect(cnt)
+    dist = depth_at_bbox(depth, bbox)
+    if math.isinf(dist):
+        dist = area_distance_estimate(area)
+
+    return cnt, bbox, dist
+
+
+def save_photo(frame: np.ndarray, bbox, label: str, dist: float,
+               save_dir: str) -> str:
+    os.makedirs(save_dir, exist_ok=True)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(save_dir, f"{label}_{ts}.png")
+
+    annotated = frame.copy()
+    x, y, w, h = bbox
+    colour = (0, 0, 255) if "red" in label else (0, 255, 255)
+    cv2.rectangle(annotated, (x, y), (x + w, y + h), colour, 3)
+    text = f"{label} {dist:.1f}m"
+    cv2.putText(annotated, text, (x, y - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, colour, 2)
+    cv2.imwrite(path, annotated)
+    return path
+
+
+# =============================================================================
+# ROS2 Node
+# =============================================================================
 
 class ColourDetectorNode(Node):
     def __init__(self):
         super().__init__("colour_detector")
 
-        # Match the letter detector style
-        self.declare_parameter("topic", "/oak/rgb/image_raw")
-        self.declare_parameter("process_every_n_frames", 3)
-        self.declare_parameter("min_area", 800.0)
-        self.declare_parameter("require_mapping_state", False)
-
-        self.topic = self.get_parameter("topic").value
-        self.process_every = int(self.get_parameter("process_every_n_frames").value)
-        self.min_area = float(self.get_parameter("min_area").value)
-        self.require_mapping_state = bool(self.get_parameter("require_mapping_state").value)
-
-        # Robot position, if /robot/pose exists
+        self.bridge = CvBridge()
         self.robot_x = 0.0
         self.robot_y = 0.0
-
-        # If require_mapping_state=False, detector runs straight away
-        self.active = not self.require_mapping_state
-
-        self.frame_count = 0
-        self.last_photo_time = {}
-        self.photo_cooldown_s = 5.0
+        self.active = False          # only run during MAPPING phase
+        self.last_photo_time = {}    # label -> timestamp, for cooldown
 
         self.save_dir = os.path.expanduser("~/part3_logs/colour_detections")
-        os.makedirs(self.save_dir, exist_ok=True)
 
         # Publishers
         self.det_pub = self.create_publisher(String, "/detections/colour", 10)
+        self.img_pub = self.create_publisher(Image, "/detections/image", 10)
 
         # Subscribers
-        self.sub = self.create_subscription(
-            Image,
-            self.topic,
-            self.image_callback,
-            10
-        )
+        self.create_subscription(String, "/robot_state", self.state_cb, 10)
+        self.create_subscription(Pose, "/robot/pose", self.pose_cb, 10)
 
-        self.create_subscription(String, "/robot_state", self.state_callback, 10)
-        self.create_subscription(Pose, "/robot/pose", self.pose_callback, 10)
-
-        self.get_logger().info(f"Colour detector listening on: {self.topic}")
-        self.get_logger().info("Publishing colour detections on: /detections/colour")
-
-        if self.require_mapping_state:
-            self.get_logger().info("Waiting for /robot_state == MAPPING before detecting")
+        # Start OAK-D
+        if DEPTHAI_AVAILABLE:
+            self._start_oakd()
         else:
-            self.get_logger().info("Running immediately, no /robot_state needed")
+            self.get_logger().warn("DepthAI not available — using fallback webcam")
+            self._start_webcam_fallback()
 
-    # ---------------- CALLBACKS ----------------
+        self.create_timer(0.1, self.process_frame)   # 10 Hz
+        self.get_logger().info("Colour detector ready")
 
-    def state_callback(self, msg):
-        self.active = msg.data == "MAPPING"
+    # ------------------------------------------------------------------
+    # Camera init
+    # ------------------------------------------------------------------
 
-    def pose_callback(self, msg):
+    def _start_oakd(self):
+        # v3 API — queues are returned directly from build_oakd_pipeline
+        pipeline, self.q_rgb, self.q_depth = build_oakd_pipeline()
+        self.device = dai.Device()  # v3 — no pipeline argument
+        self.device.start(pipeline)
+        self.use_oakd = True
+        self.get_logger().info("OAK-D pipeline started (depthai v3)")
+
+    def _start_webcam_fallback(self):
+        """Fallback for testing on laptop without OAK-D."""
+        self.cap = cv2.VideoCapture(0)
+        self.use_oakd = False
+        self.get_logger().warn("Using webcam fallback — no real depth available")
+
+    def _get_frames(self):
+        """Returns (bgr_frame, depth_frame). depth_frame may be None."""
+        if self.use_oakd:
+            rgb_msg   = self.q_rgb.tryGet()
+            depth_msg = self.q_depth.tryGet()
+            if rgb_msg is None:
+                return None, None
+            bgr   = rgb_msg.getCvFrame()
+            depth = depth_msg.getFrame() if depth_msg else None
+            return bgr, depth
+        else:
+            ret, frame = self.cap.read()
+            return (frame if ret else None), None
+
+    # ------------------------------------------------------------------
+    # ROS callbacks
+    # ------------------------------------------------------------------
+
+    def state_cb(self, msg: String):
+        self.active = (msg.data == "MAPPING")
+
+    def pose_cb(self, msg: Pose):
         self.robot_x = msg.position.x
         self.robot_y = msg.position.y
 
-    def image_callback(self, msg):
+    # ------------------------------------------------------------------
+    # Main detection loop
+    # ------------------------------------------------------------------
+
+    def process_frame(self):
         if not self.active:
             return
 
-        self.frame_count += 1
-        if self.frame_count % self.process_every != 0:
+        bgr, depth = self._get_frames()
+        if bgr is None:
             return
 
-        # Same image conversion style as the working letter detector
-        frame = np.frombuffer(msg.data, dtype=np.uint8)
-        frame = frame.reshape((msg.height, msg.width, -1))
-
-        # OAK image should usually be BGR8
-        bgr = frame.copy()
+        h, w = bgr.shape[:2]
         hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-        detections = []
+        results = []
 
-        red = self.detect_colour(
-            hsv,
-            RED_LOWER_1,
-            RED_UPPER_1,
-            "red_obstacle",
-            RED_LOWER_2,
-            RED_UPPER_2
-        )
+        # --- Red detection ---
+        red = detect_colour(hsv, depth,
+                            RED_LOWER_1, RED_UPPER_1, "red_obstacle",
+                            RED_LOWER_2, RED_UPPER_2)
+        if red:
+            cnt, bbox, dist = red
+            results.append(("red_obstacle", cnt, bbox, dist))
 
-        yellow = self.detect_colour(
-            hsv,
-            YELLOW_LOWER,
-            YELLOW_UPPER,
-            "yellow_obstacle"
-        )
+        # --- Yellow detection ---
+        yellow = detect_colour(hsv, depth,
+                               YELLOW_LOWER, YELLOW_UPPER, "yellow_obstacle")
+        if yellow:
+            cnt, bbox, dist = yellow
+            results.append(("yellow_obstacle", cnt, bbox, dist))
 
-        if red is not None:
-            detections.append(red)
-
-        if yellow is not None:
-            detections.append(yellow)
-
+        # --- Process results ---
         annotated = bgr.copy()
 
-        for detection in detections:
-            label, contour, bbox = detection
-            x, y, w, h = bbox
+        for label, cnt, bbox, dist in results:
+            x, y, bw, bh = bbox
+            cx = x + bw / 2.0
+            cy = y + bh / 2.0
+            bearing = bearing_from_x(cx, w)
+            area = cv2.contourArea(cnt)
 
-            area = cv2.contourArea(contour)
-            cx = x + w / 2.0
-            cy = y + h / 2.0
-
-            bearing_rad = self.bearing_from_x(cx, msg.width)
-            distance_m = self.estimate_distance_from_area(area)
-
+            # Draw on annotated frame
             colour = (0, 0, 255) if "red" in label else (0, 255, 255)
+            cv2.rectangle(annotated, (x, y), (x + bw, y + bh), colour, 3)
+            cv2.putText(annotated, f"{label} {dist:.1f}m",
+                        (x, y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, colour, 2)
 
-            cv2.rectangle(
-                annotated,
-                (x, y),
-                (x + w, y + h),
-                colour,
-                3
+            # Photo + log (with cooldown)
+            now = time.time()
+            last = self.last_photo_time.get(label, 0)
+            photo_path = ""
+            if now - last > PHOTO_COOLDOWN_S:
+                photo_path = save_photo(bgr, bbox, label, dist, self.save_dir)
+                self.last_photo_time[label] = now
+                self.get_logger().info(
+                    f"Detected {label} at {dist:.1f}m, bearing {math.degrees(bearing):.1f}° — photo: {photo_path}"
+                )
+
+            # Publish JSON detection
+            det = ColourDetection(
+                label=label,
+                center_x=cx,
+                center_y=cy,
+                area=area,
+                bearing_rad=bearing,
+                distance_m=dist,
+                robot_x=self.robot_x,
+                robot_y=self.robot_y,
+                photo_path=photo_path,
+                timestamp=time.strftime("%Y-%m-%dT%H:%M:%S"),
             )
+            msg = String()
+            msg.data = json.dumps(asdict(det))
+            self.det_pub.publish(msg)
 
-            cv2.putText(
-                annotated,
-                f"{label} {distance_m:.2f}m",
-                (x, max(y - 10, 20)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                colour,
-                2
-            )
+        # Publish annotated image for UI node
+        try:
+            img_msg = self.bridge.cv2_to_imgmsg(annotated, encoding="bgr8")
+            self.img_pub.publish(img_msg)
+        except Exception as e:
+            self.get_logger().warn(f"Image publish failed: {e}")
 
-            photo_path = self.save_photo_if_needed(
-                annotated,
-                label
-            )
+    def destroy_node(self):
+        if self.use_oakd and hasattr(self, "device"):
+            self.device.close()
+        elif hasattr(self, "cap"):
+            self.cap.release()
+        super().destroy_node()
 
-            msg_out = String()
-            msg_out.data = json.dumps({
-                "label": label,
-                "center_x": cx,
-                "center_y": cy,
-                "area": area,
-                "bearing_rad": bearing_rad,
-                "bearing_deg": math.degrees(bearing_rad),
-                "distance_m": distance_m,
-                "robot_x": self.robot_x,
-                "robot_y": self.robot_y,
-                "photo_path": photo_path,
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
-            })
 
-            self.det_pub.publish(msg_out)
+# =============================================================================
+# Standalone debug mode — run without ROS to tune HSV
+# python3 colour_detector_node.py
+# =============================================================================
 
-            self.get_logger().info(
-                f"Detected {label}: area={area:.1f}, "
-                f"bearing={math.degrees(bearing_rad):.1f} deg, "
-                f"distance≈{distance_m:.2f} m"
-            )
+def debug_standalone():
+    print("Colour detector debug mode")
+    if DEPTHAI_AVAILABLE:
+        pipeline, q_rgb, q_depth = build_oakd_pipeline()  # unpack the 3 values
+        with dai.Device() as device:
+            device.start(pipeline)
+            _debug_loop_oakd(q_rgb, q_depth)
+    else:
+        cap = cv2.VideoCapture(0)
+        _debug_loop_webcam(cap)
+        cap.release()
 
-        # Save latest debug image every processed frame
-        cv2.imwrite("/tmp/colour_detection_result.png", annotated)
 
-    # ---------------- DETECTION HELPERS ----------------
+def _debug_loop_oakd(q_rgb, q_depth):
+    while True:
+        rgb_pkt   = q_rgb.tryGet()
+        depth_pkt = q_depth.tryGet()
+        if rgb_pkt is None:
+            continue
+        bgr   = rgb_pkt.getCvFrame()
+        depth = depth_pkt.getFrame() if depth_pkt else None
+        if not _debug_show(bgr, depth):
+            break
 
-    def detect_colour(self, hsv, lower1, upper1, label, lower2=None, upper2=None):
-        mask = cv2.inRange(hsv, lower1, upper1)
 
-        if lower2 is not None and upper2 is not None:
-            mask2 = cv2.inRange(hsv, lower2, upper2)
-            mask = cv2.bitwise_or(mask, mask2)
+def _debug_loop_webcam(cap):
+    while True:
+        ret, bgr = cap.read()
+        if not ret:
+            break
+        if not _debug_show(bgr, None):
+            break
 
-        # Clean up noisy dots
-        kernel = np.ones((7, 7), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-        contours, _ = cv2.findContours(
-            mask,
-            cv2.RETR_EXTERNAL,
-            cv2.CHAIN_APPROX_SIMPLE
-        )
+def _debug_show(bgr, depth) -> bool:
+    h, w = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
 
-        if not contours:
-            return None
+    red    = detect_colour(hsv, depth, RED_LOWER_1, RED_UPPER_1, "red", RED_LOWER_2, RED_UPPER_2)
+    yellow = detect_colour(hsv, depth, YELLOW_LOWER, YELLOW_UPPER, "yellow")
 
-        biggest = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(biggest)
+    display = bgr.copy()
 
-        if area < self.min_area:
-            return None
+    if red:
+        _, bbox, dist = red
+        x, y, bw, bh = bbox
+        cv2.rectangle(display, (x, y), (x+bw, y+bh), (0, 0, 255), 2)
+        cv2.putText(display, f"RED {dist:.1f}m", (x, y-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
-        bbox = cv2.boundingRect(biggest)
+    if yellow:
+        _, bbox, dist = yellow
+        x, y, bw, bh = bbox
+        cv2.rectangle(display, (x, y), (x+bw, y+bh), (0, 255, 255), 2)
+        cv2.putText(display, f"YELLOW {dist:.1f}m", (x, y-5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-        return label, biggest, bbox
+    # Small red mask overlay top-left
+    red_mask = cv2.inRange(hsv, RED_LOWER_1, RED_UPPER_1)
+    red_mask |= cv2.inRange(hsv, RED_LOWER_2, RED_UPPER_2)
+    small = cv2.resize(red_mask, (w//4, h//4))
+    display[0:h//4, 0:w//4] = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
+    cv2.putText(display, "red mask", (5, h//4 + 15),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
 
-    def bearing_from_x(self, x_px, image_width):
-        # OAK-D horizontal FOV is roughly 71 degrees
-        hfov_rad = math.radians(71.0)
-
-        # Left side = negative, right side = positive
-        norm = (x_px - image_width / 2.0) / (image_width / 2.0)
-
-        return norm * (hfov_rad / 2.0)
-
-    def estimate_distance_from_area(self, area_px):
-        # This is only a rough fallback estimate because this version does not use depth.
-        # Bigger area = closer object.
-        if area_px <= 0:
-            return float("inf")
-
-        known_width_m = 0.30
-        focal_px = 600.0
-
-        return (known_width_m * focal_px) / math.sqrt(area_px)
-
-    def save_photo_if_needed(self, frame, label):
-        now = time.time()
-        last = self.last_photo_time.get(label, 0)
-
-        if now - last < self.photo_cooldown_s:
-            return ""
-
-        self.last_photo_time[label] = now
-
-        filename = f"{label}_{time.strftime('%Y%m%d_%H%M%S')}.png"
-        path = os.path.join(self.save_dir, filename)
-
-        cv2.imwrite(path, frame)
-
-        return path
+    cv2.imshow("Colour Detector Debug", display)
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
+        cv2.destroyAllWindows()
+        return False
+    return True
 
 
 def main(args=None):
     rclpy.init(args=args)
     node = ColourDetectorNode()
-
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
@@ -274,4 +460,4 @@ def main(args=None):
 
 
 if __name__ == "__main__":
-    main()
+    debug_standalone()
