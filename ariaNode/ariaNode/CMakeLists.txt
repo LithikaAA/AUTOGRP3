@@ -9,6 +9,7 @@ endif()
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 
 message("The root directory is ${CMAKE_MODULE_PATH}")
 
@@ -33,6 +34,7 @@ endif()
 add_executable(ariaNode src/ariaNode.cpp)
 ament_target_dependencies(ariaNode
 "geometry_msgs"
+"nav_msgs"
 "rclcpp"
 )
 
