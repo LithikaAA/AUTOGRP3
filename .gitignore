@@ -6,4 +6,6 @@ __pycache__/
 .venv/
 .vscode/
 *.log
-run_logs/
+run_logs/AUTOGRP3/
+AriaCoda/
+AUTOGRP3.bundle
