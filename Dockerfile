@@ -36,10 +36,13 @@ RUN apt-get update && apt-get install -y \
     # lidar
     ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
+    ros-jazzy-depthai-ros \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages
-RUN pip install depthai --break-system-packages 
+RUN pip install depthai --break-system-packages
+# Install Python packages
+RUN pip install depthai onnxruntime --break-system-packages
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
