@@ -9,20 +9,20 @@ LiDAR E-STOP -> moving obstacle detection
     -> within 1m: EMERGENCY STOP, immediate halt, log incident + save rosbag
         > this is PERMANENT, robot does not resume, human must reset
 
-- publishes /estop_status (Int8) so other nodes know what state we're in:
+- publishes /estop_status so other nodes know what state we're in:
     0 = all clear
     1 = warning (moving obstacle 1-5m), will resume when clear
     2 = emergency stop (moving obstacle within 1m), PERMANENT
 
 How moving detection works:
 - we compare each lidar scan to the previous one
-- stationary objects while the robot moves usually change at a steady/consistent rate
+- stationary objects while the robot moves usually change at a consistent rate
   (example: walls slowly getting closer as the robot drives forward)
 - sudden larger changes are treated as moving obstacles
 - needs 5 rays to agree before triggering (reduces false positives)
 - only checks the front 30 deg cone since side objects are less important
 
-How rosbag rolling buffer works:
+How rosbag rolling buffer works (lowkey might replace this):
 - a rosbag is ALWAYS recording in the background
 - restarts every 5 seconds so when estop triggers, bag has last ~5 seconds
 - when estop triggers, we stop (save) the current bag then start a fresh one
@@ -61,13 +61,13 @@ conehalfdeg = 30.0  # check 30 deg either side of dead ahead
 
 # consistency based motion detection
 historylen = 5  # how many past deltas per ray to average for drift baseline
-drifttol = 0.12 # metres -> how much a ray can spike above its drift before flagged
+drifttol = 0.15 # metres -> how much a ray can spike above its drift before flagged
                 # TUNE: lower = more sensitive, higher = fewer false positives
-minhits = 5     # how many flagged rays needed to actually trigger
+minhits = 5 # how many flagged rays needed to actually trigger
 
 # rosbag settings
 bagdirect = "/ros2_ws/bags"
-bagsecs = 5                     # rolling window, so saved bag = last ~5 seconds
+bagsecs = 5 # rolling window, so saved bag = last ~5 seconds
 bagtops = ["/scan", "/cmd_vel"] # what to record
 
 # where to save incident logs
@@ -83,7 +83,7 @@ class LidarEstop(Node):
         # estopON -> full emergency stop (1m), PERMANENT, never clears automatically
         # warnON  -> warning zone (5m), clears once path is clear
         self.estopON = False
-        self.warnON  = False
+        self.warnON = False
 
         # last scan - used to compute per-ray deltas
         self.prevranges = None
@@ -99,7 +99,7 @@ class LidarEstop(Node):
         os.makedirs(bagdirect, exist_ok=True)
 
         # pubs
-        self.cmdpub    = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.cmdpub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.statuspub = self.create_publisher(Int8, "/estop_status", 10)
 
         self.create_subscription(LaserScan, "/scan", self.lidarcb, 10)
@@ -147,7 +147,6 @@ class LidarEstop(Node):
 
 
     # lidar callback, runs every time a new scan arrives
-
     def lidarcb(self, msg: LaserScan):
         curr  = msg.ranges
         nrays = len(curr)
@@ -168,26 +167,25 @@ class LidarEstop(Node):
             return
 
         # work out which ray indices fall in the front cone
-        conerad  = math.radians(conehalfdeg)
+        conerad = math.radians(conehalfdeg)
         idxahead = int(round(-msg.angle_min / msg.angle_increment))
         idxahead = max(0, min(nrays - 1, idxahead))
-        idxhalf  = int(math.ceil(conerad / msg.angle_increment))
+        idxhalf = int(math.ceil(conerad / msg.angle_increment))
         idxstart = max(0,     idxahead - idxhalf)
-        idxend   = min(nrays, idxahead + idxhalf + 1)  # exclusive
+        idxend = min(nrays, idxahead + idxhalf + 1)  # exclusive
 
-        warnmoovehits  = 0
+        warnmoovehits = 0
         estopmoovehits = 0
-        hitclosest     = float("inf")
+        hitclosest = float("inf")
 
         for i in range(idxstart, idxend):
 
-            rangenow  = curr[i]
+            rangenow = curr[i]
             rangeprev = self.prevranges[i]
 
             # skip invalid readings
             if (
-                math.isnan(rangenow)  or math.isinf(rangenow)  or rangenow  <= 0.1 or
-                math.isnan(rangeprev) or math.isinf(rangeprev) or rangeprev <= 0.1
+                math.isnan(rangenow) or math.isinf(rangenow) or rangenow  <= 0.1 or math.isnan(rangeprev) or math.isinf(rangeprev) or rangeprev <= 0.1
             ):
                 self.deltahistory[i].append(0.0)
                 continue
@@ -198,7 +196,7 @@ class LidarEstop(Node):
             # this is the "expected" change from ego motion
             avgdrift = sum(self.deltahistory[i]) / len(self.deltahistory[i])
 
-            # update history BEFORE using avgdrift (don't pollute your own baseline)
+            # update history before using avgdrift (don't pollute your own baseline)
             self.deltahistory[i].append(instantchange)
 
             # how much did this ray spike above its normal drift?
@@ -214,7 +212,7 @@ class LidarEstop(Node):
                     hitclosest = min(hitclosest, rangenow)
 
         estoptrigger = estopmoovehits >= minhits
-        warntrigger  = warnmoovehits  >= minhits
+        warntrigger = warnmoovehits  >= minhits
 
         # emergency stop
         if estoptrigger and not self.estopON:
@@ -223,7 +221,7 @@ class LidarEstop(Node):
                 f"EMERGENCY STOP - moving obstacle at {hitclosest:.2f}m ({estopmoovehits} ray hits)"
             )
             self.estopON = True
-            self.warnON  = False
+            self.warnON = False
             self.logincident(hitclosest, estopmoovehits)
             self.savethebag()
 
@@ -279,7 +277,6 @@ class LidarEstop(Node):
 
 
 # main
-
 def main():
     rclpy.init()
     node = LidarEstop()
