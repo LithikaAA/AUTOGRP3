@@ -19,7 +19,9 @@ import rclpy
 from rclpy.node import Node
 
 from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, Image, Joy, Imu
+from std_msgs.msg import String
 from cv_bridge import CvBridge
 
 
@@ -92,7 +94,10 @@ class Part2MissionController(Node):
         self.declare_parameter("image_topic",   "/camera/image")
         self.declare_parameter("joy_topic",     "/joy")
         self.declare_parameter("imu_topic",     "/imu/data")
+        self.declare_parameter("odom_topic",    "/odom")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("mission_command_topic", "/mission_command")
+        self.declare_parameter("robot_state_topic", "/robot_state")
 
         # -------------------------------------------------
         # joystick mapping (PS4 defaults)
@@ -124,13 +129,21 @@ class Part2MissionController(Node):
         self.declare_parameter("cone_min_area",   500.0)
         self.declare_parameter("object_min_area", 350.0)
         self.declare_parameter("photos_dir",      "mission_photos")
+        self.declare_parameter("binary_map_csv",  "")
+        self.declare_parameter("map_yaml",        "")
+        self.declare_parameter("csv_waypoint_count", 6)
+        self.declare_parameter("use_test_waypoint", True)
+        self.declare_parameter("test_waypoint_distance", 1.0)
 
         # read params
         scan_topic    = self.get_parameter("scan_topic").value
         image_topic   = self.get_parameter("image_topic").value
         joy_topic     = self.get_parameter("joy_topic").value
         imu_topic     = self.get_parameter("imu_topic").value
+        odom_topic    = self.get_parameter("odom_topic").value
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
+        mission_command_topic = self.get_parameter("mission_command_topic").value
+        robot_state_topic = self.get_parameter("robot_state_topic").value
 
         self.joy_axis_linear   = int(self.get_parameter("joy_axis_linear").value)
         self.joy_axis_angular  = int(self.get_parameter("joy_axis_angular").value)
@@ -155,6 +168,11 @@ class Part2MissionController(Node):
 
         self.photos_dir = str(self.get_parameter("photos_dir").value)
         os.makedirs(self.photos_dir, exist_ok=True)
+        self.binary_map_csv = str(self.get_parameter("binary_map_csv").value)
+        self.map_yaml = str(self.get_parameter("map_yaml").value)
+        self.csv_waypoint_count = int(self.get_parameter("csv_waypoint_count").value)
+        self.use_test_waypoint = bool(self.get_parameter("use_test_waypoint").value)
+        self.test_waypoint_distance = float(self.get_parameter("test_waypoint_distance").value)
 
         # -------------------------
         # mode state
@@ -175,6 +193,10 @@ class Part2MissionController(Node):
         self.have_imu   = False
 
         self.current_heading = 0.0
+        self.have_odom = False
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_yaw = 0.0
 
         self.front_min = float("inf")
         self.left_min  = float("inf")
@@ -200,21 +222,28 @@ class Part2MissionController(Node):
 
         self.journey_log: List[DiscoveryResult] = []
         self.mission_start_time = time.time()
+        self.csv_waypoints: List[Tuple[float, float]] = []
+        self.current_csv_waypoint_idx = 0
+        self.goal_achieved_announced = False
 
         # -------------------------
         # pubs / subs
         # -------------------------
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
+        self.robot_state_pub = self.create_publisher(String, robot_state_topic, 10)
 
         self.create_subscription(LaserScan, scan_topic,  self.scan_callback,  10)
         self.create_subscription(Image,     image_topic, self.image_callback, 10)
         self.create_subscription(Joy,       joy_topic,   self.joy_callback,   10)
         self.create_subscription(Imu,       imu_topic,   self.imu_callback,   10)
+        self.create_subscription(Odometry,  odom_topic,  self.odom_callback,  10)
+        self.create_subscription(String, mission_command_topic, self.command_callback, 10)
 
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info("Part 2 mission controller started")
         self.get_logger().info(f"Local exploration enabled; max discoveries: {self.max_discoveries}")
+        self.get_logger().info(f"Mission commands: {mission_command_topic}; odom: {odom_topic}")
         self.get_logger().info("PS4: X=AUTO  O=MANUAL  Triangle=deadman (hold while in AUTO)")
         self.get_logger().info("Keyboard: a=AUTO  m=MANUAL  d=deadman  w/s/q/e/x")
 
@@ -231,6 +260,45 @@ class Part2MissionController(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_heading = math.atan2(siny_cosp, cosy_cosp)
         self.have_imu = True
+
+    def odom_callback(self, msg: Odometry):
+        self.have_odom = True
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+        q = msg.pose.pose.orientation
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny, cosy)
+
+    def command_callback(self, msg: String):
+        command = msg.data.strip().lower()
+        if command == "drive_waypoints":
+            self.csv_waypoints = self.load_test_waypoint() if self.use_test_waypoint else self.load_csv_waypoints()
+            self.current_csv_waypoint_idx = 0
+            self.goal_achieved_announced = False
+            if not self.csv_waypoints:
+                self.get_logger().error("Drive Waypoints requested, but no CSV waypoints could be generated.")
+                self.stop_robot()
+                return
+            self.mode = "AUTO"
+            self.auto_state = "CSV_WAYPOINTS"
+            self.deadman_pressed = True
+            self.publish_robot_state("WAYPOINT")
+            self.get_logger().info(f"Drive Waypoints command accepted: {len(self.csv_waypoints)} CSV waypoint(s).")
+        elif command == "go_home":
+            if self.auto_state == "CSV_WAYPOINTS":
+                self.mode = "MANUAL"
+                self.stop_robot()
+                self.publish_robot_state("RETURN_TO_CENTER")
+                self.get_logger().info("Go Home command received: distbug waypoint mode stopped.")
+        elif command == "start_wandering":
+            if self.auto_state in ["CSV_WAYPOINTS", "GOAL_ACHIEVED"]:
+                self.mode = "MANUAL"
+                self.auto_state = "EXPLORE"
+                self.csv_waypoints = []
+                self.current_csv_waypoint_idx = 0
+                self.stop_robot()
+                self.get_logger().info("Start Wandering command received: distbug waypoint mode stopped.")
 
     def scan_callback(self, msg: LaserScan):
         self.have_scan = True
@@ -327,7 +395,10 @@ class Part2MissionController(Node):
 
     def keyboard_thread(self):
         """Background keyboard fallback - useful in sim without a physical controller."""
-        settings = termios.tcgetattr(sys.stdin)
+        try:
+            settings = termios.tcgetattr(sys.stdin)
+        except termios.error:
+            return
         try:
             tty.setcbreak(sys.stdin.fileno())
             while rclpy.ok():
@@ -473,6 +544,86 @@ class Part2MissionController(Node):
         ]
         return min(vals) if vals else None
 
+    def _default_map_path(self, filename: str) -> str:
+        candidates = [
+            os.path.join("/ros2_ws", "maps", filename),
+            os.path.join(os.getcwd(), "maps", filename),
+            os.path.join(os.getcwd(), "ros2_ws", "maps", filename),
+        ]
+        here = os.path.abspath(__file__)
+        parts = here.split(os.sep)
+        if "ros2_ws" in parts:
+            ws_idx = parts.index("ros2_ws")
+            ws_root = os.sep.join(parts[:ws_idx + 1])
+            candidates.insert(0, os.path.join(ws_root, "maps", filename))
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return candidates[0]
+
+    def _map_metadata(self) -> Tuple[float, float, float]:
+        yaml_path = self.map_yaml or self._default_map_path("my_map.yaml")
+        resolution = 0.05
+        origin_x = 0.0
+        origin_y = 0.0
+        try:
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped.startswith("resolution:"):
+                        resolution = float(stripped.split(":", 1)[1].strip())
+                    elif stripped.startswith("origin:"):
+                        raw = stripped.split(":", 1)[1].strip().strip("[]")
+                        vals = [float(v.strip()) for v in raw.split(",")]
+                        if len(vals) >= 2:
+                            origin_x, origin_y = vals[0], vals[1]
+        except OSError:
+            self.get_logger().warn(f"Map YAML not found: {yaml_path}; using default map metadata.")
+        return resolution, origin_x, origin_y
+
+    def load_csv_waypoints(self) -> List[Tuple[float, float]]:
+        csv_path = self.binary_map_csv or self._default_map_path("my_map_binary.csv")
+        try:
+            grid = np.loadtxt(csv_path, delimiter=",", dtype=np.int8)
+        except Exception as exc:
+            self.get_logger().error(f"Could not load binary map CSV '{csv_path}': {exc}")
+            return []
+
+        free_rows, free_cols = np.where(grid == 0)
+        if len(free_rows) == 0:
+            self.get_logger().error(f"No free cells found in {csv_path}")
+            return []
+
+        resolution, origin_x, origin_y = self._map_metadata()
+        height = grid.shape[0]
+        points = list(zip(free_rows.tolist(), free_cols.tolist()))
+        points.sort(key=lambda rc: (rc[1], rc[0]))
+
+        count = max(1, min(self.csv_waypoint_count, len(points)))
+        selected = []
+        for i in range(count):
+            idx = int(round(i * (len(points) - 1) / max(count - 1, 1)))
+            row, col = points[idx]
+            x = origin_x + (col + 0.5) * resolution
+            y = origin_y + (height - row - 0.5) * resolution
+            selected.append((x, y))
+
+        self.get_logger().info(f"Generated CSV waypoints from {csv_path}: {selected}")
+        return selected
+
+    def load_test_waypoint(self) -> List[Tuple[float, float]]:
+        if not self.have_odom:
+            self.get_logger().warn("No odom yet for test waypoint. Try Drive Waypoints again after /odom is live.")
+            return []
+        distance = max(0.2, min(self.test_waypoint_distance, 2.0))
+        goal_x = self.current_x + distance * math.cos(self.current_yaw)
+        goal_y = self.current_y + distance * math.sin(self.current_yaw)
+        self.get_logger().info(
+            f"Using test waypoint ({goal_x:.2f}, {goal_y:.2f}) "
+            f"{distance:.2f} m ahead of current pose."
+        )
+        return [(goal_x, goal_y)]
+
     # =========================
     # actions
     # =========================
@@ -485,6 +636,9 @@ class Part2MissionController(Node):
         msg.linear.x  = linear_x
         msg.angular.z = angular_z
         self.cmd_pub.publish(msg)
+
+    def publish_robot_state(self, state: str):
+        self.robot_state_pub.publish(String(data=state))
 
     def save_current_image(self, prefix: str) -> Optional[str]:
         if self.latest_bgr is None:
@@ -506,9 +660,14 @@ class Part2MissionController(Node):
             self.run_auto()
 
     def run_manual(self):
-        self.publish_cmd(self.manual_linear, self.manual_angular)
+        if abs(self.manual_linear) > 1e-3 or abs(self.manual_angular) > 1e-3:
+            self.publish_cmd(self.manual_linear, self.manual_angular)
 
     def run_auto(self):
+        if self.auto_state == "CSV_WAYPOINTS":
+            self.do_csv_waypoints()
+            return
+
         if not (self.have_scan and self.have_image):
             self.stop_robot()
             self.get_logger().warn(
@@ -551,6 +710,62 @@ class Part2MissionController(Node):
             self.do_capture_object()
         else:
             self.stop_robot()
+
+    def do_csv_waypoints(self):
+        if not (self.have_scan and self.have_odom):
+            self.stop_robot()
+            self.get_logger().warn(
+                "CSV waypoint mode waiting for /scan and /odom",
+                throttle_duration_sec=2.0
+            )
+            return
+
+        if self.current_csv_waypoint_idx >= len(self.csv_waypoints):
+            self.stop_robot()
+            self.mode = "MANUAL"
+            self.auto_state = "GOAL_ACHIEVED"
+            if not self.goal_achieved_announced:
+                self.publish_robot_state("GOAL_ACHIEVED")
+                self.get_logger().info("GOAL ACHIEVED - final waypoint reached. Press Go Home to return to centre.")
+                self.goal_achieved_announced = True
+            return
+
+        goal_x, goal_y = self.csv_waypoints[self.current_csv_waypoint_idx]
+        dx = goal_x - self.current_x
+        dy = goal_y - self.current_y
+        distance = math.hypot(dx, dy)
+
+        if distance < 0.25:
+            self.get_logger().info(
+                f"Reached CSV waypoint {self.current_csv_waypoint_idx + 1}/{len(self.csv_waypoints)}"
+            )
+            self.current_csv_waypoint_idx += 1
+            self.stop_robot()
+            if self.current_csv_waypoint_idx >= len(self.csv_waypoints):
+                self.mode = "MANUAL"
+                self.auto_state = "GOAL_ACHIEVED"
+                self.publish_robot_state("GOAL_ACHIEVED")
+                self.get_logger().info("GOAL ACHIEVED - final waypoint reached. Press Go Home to return to centre.")
+                self.goal_achieved_announced = True
+            return
+
+        if self.front_min < self.critical_obstacle_dist_m:
+            turn_dir = -1.0 if self.left_min < self.right_min else 1.0
+            self.publish_cmd(0.0, 0.8 * turn_dir)
+            return
+
+        target_heading = math.atan2(dy, dx)
+        heading_error = wrap_to_pi(target_heading - self.current_yaw)
+        angular = clamp(1.4 * heading_error, -0.6, 0.6)
+        linear = 0.18 if abs(heading_error) < math.radians(25) else 0.04
+        linear = min(linear, distance * 0.5)
+
+        if self.front_min < self.front_obstacle_dist_m:
+            turn_dir = -1.0 if self.left_min < self.right_min else 1.0
+            self.publish_cmd(0.04, 0.45 * turn_dir)
+            return
+
+        self.publish_cmd(linear, angular)
 
     # =========================
     # behaviour states

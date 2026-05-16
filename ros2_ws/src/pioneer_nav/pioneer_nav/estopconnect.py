@@ -45,6 +45,7 @@ from rclpy.node import Node
 
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool
 from std_msgs.msg import Int8
 
 # /estop_status values
@@ -66,18 +67,22 @@ drifttol = 0.15 # metres -> how much a ray can spike above its drift before flag
 minhits = 5 # how many flagged rays needed to actually trigger
 
 # rosbag settings
-bagdirect = "/ros2_ws/bags"
+default_bagdirect = os.path.expanduser("~/pioneer_estop/bags")
 bagsecs = 5 # rolling window, so saved bag = last ~5 seconds
 bagtops = ["/scan", "/cmd_vel"] # what to record
 
 # where to save incident logs
-incidentlog = "/ros2_ws/incidents.txt"
+default_incidentlog = os.path.expanduser("~/pioneer_estop/incidents.txt")
 
 
 class LidarEstop(Node):
 
     def __init__(self):
         super().__init__("estoplidar")
+        self.declare_parameter("bag_directory", default_bagdirect)
+        self.declare_parameter("incident_log", default_incidentlog)
+        self.bagdirect = self.get_parameter("bag_directory").value
+        self.incidentlog = self.get_parameter("incident_log").value
 
         # two states:
         # estopON -> full emergency stop (1m), PERMANENT, never clears automatically
@@ -96,11 +101,13 @@ class LidarEstop(Node):
         # rosbag subprocess handle
         self.bagproc = None
 
-        os.makedirs(bagdirect, exist_ok=True)
+        os.makedirs(self.bagdirect, exist_ok=True)
+        os.makedirs(os.path.dirname(self.incidentlog), exist_ok=True)
 
         # pubs
         self.cmdpub = self.create_publisher(Twist, "/cmd_vel", 10)
         self.statuspub = self.create_publisher(Int8, "/estop_status", 10)
+        self.triggeredpub = self.create_publisher(Bool, "/estop/triggered", 10)
 
         self.create_subscription(LaserScan, "/scan", self.lidarcb, 10)
 
@@ -119,7 +126,7 @@ class LidarEstop(Node):
 
     def startbag(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        bagpath = os.path.join(bagdirect, f"rolling_{timestamp}")
+        bagpath = os.path.join(self.bagdirect, f"rolling_{timestamp}")
         try:
             self.bagproc = subprocess.Popen(
                 ["ros2", "bag", "record", "-o", bagpath, "--topics"] + bagtops
@@ -250,9 +257,9 @@ class LidarEstop(Node):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] ESTOP triggered! - Moving obstacle at {closest:.2f}m ({hits} ray hits)\n"
         try:
-            with open(incidentlog, "a") as f:
+            with open(self.incidentlog, "a") as f:
                 f.write(line)
-            self.get_logger().info(f"Incident logged to {incidentlog}")
+            self.get_logger().info(f"Incident logged to {self.incidentlog}")
         except Exception as e:
             self.get_logger().warn(f"Could not write incident log: {e}")
 
@@ -264,11 +271,14 @@ class LidarEstop(Node):
         if self.estopON:
             self.sendvelo(0.0)
             self.statuspub.publish(Int8(data=estopstate))
+            self.triggeredpub.publish(Bool(data=True))
         elif self.warnON:
             self.sendvelo(0.0)
             self.statuspub.publish(Int8(data=warnstate))
+            self.triggeredpub.publish(Bool(data=False))
         else:
             self.statuspub.publish(Int8(data=clearstate))
+            self.triggeredpub.publish(Bool(data=False))
 
     def sendvelo(self, speed: float):
         twist = Twist()

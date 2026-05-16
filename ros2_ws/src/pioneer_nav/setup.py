@@ -14,6 +14,8 @@ setup(
             'launch/sdf.launch.py',
             'launch/control_node_gazebo.launch.py',
             'launch/slam_mapping.launch.py',
+            'launch/gazebo_mapping_gui.launch.py',
+            'launch/mapping_gui.launch.py',
         ]),
         ('share/' + package_name + '/config', [
             'pioneer_nav/config/test_waypoints.txt',
@@ -40,6 +42,10 @@ setup(
             'odom_tf_broadcaster = pioneer_nav.odom_tf_broadcaster:main',
             'mission_manager = pioneer_nav.mission_manager:main',
             'colour_detector = pioneer_nav.colour_detector_node:main',
+            'estoplidar = pioneer_nav.estoplidar:main',
+            'estopconnect = pioneer_nav.estopconnect:main',
+            'estoptest = pioneer_nav.estoptest:main',
+            'robot_gui = pioneer_nav.GUI:main',
         ],
     },
 )

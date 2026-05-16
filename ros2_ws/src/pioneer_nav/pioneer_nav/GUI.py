@@ -32,15 +32,20 @@ Run:
 import sys
 import json
 import math
+import os
+import subprocess
 import threading
+import time
 from datetime import datetime
+from pathlib import Path as FilePath
 
 import cv2
 import numpy as np
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image, LaserScan
 from std_msgs.msg import String
 from geometry_msgs.msg import Pose
 from nav_msgs.msg import OccupancyGrid, Path
@@ -48,7 +53,7 @@ from nav_msgs.msg import OccupancyGrid, Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel,
     QVBoxLayout, QHBoxLayout, QGridLayout,
-    QFrame, QScrollArea, QSizePolicy, QProgressBar
+    QFrame, QScrollArea, QSizePolicy, QProgressBar, QPushButton
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF
 from PyQt5.QtGui import (
@@ -92,8 +97,11 @@ class Signals(QObject):
     letter_detected = pyqtSignal(str)              # e.g. "alpha"
     colour_detected = pyqtSignal(dict)             # JSON dict from /detections/colour
     map_updated     = pyqtSignal(object)           # OccupancyGrid message
+    scan_updated    = pyqtSignal(object)           # LaserScan message
     path_updated    = pyqtSignal(object)           # Path message
     arena_updated   = pyqtSignal(dict)             # JSON dict from /arena_status
+    save_status     = pyqtSignal(str, bool)        # message, success flag
+    mission_command = pyqtSignal(str)              # GUI command to ROS
 
 
 # ──────────────────────────────────────────────
@@ -107,6 +115,12 @@ class GUINode(Node):
     def __init__(self, signals: Signals):
         super().__init__("robot_gui")
         self.signals = signals
+        map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+        )
 
         # Each subscription maps one ROS topic to one callback.
         # The callback converts the message and emits a signal.
@@ -115,9 +129,15 @@ class GUINode(Node):
         self.create_subscription(Pose,          "/robot/pose",        self._cb_pose,    10)
         self.create_subscription(String,        "/detected_letter",   self._cb_letter,  10)
         self.create_subscription(String,        "/detections/colour", self._cb_colour,  10)
-        self.create_subscription(OccupancyGrid, "/map",               self._cb_map,     10)
+        self.create_subscription(OccupancyGrid, "/map",               self._cb_map,     map_qos)
+        self.create_subscription(LaserScan,     "/scan",              self._cb_scan,    10)
         self.create_subscription(Path,          "/planned_path",      self._cb_path,    10)
         self.create_subscription(String,        "/arena_status",      self._cb_arena,   10)
+        self.command_pub = self.create_publisher(String, "/mission_command", 10)
+
+    def publish_command(self, command: str):
+        self.command_pub.publish(String(data=command))
+        self.get_logger().info(f"GUI command published: {command}")
 
     def _cb_camera(self, msg):
         # Convert raw bytes to numpy array, fix channel order if needed
@@ -156,6 +176,9 @@ class GUINode(Node):
     def _cb_map(self, msg):
         # Published by slam_toolbox during mapping phase
         self.signals.map_updated.emit(msg)
+
+    def _cb_scan(self, msg):
+        self.signals.scan_updated.emit(msg)
 
     def _cb_path(self, msg):
         # Published by mission_manager.py during waypoint phase
@@ -240,11 +263,30 @@ class MapWidget(QWidget):
         self._map_oy    = 0.0    # map origin y (world coords)
         self._map_w     = 0      # map width in cells
         self._map_h     = 0      # map height in cells
+        self._last_map_time = None
 
         # Robot pose — updated from /robot/pose
         self._robot_x   = 0.0
         self._robot_y   = 0.0
         self._robot_yaw = 0.0
+        self._have_pose  = False
+        self._arena_origin_x = None
+        self._arena_origin_y = None
+
+        # 15x15m live coverage grid. The first robot pose is the centre.
+        self._arena_size = 15.0
+        self._arena_half = self._arena_size / 2.0
+        self._coverage_res = 0.25
+        self._coverage_n = int(self._arena_size / self._coverage_res)
+        self._free_cells = np.zeros((self._coverage_n, self._coverage_n), dtype=bool)
+        self._obstacle_cells = np.zeros((self._coverage_n, self._coverage_n), dtype=bool)
+
+        # Live fallback map from LaserScan, shown before /map arrives.
+        self._path_trace = []
+        self._scan_hits = []
+        self._max_trace_points = 2000
+        self._max_scan_hits = 5000
+        self._scan_hit_lifetime = 10.0
 
         # Detection markers — accumulated over the run
         # Each entry: (world_x, world_y, label_string, colour_string)
@@ -264,22 +306,96 @@ class MapWidget(QWidget):
         data = np.array(msg.data, dtype=np.int8).reshape((self._map_h, self._map_w))
         img  = np.zeros((self._map_h, self._map_w, 3), dtype=np.uint8)
 
-        # -1 = unknown (grey), 0 = free (light), >50 = occupied (dark)
-        img[data == -1] = [40,  40,  40]
-        img[data == 0]  = [200, 200, 200]
-        img[data > 50]  = [20,  20,  20]
+        # OccupancyGrid cell colours:
+        # -1 unknown, 0 free, >50 occupied/non-free.
+        # Use high-contrast colours so the map reads like a grid,
+        # not a blurry lidar sweep.
+        img[data == -1] = [18,  24,  31]
+        img[data == 0]  = [220, 238, 225]
+        img[data > 50]  = [248,  81,  73]
 
         # ROS map origin is bottom-left, Qt is top-left — flip vertically
         img = np.flipud(img)
         h, w, _ = img.shape
         self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888)
+        self._last_map_time = time.time()
         self.update()   # trigger repaint
 
     def update_pose(self, x, y, yaw):
         self._robot_x   = x
         self._robot_y   = y
         self._robot_yaw = yaw
+        self._have_pose = True
+        if self._arena_origin_x is None or self._arena_origin_y is None:
+            self._arena_origin_x = x
+            self._arena_origin_y = y
+        if not self._path_trace or math.hypot(
+            x - self._path_trace[-1][0],
+            y - self._path_trace[-1][1],
+        ) > 0.03:
+            self._path_trace.append((x, y))
+            if len(self._path_trace) > self._max_trace_points:
+                self._path_trace = self._path_trace[-self._max_trace_points:]
         self.update()
+
+    def update_scan(self, msg):
+        if not self._have_pose or self._arena_origin_x is None:
+            return
+
+        hits = []
+        now = time.time()
+        step = max(1, len(msg.ranges) // 180)
+        for i in range(0, len(msg.ranges), step):
+            r = msg.ranges[i]
+            if not math.isfinite(r) or r < msg.range_min or r > msg.range_max:
+                continue
+            angle = self._robot_yaw + msg.angle_min + i * msg.angle_increment
+            wx = self._robot_x + r * math.cos(angle)
+            wy = self._robot_y + r * math.sin(angle)
+            hits.append((wx, wy, now))
+            self._paint_lidar_ray(angle, r, msg.range_max)
+
+        self._scan_hits.extend(hits)
+        cutoff = now - self._scan_hit_lifetime
+        self._scan_hits = [hit for hit in self._scan_hits if hit[2] >= cutoff]
+        if len(self._scan_hits) > self._max_scan_hits:
+            self._scan_hits = self._scan_hits[-self._max_scan_hits:]
+        self.update()
+
+    def _world_to_arena(self, wx, wy):
+        if self._arena_origin_x is None or self._arena_origin_y is None:
+            return 0.0, 0.0
+        return wx - self._arena_origin_x, wy - self._arena_origin_y
+
+    def _arena_to_cell(self, ax, ay):
+        col = int((ax + self._arena_half) / self._coverage_res)
+        row = int((self._arena_half - ay) / self._coverage_res)
+        if 0 <= row < self._coverage_n and 0 <= col < self._coverage_n:
+            return row, col
+        return None
+
+    def _world_to_cell(self, wx, wy):
+        ax, ay = self._world_to_arena(wx, wy)
+        return self._arena_to_cell(ax, ay)
+
+    def _paint_lidar_ray(self, angle, distance, sensor_max_range):
+        max_dist = min(distance, sensor_max_range, self._arena_half * 1.45)
+        step = max(self._coverage_res * 0.5, 0.05)
+        travelled = 0.0
+        while travelled < max_dist:
+            wx = self._robot_x + travelled * math.cos(angle)
+            wy = self._robot_y + travelled * math.sin(angle)
+            cell = self._world_to_cell(wx, wy)
+            if cell is not None:
+                self._free_cells[cell] = True
+            travelled += step
+
+        if distance < sensor_max_range * 0.97:
+            wx = self._robot_x + distance * math.cos(angle)
+            wy = self._robot_y + distance * math.sin(angle)
+            cell = self._world_to_cell(wx, wy)
+            if cell is not None:
+                self._obstacle_cells[cell] = True
 
     def add_detection(self, x, y, label, colour):
         self._detections.append((x, y, label, colour))
@@ -294,8 +410,40 @@ class MapWidget(QWidget):
         Convert world coordinates (metres) to widget pixel coordinates.
         Accounts for map scale and centres the map in the widget.
         """
+        if self._arena_origin_x is not None and self._arena_origin_y is not None:
+            size = min(self.width(), self.height()) - 20
+            size = max(10, size)
+            dx = (self.width() - size) // 2
+            dy = (self.height() - size) // 2
+            ax, ay = self._world_to_arena(wx, wy)
+            px = int(dx + (ax + self._arena_half) / self._arena_size * size)
+            py = int(dy + (self._arena_half - ay) / self._arena_size * size)
+            return (px, py)
+
         if self._map_w == 0 or self._map_h == 0:
-            return (self.width()//2, self.height()//2)
+            scan_points = [(x, y) for x, y, _stamp in self._scan_hits]
+            points = self._path_trace + scan_points + [(self._robot_x, self._robot_y)]
+            if not points:
+                return (self.width()//2, self.height()//2)
+
+            min_x = min(p[0] for p in points)
+            max_x = max(p[0] for p in points)
+            min_y = min(p[1] for p in points)
+            max_y = max(p[1] for p in points)
+            span = max(max_x - min_x, max_y - min_y, 1.0)
+            pad = max(1.0, span * 0.15)
+            min_x -= pad
+            max_x += pad
+            min_y -= pad
+            max_y += pad
+            sx = self.width() / max(max_x - min_x, 0.1)
+            sy = self.height() / max(max_y - min_y, 0.1)
+            scale = min(sx, sy)
+            used_w = (max_x - min_x) * scale
+            used_h = (max_y - min_y) * scale
+            px = int((wx - min_x) * scale + (self.width() - used_w) / 2)
+            py = int((max_y - wy) * scale + (self.height() - used_h) / 2)
+            return (px, py)
 
         # World → grid cell
         gx    = (wx - self._map_ox) / self._map_res
@@ -307,26 +455,114 @@ class MapWidget(QWidget):
         py = int(gy * scale + (self.height() - self._map_h * scale) / 2)
         return (px, py)
 
+    def _draw_coverage_grid(self, painter):
+        size = min(self.width(), self.height()) - 20
+        size = max(10, size)
+        dx = (self.width() - size) // 2
+        dy = (self.height() - size) // 2
+        cell = size / self._coverage_n
+
+        painter.fillRect(dx, dy, size, size, QColor(10, 14, 20))
+
+        for row in range(self._coverage_n):
+            y = int(dy + row * cell)
+            h = max(1, int(math.ceil(cell)))
+            for col in range(self._coverage_n):
+                if not self._free_cells[row, col] and not self._obstacle_cells[row, col]:
+                    continue
+                x = int(dx + col * cell)
+                w = max(1, int(math.ceil(cell)))
+                if self._obstacle_cells[row, col]:
+                    colour = QColor(248, 81, 73)
+                else:
+                    colour = QColor(63, 185, 80, 165)
+                painter.fillRect(x, y, w, h, colour)
+
+        painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
+        for i in range(self._coverage_n + 1):
+            pos = int(dx + i * cell)
+            painter.drawLine(pos, dy, pos, dy + size)
+            pos_y = int(dy + i * cell)
+            painter.drawLine(dx, pos_y, dx + size, pos_y)
+
+        # Stronger metre grid lines for quick 15x15 visual debugging.
+        metre_step = self._coverage_n / self._arena_size
+        painter.setPen(QPen(QColor(88, 166, 255, 70), 1))
+        for metre in range(16):
+            offset = int(metre * metre_step * cell)
+            painter.drawLine(dx + offset, dy, dx + offset, dy + size)
+            painter.drawLine(dx, dy + offset, dx + size, dy + offset)
+
+        painter.setPen(QPen(QColor(TEXT_DIM), 1))
+        painter.setFont(QFont(FONT_UI, 9))
+        painter.drawText(dx + 8, dy + 18, "15 x 15 m LiDAR coverage grid")
+
     def paintEvent(self, event):
         """Called by Qt whenever the widget needs to be redrawn."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(BG))
+        self._draw_coverage_grid(painter)
 
         # Draw occupancy grid map
-        if self._map_img:
+        if False and self._map_img:
             scale = min(self.width() / self._map_w, self.height() / self._map_h)
             dw    = int(self._map_w * scale)
             dh    = int(self._map_h * scale)
             dx    = (self.width()  - dw) // 2
             dy    = (self.height() - dh) // 2
             pix   = QPixmap.fromImage(self._map_img).scaled(
-                dw, dh, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                dw, dh, Qt.KeepAspectRatio, Qt.FastTransformation)
             painter.drawPixmap(dx, dy, pix)
-        else:
+
+            cell_px = scale
+            if cell_px >= 4:
+                painter.setPen(QPen(QColor(255, 255, 255, 35), 1))
+                for col in range(self._map_w + 1):
+                    x = int(dx + col * scale)
+                    painter.drawLine(x, dy, x, dy + dh)
+                for row in range(self._map_h + 1):
+                    y = int(dy + row * scale)
+                    painter.drawLine(dx, y, dx + dw, y)
+            else:
+                major = max(5, int(0.5 / max(self._map_res, 0.001)))
+                painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
+                for col in range(0, self._map_w + 1, major):
+                    x = int(dx + col * scale)
+                    painter.drawLine(x, dy, x, dy + dh)
+                for row in range(0, self._map_h + 1, major):
+                    y = int(dy + row * scale)
+                    painter.drawLine(dx, y, dx + dw, y)
+        elif False:
+            # Live scan fallback: draw accumulated lidar hits and robot path
+            # while slam_toolbox is still preparing the occupancy grid.
+            if self._scan_hits:
+                painter.setPen(QPen(QColor(200, 200, 200, 160), 2))
+                for wx, wy, _stamp in self._scan_hits[-self._max_scan_hits:]:
+                    px, py = self._world_to_px(wx, wy)
+                    painter.drawPoint(px, py)
+
+            if len(self._path_trace) >= 2:
+                painter.setPen(QPen(QColor(ACCENT), 2))
+                for i in range(len(self._path_trace) - 1):
+                    p1 = self._world_to_px(*self._path_trace[i])
+                    p2 = self._world_to_px(*self._path_trace[i + 1])
+                    painter.drawLine(*p1, *p2)
+
             painter.setPen(QColor(TEXT_DIM))
             painter.setFont(QFont(FONT_UI, 10))
-            painter.drawText(self.rect(), Qt.AlignCenter, "Waiting for /map...")
+            label = "Live LiDAR trace — waiting for /map..."
+            painter.drawText(self.rect().adjusted(0, 14, 0, 0), Qt.AlignHCenter | Qt.AlignTop, label)
+
+        if False and self._map_img:
+            age = 0.0 if self._last_map_time is None else time.time() - self._last_map_time
+            painter.setPen(QColor(TEXT_DIM))
+            painter.setFont(QFont(FONT_UI, 10))
+            painter.drawText(
+                self.rect().adjusted(0, 14, 0, 0),
+                Qt.AlignHCenter | Qt.AlignTop,
+                f"SLAM map live  |  last update {age:.1f}s ago",
+            )
 
         # Draw planned path as dashed line
         if len(self._path) >= 2:
@@ -348,19 +584,11 @@ class MapWidget(QWidget):
             painter.setPen(QColor(TEXT))
             painter.drawText(px+8, py+4, label[:3])
 
-        # Draw robot as a directional arrow
+        # Draw robot as a single point.
         rx, ry = self._world_to_px(self._robot_x, self._robot_y)
-        painter.save()
-        painter.translate(rx, ry)
-        painter.rotate(-math.degrees(self._robot_yaw))
-        arrow = QPolygonF([
-            QPointF(0, -12), QPointF(-7, 8),
-            QPointF(0, 4),   QPointF(7, 8),
-        ])
         painter.setBrush(QBrush(QColor(ACCENT)))
-        painter.setPen(QPen(QColor(TEXT), 1))
-        painter.drawPolygon(arrow)
-        painter.restore()
+        painter.setPen(QPen(QColor(TEXT), 2))
+        painter.drawEllipse(rx - 5, ry - 5, 10, 10)
         painter.end()
 
 
@@ -525,6 +753,7 @@ class RobotGUI(QMainWindow):
         self.setWindowTitle("AUTO4508 — Pioneer 3-AT Monitor")
         self.setMinimumSize(1400, 800)
         self.setStyleSheet(f"background: {BG}; color: {TEXT};")
+        self._latest_map_msg = None
 
         self._build_ui()
         self._connect_signals()
@@ -582,7 +811,6 @@ class RobotGUI(QMainWindow):
             ("Action",      "—"),
             ("Pos X",       "0.00 m"),
             ("Pos Y",       "0.00 m"),
-            ("Heading",     "0.0°"),
             ("Last Letter", "—"),
         ]):
             self._status_labels[key] = status_row(sg, i, key, val)
@@ -601,6 +829,70 @@ class RobotGUI(QMainWindow):
         map_frame, map_layout = make_panel("Map")
         self._map_widget = MapWidget()
         map_layout.addWidget(self._map_widget)
+
+        map_controls = QHBoxLayout()
+        self._start_wandering_btn = QPushButton("Start Wandering")
+        self._start_wandering_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
+        self._start_wandering_btn.setCursor(Qt.PointingHandCursor)
+        self._start_wandering_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {GREEN}22;
+                color: {GREEN};
+                border: 1px solid {GREEN};
+                border-radius: 6px;
+                padding: 6px 12px;
+            }}
+        """)
+        self._go_home_btn = QPushButton("Go Home")
+        self._go_home_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
+        self._go_home_btn.setCursor(Qt.PointingHandCursor)
+        self._go_home_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {ACCENT}22;
+                color: {ACCENT};
+                border: 1px solid {ACCENT};
+                border-radius: 6px;
+                padding: 6px 12px;
+            }}
+        """)
+        self._drive_waypoints_btn = QPushButton("Drive Waypoints")
+        self._drive_waypoints_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
+        self._drive_waypoints_btn.setCursor(Qt.PointingHandCursor)
+        self._drive_waypoints_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {YELLOW}22;
+                color: {YELLOW};
+                border: 1px solid {YELLOW};
+                border-radius: 6px;
+                padding: 6px 12px;
+            }}
+        """)
+        self._save_map_btn = QPushButton("Save Map")
+        self._save_map_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
+        self._save_map_btn.setCursor(Qt.PointingHandCursor)
+        self._save_map_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {GREEN}22;
+                color: {GREEN};
+                border: 1px solid {GREEN};
+                border-radius: 6px;
+                padding: 6px 12px;
+            }}
+            QPushButton:disabled {{
+                background: {BORDER};
+                color: {TEXT_DIM};
+                border: 1px solid {BORDER};
+            }}
+        """)
+        self._save_map_label = QLabel("Maps save to ros2_ws/maps")
+        self._save_map_label.setFont(QFont(FONT_UI, 8))
+        self._save_map_label.setStyleSheet(f"color: {TEXT_DIM}; border: none; background: transparent;")
+        map_controls.addWidget(self._start_wandering_btn)
+        map_controls.addWidget(self._go_home_btn)
+        map_controls.addWidget(self._drive_waypoints_btn)
+        map_controls.addWidget(self._save_map_btn)
+        map_controls.addWidget(self._save_map_label, 1)
+        map_layout.addLayout(map_controls)
         content.addWidget(map_frame, 4)
 
         # RIGHT COLUMN
@@ -658,8 +950,14 @@ class RobotGUI(QMainWindow):
         self.signals.letter_detected.connect(self._on_letter)
         self.signals.colour_detected.connect(self._on_colour)
         self.signals.map_updated.connect(self._on_map)
+        self.signals.scan_updated.connect(self._on_scan)
         self.signals.path_updated.connect(self._on_path)
         self.signals.arena_updated.connect(self._on_arena)
+        self.signals.save_status.connect(self._on_save_status)
+        self._start_wandering_btn.clicked.connect(lambda: self._send_mission_command("start_wandering"))
+        self._go_home_btn.clicked.connect(lambda: self._send_mission_command("go_home"))
+        self._drive_waypoints_btn.clicked.connect(lambda: self._send_mission_command("drive_waypoints"))
+        self._save_map_btn.clicked.connect(self._save_map)
 
     # ── Slot handlers ────────────────────────────
     # These run on the Qt main thread, safe to update UI
@@ -682,6 +980,7 @@ class RobotGUI(QMainWindow):
         colour_map = {
             "MAPPING":          GREEN,
             "WAYPOINT":         ACCENT,
+            "GOAL_ACHIEVED":    GREEN,
             "IDLE":             YELLOW,
             "STOPPED":          RED,
             "ESTOP":            RED,
@@ -693,6 +992,7 @@ class RobotGUI(QMainWindow):
         action_map = {
             "MAPPING":  "Exploring area and building map...",
             "WAYPOINT": "Driving to waypoints at maximum speed...",
+            "GOAL_ACHIEVED": "Goal achieved. Press Go Home to return to centre.",
             "IDLE":     "Standing by.",
             "STOPPED":  "EMERGENCY STOP — all motion halted!",
             "ESTOP":    "EMERGENCY STOP — obstacle detected!",
@@ -704,10 +1004,9 @@ class RobotGUI(QMainWindow):
         self._det_log.add_entry(f"State → {state}", colour)
 
     def _on_pose(self, x: float, y: float, yaw: float):
-        """Update position display and move robot arrow on map."""
+        """Update position display and move robot point on map."""
         self._status_labels["Pos X"].setText(f"{x:.2f} m")
         self._status_labels["Pos Y"].setText(f"{y:.2f} m")
-        self._status_labels["Heading"].setText(f"{math.degrees(yaw):.1f}°")
         self._map_widget.update_pose(x, y, yaw)
 
     def _on_letter(self, name: str):
@@ -746,7 +1045,11 @@ class RobotGUI(QMainWindow):
                 self._photo_label.setPixmap(pix)
 
     def _on_map(self, msg):
+        self._latest_map_msg = msg
         self._map_widget.update_map(msg)
+
+    def _on_scan(self, msg):
+        self._map_widget.update_scan(msg)
 
     def _on_path(self, msg):
         self._map_widget.update_path(msg.poses)
@@ -755,6 +1058,97 @@ class RobotGUI(QMainWindow):
 
     def _on_arena(self, data: dict):
         self._arena_panel.update(data)
+
+    def _send_mission_command(self, command: str):
+        self.signals.mission_command.emit(command)
+        self._det_log.add_entry(f"Command -> {command}", ACCENT)
+        self._action_label.setText(f"Command sent: {command}")
+
+    def _save_map(self):
+        if self._latest_map_msg is None:
+            self.signals.save_status.emit("No /map received yet", False)
+            return
+
+        self._save_map_btn.setEnabled(False)
+        self._save_map_label.setText("Saving current /map...")
+        self._save_map_label.setStyleSheet(f"color: {TEXT_DIM}; border: none; background: transparent;")
+
+        def worker():
+            msg = self._latest_map_msg
+            try:
+                prefix = self._save_occupancy_grid(msg)
+                self.signals.save_status.emit(f"Saved {prefix}.png", True)
+            except Exception as exc:
+                self.signals.save_status.emit(str(exc), False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _save_occupancy_grid(self, msg) -> str:
+        out_dir = self._map_output_dir()
+        os.makedirs(out_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        prefix = os.path.join(out_dir, f"pioneer_map_{stamp}")
+
+        width = msg.info.width
+        height = msg.info.height
+        data = np.array(msg.data, dtype=np.int16).reshape((height, width))
+
+        img = np.full((height, width), 205, dtype=np.uint8)
+        img[data == 0] = 254
+        img[data >= 65] = 0
+        img = np.flipud(img)
+
+        image_path = f"{prefix}.png"
+        yaml_path = f"{prefix}.yaml"
+        if not cv2.imwrite(image_path, img):
+            raise RuntimeError(f"Could not write {image_path}")
+
+        yaw = self._yaw_from_quaternion(msg.info.origin.orientation)
+        with open(yaml_path, "w", encoding="utf-8") as yaml_file:
+            yaml_file.write(
+                f"image: {os.path.basename(image_path)}\n"
+                f"mode: trinary\n"
+                f"resolution: {msg.info.resolution:.8f}\n"
+                f"origin: [{msg.info.origin.position.x:.8f}, "
+                f"{msg.info.origin.position.y:.8f}, {yaw:.8f}]\n"
+                f"negate: 0\n"
+                f"occupied_thresh: 0.65\n"
+                f"free_thresh: 0.25\n"
+            )
+
+        return prefix
+
+    def _yaw_from_quaternion(self, q) -> float:
+        siny = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny, cosy)
+
+    def _map_output_dir(self) -> str:
+        env_dir = os.environ.get("PIONEER_MAP_DIR")
+        if env_dir:
+            return os.path.expanduser(env_dir)
+
+        here = FilePath(__file__).resolve()
+        for parent in [here] + list(here.parents):
+            if parent.name == "ros2_ws":
+                return str(parent / "maps")
+
+        cwd = FilePath.cwd().resolve()
+        if cwd.name == "ros2_ws":
+            return str(cwd / "maps")
+
+        docker_ws = FilePath("/ros2_ws")
+        if docker_ws.exists():
+            return str(docker_ws / "maps")
+
+        return str(cwd / "maps")
+
+    def _on_save_status(self, message: str, ok: bool):
+        self._save_map_btn.setEnabled(True)
+        colour = GREEN if ok else RED
+        self._save_map_label.setText(message)
+        self._save_map_label.setStyleSheet(f"color: {colour}; border: none; background: transparent;")
+        self._det_log.add_entry(message, colour)
 
     def _tick_clock(self):
         self._clock_label.setText(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
@@ -770,6 +1164,7 @@ def main():
     rclpy.init()
     signals = Signals()
     node    = GUINode(signals)
+    signals.mission_command.connect(node.publish_command)
 
     # Spin ROS2 in background — this processes all incoming messages
     ros_thread = threading.Thread(

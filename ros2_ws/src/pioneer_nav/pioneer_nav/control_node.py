@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import math
 import random
 import threading
@@ -7,9 +8,11 @@ from enum import Enum
 
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Joy, LaserScan
+from std_msgs.msg import Int8, String
 from tf2_msgs.msg import TFMessage
 
 # Configuration defaults
@@ -48,6 +51,9 @@ MAX_CENTER_ANGLE = 45
 RETURN_TO_CENTER_SPEED = 0.25
 RETURN_TO_CENTER_TURN_SPEED_DEG = 30.0
 RETURN_TO_CENTER_MIN_DISTANCE = 0.5
+ESTOP_CLEAR = 0
+ESTOP_WARNING = 1
+ESTOP_ACTIVE = 2
 
 
 class DRIVE_MODE(Enum):
@@ -111,11 +117,22 @@ class ControlNode(Node):
         self.declare_parameter('gazebo_tf_topic', '/model/pioneer/tf')
         self.declare_parameter('gazebo_tf_frame_match', 'pioneer')
         self.declare_parameter('gazebo_tf_allow_unmatched', False)
+        self.declare_parameter('estop_status_topic', '/estop_status')
+        self.declare_parameter('robot_pose_topic', '/robot/pose')
+        self.declare_parameter('arena_status_topic', '/arena_status')
+        self.declare_parameter('robot_state_topic', '/robot_state')
+        self.declare_parameter('mission_command_topic', '/mission_command')
+        self.declare_parameter('publish_gui_topics', True)
 
         joy_topic = self.get_parameter('joy_topic').value
         scan_topic = self.get_parameter('scan_topic').value
         odom_topic = self.get_parameter('odom_topic').value
         cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
+        estop_status_topic = self.get_parameter('estop_status_topic').value
+        robot_pose_topic = self.get_parameter('robot_pose_topic').value
+        arena_status_topic = self.get_parameter('arena_status_topic').value
+        robot_state_topic = self.get_parameter('robot_state_topic').value
+        mission_command_topic = self.get_parameter('mission_command_topic').value
 
         self.joy_deadman_axis = int(self.get_parameter('joy_deadman_axis').value)
         self.joy_auto_button = int(self.get_parameter('joy_auto_button').value)
@@ -134,12 +151,18 @@ class ControlNode(Node):
         self.gazebo_tf_topic = self.get_parameter('gazebo_tf_topic').value
         self.gazebo_tf_frame_match = self.get_parameter('gazebo_tf_frame_match').value
         self.gazebo_tf_allow_unmatched = bool(self.get_parameter('gazebo_tf_allow_unmatched').value)
+        self.publish_gui_topics = bool(self.get_parameter('publish_gui_topics').value)
 
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
+        self.pose_pub = self.create_publisher(Pose, robot_pose_topic, 10)
+        self.arena_status_pub = self.create_publisher(String, arena_status_topic, 10)
+        self.robot_state_pub = self.create_publisher(String, robot_state_topic, 10)
 
         self.create_subscription(Joy, joy_topic, self.joy_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.create_subscription(LaserScan, scan_topic, self.lidar_cb, 10)
+        self.create_subscription(Int8, estop_status_topic, self.estop_status_cb, 10)
+        self.create_subscription(String, mission_command_topic, self.mission_command_cb, 10)
         if self.use_gazebo_tf_pose:
             self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_cb, 10)
 
@@ -170,6 +193,8 @@ class ControlNode(Node):
         self.last_angular = 0.0
         self.trigger = False
         self.emergency_stop = False
+        self.external_estop_status = ESTOP_CLEAR
+        self.external_waypoint_active = False
         self._last_auto_button = False
         self._last_manual_button = False
         self._last_stop_button = False
@@ -184,6 +209,10 @@ class ControlNode(Node):
         self.get_logger().info('Pioneer control node started')
         self.get_logger().info(f'Joy: {joy_topic}, scan: {scan_topic}, odom: {odom_topic}, cmd_vel: {cmd_vel_topic}')
         self.get_logger().info(
+            f'E-stop: {estop_status_topic}; GUI topics: pose={robot_pose_topic}, '
+            f'arena={arena_status_topic}, state={robot_state_topic}'
+        )
+        self.get_logger().info(
             f'Speeds: forward={self.forward_speed:.2f} m/s, reverse={self.reverse_speed:.2f} m/s, '
             f'turn={self.turn_speed_deg:.1f} deg/s'
         )
@@ -196,6 +225,60 @@ class ControlNode(Node):
                 f'Gazebo sim: using {self.gazebo_tf_topic} for world pose when available '
                 f'(match="{self.gazebo_tf_frame_match}"), otherwise falling back to {odom_topic}.'
             )
+
+    def mission_command_cb(self, msg: String):
+        command = msg.data.strip().lower()
+        with self.mutex:
+            if command == 'start_wandering':
+                self.external_waypoint_active = False
+                if self.external_estop_status == ESTOP_ACTIVE:
+                    self.get_logger().warn('Ignoring start_wandering command while external e-stop is active.')
+                    return
+                self.emergency_stop = False
+                self.drive_mode = DRIVE_MODE.AUTO
+                self.auto_state = AUTO_STATE.WANDERING_TURN
+                self.target_yaw = None
+                self.start_position = (self.current_x, self.current_y)
+                self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().info('GUI command: starting autonomous wandering.')
+            elif command == 'go_home':
+                self.external_waypoint_active = False
+                if self.external_estop_status == ESTOP_ACTIVE:
+                    self.get_logger().warn('Ignoring go_home command while external e-stop is active.')
+                    return
+                self.emergency_stop = False
+                self.drive_mode = DRIVE_MODE.AUTO
+                self.auto_state = AUTO_STATE.RETURN_TO_CENTER
+                self.target_yaw = None
+                self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().info('GUI command: returning to map/start center.')
+            elif command == 'drive_waypoints':
+                self.external_waypoint_active = True
+                self.drive_mode = DRIVE_MODE.MANUAL
+                self.publish_twist(0.0, 0.0)
+                self.get_logger().info('GUI command: paused control_node for distbug waypoint driving.')
+
+    def estop_status_cb(self, msg: Int8):
+        with self.mutex:
+            previous = self.external_estop_status
+            self.external_estop_status = int(msg.data)
+
+            if self.external_estop_status == ESTOP_ACTIVE:
+                self.emergency_stop = True
+                self.drive_mode = DRIVE_MODE.MANUAL
+                self.publish_twist(0.0, 0.0)
+                if previous != ESTOP_ACTIVE:
+                    self.get_logger().error('External LiDAR E-STOP active. Motion halted.')
+
+            elif self.external_estop_status == ESTOP_WARNING:
+                self.publish_twist(0.0, 0.0)
+                if previous != ESTOP_WARNING:
+                    self.get_logger().warn('External LiDAR warning active. Pausing motion.')
+
+            elif previous != ESTOP_CLEAR:
+                self.get_logger().info('External LiDAR e-stop clear.')
 
     def joy_cb(self, msg: Joy):
         with self.mutex:
@@ -317,6 +400,7 @@ class ControlNode(Node):
                 )
             self.have_odom = True
             self.last_odom_time = time.time()
+            self.publish_robot_pose(msg.pose.pose)
 
     def gazebo_tf_cb(self, msg: TFMessage):
         with self.mutex:
@@ -369,6 +453,12 @@ class ControlNode(Node):
                 self._reported_gazebo_tf_pose = True
                 frame = selected.child_frame_id or selected.header.frame_id or '<blank>'
                 self.get_logger().info(f'Using Gazebo world pose from {self.gazebo_tf_topic}, frame "{frame}".')
+            pose = Pose()
+            pose.position.x = self.current_x
+            pose.position.y = self.current_y
+            pose.position.z = selected.transform.translation.z
+            pose.orientation = selected.transform.rotation
+            self.publish_robot_pose(pose)
 
     def relative_position(self):
         if self.map_origin_x is None or self.map_origin_y is None:
@@ -381,6 +471,24 @@ class ControlNode(Node):
         outside_y = max(0.0, abs(rel_y) - MAP_HALF_SIZE)
         outside_distance = math.hypot(outside_x, outside_y)
         clearance_to_edge = min(MAP_HALF_SIZE - abs(rel_x), MAP_HALF_SIZE - abs(rel_y))
+        if self.publish_gui_topics:
+            msg = String()
+            msg.data = json.dumps({
+                'state': self.auto_state.name,
+                'drive_mode': self.drive_mode.name,
+                'rel_x': rel_x,
+                'rel_y': rel_y,
+                'center_dist': distance_from_center,
+                'edge_clearance': clearance_to_edge,
+                'outside': outside_distance,
+                'yaw': self.current_yaw,
+                'pose_source': self.pose_source,
+                'front_min_distance': self.front_min_distance,
+                'left_min_distance': self.left_min_distance,
+                'right_min_distance': self.right_min_distance,
+                'estop_status': self.external_estop_status,
+            })
+            self.arena_status_pub.publish(msg)
         self.get_logger().info(
             f'Arena status: state={self.auto_state.name} '
             f'rel=({rel_x:.2f}, {rel_y:.2f})m '
@@ -394,7 +502,19 @@ class ControlNode(Node):
 
     def control_loop(self):
         with self.mutex:
+            self.publish_robot_state()
+
             if self.emergency_stop:
+                self.publish_twist(0.0, 0.0)
+                return
+
+            if self.external_estop_status == ESTOP_ACTIVE:
+                self.emergency_stop = True
+                self.drive_mode = DRIVE_MODE.MANUAL
+                self.publish_twist(0.0, 0.0)
+                return
+
+            if self.external_estop_status == ESTOP_WARNING:
                 self.publish_twist(0.0, 0.0)
                 return
 
@@ -768,6 +888,27 @@ class ControlNode(Node):
         else:
             cmd.angular.z = float(angular)
         self.cmd_pub.publish(cmd)
+
+    def publish_robot_pose(self, pose: Pose):
+        if self.publish_gui_topics:
+            self.pose_pub.publish(pose)
+
+    def publish_robot_state(self):
+        if not self.publish_gui_topics:
+            return
+
+        if self.emergency_stop or self.external_estop_status == ESTOP_ACTIVE:
+            state = 'ESTOP'
+        elif self.external_estop_status == ESTOP_WARNING:
+            state = 'STOPPED'
+        elif self.external_waypoint_active:
+            return
+        elif self.drive_mode == DRIVE_MODE.AUTO:
+            state = 'MAPPING'
+        else:
+            state = 'IDLE'
+
+        self.robot_state_pub.publish(String(data=state))
 
 
 def main(args=None):

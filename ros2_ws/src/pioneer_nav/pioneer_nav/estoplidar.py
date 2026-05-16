@@ -44,6 +44,12 @@ from rclpy.node import Node
 
 from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
+from std_msgs.msg import Bool
+from std_msgs.msg import Int8
+
+clearstate = 0
+warnstate = 1
+estopstate = 2
 
 # settings
 stopdist = 1.0 # metres -> emergency stop zone
@@ -54,12 +60,12 @@ fwdspeed = 0.2 # m/s
 movethres = 0.18 # metres
 
 # rosbag settings
-bagdirect = "/ros2_ws/bags" # where to save bags
+default_bagdirect = os.path.expanduser("~/pioneer_estop/bags") # where to save bags
 bagtime = 10 # seconds before restarting the rolling bag
 bagtops = ["/scan", "/cmd_vel"] # what topics to record
 
 # where to save incident logs
-incidentlog = "/ros2_ws/incidents.txt"
+default_incidentlog = os.path.expanduser("~/pioneer_estop/incidents.txt")
 
 
 class LidarEstop(Node):
@@ -67,6 +73,14 @@ class LidarEstop(Node):
     def __init__(self):
         # create ROS2 node
         super().__init__("estoplidar")
+        self.declare_parameter("publish_forward_when_clear", False)
+        self.declare_parameter("bag_directory", default_bagdirect)
+        self.declare_parameter("incident_log", default_incidentlog)
+        self.publish_forward_when_clear = bool(
+            self.get_parameter("publish_forward_when_clear").value
+        )
+        self.bagdirect = self.get_parameter("bag_directory").value
+        self.incidentlog = self.get_parameter("incident_log").value
 
         # two separate states now:
         # estopON -> full emergency stop (1m), latches for estophold seconds
@@ -81,7 +95,8 @@ class LidarEstop(Node):
         self.bagproc = None
 
         # make sure bag directory exists
-        os.makedirs(bagdirect, exist_ok=True)
+        os.makedirs(self.bagdirect, exist_ok=True)
+        os.makedirs(os.path.dirname(self.incidentlog), exist_ok=True)
 
         # create publisher for robot velocity
         self.cmdpub = self.create_publisher(
@@ -89,6 +104,8 @@ class LidarEstop(Node):
             "/cmd_vel",
             10
         )
+        self.statuspub = self.create_publisher(Int8, "/estop_status", 10)
+        self.triggeredpub = self.create_publisher(Bool, "/estop/triggered", 10)
 
         # subscribe to lidar scan topic
         self.create_subscription(
@@ -115,7 +132,7 @@ class LidarEstop(Node):
     def startbag(self):
         # name each bag by timestamp (with microseconds so rapid restarts don't clash)
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        bagpath = os.path.join(bagdirect, f"rolling_{timestamp}")
+        bagpath = os.path.join(self.bagdirect, f"rolling_{timestamp}")
 
         try:
             self.bagproc = subprocess.Popen(
@@ -247,9 +264,9 @@ class LidarEstop(Node):
         line = f"[{timestamp}] ESTOP triggered! - Moving obstacle at {closest:.2f}m ({hits} ray hits)\n"
 
         try:
-            with open(incidentlog, "a") as f:
+            with open(self.incidentlog, "a") as f:
                 f.write(line)
-            self.get_logger().info(f"Incident logged to {incidentlog}")
+            self.get_logger().info(f"Incident logged to {self.incidentlog}")
         except Exception as e:
             self.get_logger().warn(f"Could not write incident log: {e}")
 
@@ -260,14 +277,21 @@ class LidarEstop(Node):
         # estop overrides everything
         if self.estopON:
             self.sendvelo(0.0)
+            self.statuspub.publish(Int8(data=estopstate))
+            self.triggeredpub.publish(Bool(data=True))
 
         # warning zone — stop and wait
         elif self.warnON:
             self.sendvelo(0.0)
+            self.statuspub.publish(Int8(data=warnstate))
+            self.triggeredpub.publish(Bool(data=False))
 
         # all clear, go forward
         else:
-            self.sendvelo(fwdspeed)
+            self.statuspub.publish(Int8(data=clearstate))
+            self.triggeredpub.publish(Bool(data=False))
+            if self.publish_forward_when_clear:
+                self.sendvelo(fwdspeed)
 
     # sends a velocity command
     def sendvelo(self, speed: float):

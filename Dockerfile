@@ -12,8 +12,10 @@ RUN apt-get update && apt-get install -y \
     cmake \
     iputils-ping \
     net-tools \
+    x11-apps \
     python3-pip \
     python3-opencv \
+    python3-pyqt5 \
     doxygen \
     python3-colcon-common-extensions \
     ros-jazzy-ros-base \

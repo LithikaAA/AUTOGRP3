@@ -14,6 +14,9 @@ services:
       - /dev/input:/dev/input
       - /dev:/dev
       - ./ros2_ws/maps:/ros2_ws/maps
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     environment:
       - ROS_DOMAIN_ID=0
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
     command: /bin/bash
