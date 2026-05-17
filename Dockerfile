@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     python3-opencv \
     python3-pyqt5 \
+    python3-numpy \
     doxygen \
     python3-colcon-common-extensions \
     ros-jazzy-ros-base \
@@ -35,13 +36,17 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-nmea-navsat-driver \
     ros-jazzy-teleop-twist-keyboard \
     ros-jazzy-cv-bridge \
-    # lidar
+    ros-jazzy-ros-gz-bridge \
+    ros-jazzy-ros-gz-sim \
+    ros-jazzy-ros-gz-interfaces \
     ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages
-RUN pip install depthai --break-system-packages 
+RUN pip install --break-system-packages \
+    depthai \
+    onnxruntime
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \

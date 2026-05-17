@@ -22,6 +22,7 @@ setup(
             'launch/slam_mapping.launch.py',
             'launch/gazebo_mapping_gui.launch.py',
             'launch/mapping_gui.launch.py',
+            'launch/letter_detector.launch.py',
         ]),
         ('share/' + package_name + '/config', [
             'pioneer_nav/config/test_waypoints.txt',
