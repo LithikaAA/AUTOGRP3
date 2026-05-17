@@ -242,3 +242,50 @@ python3 ros2_ws/src/pioneer_nav/scripts/map_to_binary.py \
   --csv ros2_ws/maps/my_map_binary.csv
 
 
+
+
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  START FROM HERE - CLEAN UP LATER (FOR GUI)
+1.  Follow normal steps to SSH in and build and run docker - note potentially when running the docker you may need to do the one compatiable with the camera - play around with this a bit if something isn't working
+2.  Start up aria node as normal
+3.  Start up LiDAR
+4.  To run the GUI (gooooooeeeeeyyy)
+```
+    ros2 launch pioneer_nav mapping_gui.launch.py \
+    use_sim_time:=false \
+    scan_frame:=sick_laser \
+    gui:=true \
+    estop:=true
+```
+6.  Potential issues:
+SLAM: potentially need to kill other sessions and make sure \map topic is up
+kill sessions:
+```
+CHECKS: if you need to kill existing slam: 
+pkill -f slam_toolbox
+pkill -f lifecycle_manager
+pkill -f odom_tf_broadcaster
+pkill -f static_transform_publisher
+```
+check topics: 
+```
+ros2 topic hz /map
+```
+7. Accessing the saved map/waypoint txt file: saved here: /ros2_ws/maps
+The main files to access:
+/ros2_ws/maps/latest_obstacle_waypoints.txt
+/ros2_ws/maps/pioneer_map_*.png
+/ros2_ws/maps/pioneer_map_*.yaml
+/ros2_ws/maps/pioneer_map_*_obstacle_waypoints.txt
+
+```
+From pioneer:
+cd ~/AUTOGRP3/AUTOGRP3/AUTOGRP3/ros2_ws/maps
+ls -lh
+Copy onto laptop:
+scp team3@192.168.2.101:~/AUTOGRP3/AUTOGRP3/AUTOGRP3/ros2_ws/maps/latest_obstacle_waypoints.txt .
+scp team3@192.168.2.101:~/AUTOGRP3/AUTOGRP3/AUTOGRP3/ros2_ws/maps/pioneer_map_*.png .
+scp team3@192.168.2.101:~/AUTOGRP3/AUTOGRP3/AUTOGRP3/ros2_ws/maps/pioneer_map_*.yaml .
+```
+Full process is earlier in this read me as well. 
+
