@@ -22,6 +22,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan, Image, Joy, Imu
 from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
 from cv_bridge import CvBridge
 
 
@@ -44,6 +45,12 @@ def wrap_to_pi(angle: float) -> float:
 def bearing_from_image_x(x_px: float, width: int, hfov_rad: float) -> float:
     norm = (x_px - (width / 2.0)) / (width / 2.0)
     return norm * (hfov_rad / 2.0)
+
+
+def yaw_from_quaternion(q) -> float:
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
 
 
 def hsv_mask_orange(hsv_img: np.ndarray) -> np.ndarray:
@@ -98,6 +105,11 @@ class Part2MissionController(Node):
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("mission_command_topic", "/mission_command")
         self.declare_parameter("robot_state_topic", "/robot_state")
+        self.declare_parameter("pose_topic", "")
+        self.declare_parameter("use_gazebo_tf_pose", False)
+        self.declare_parameter("gazebo_tf_topic", "/world/pioneer_world/dynamic_pose/info")
+        self.declare_parameter("gazebo_tf_frame_match", "pioneer")
+        self.declare_parameter("gazebo_tf_allow_unmatched", False)
 
         # -------------------------------------------------
         # joystick mapping (PS4 defaults)
@@ -131,9 +143,22 @@ class Part2MissionController(Node):
         self.declare_parameter("photos_dir",      "mission_photos")
         self.declare_parameter("binary_map_csv",  "")
         self.declare_parameter("map_yaml",        "")
+        self.declare_parameter("obstacle_waypoint_file", "")
+        self.declare_parameter("waypoint_file", "")
+        self.declare_parameter("obstacle_waypoints_relative_to_start", True)
         self.declare_parameter("csv_waypoint_count", 6)
-        self.declare_parameter("use_test_waypoint", True)
+        self.declare_parameter("use_test_waypoint", False)
         self.declare_parameter("test_waypoint_distance", 1.0)
+        self.declare_parameter("waypoint_goal_tolerance", 0.8)
+        self.declare_parameter("goal_tolerance", 0.0)
+        self.declare_parameter("waypoint_linear_speed", 0.18)
+        self.declare_parameter("waypoint_slow_linear_speed", 0.04)
+        self.declare_parameter("waypoint_heading_tolerance_deg", 25.0)
+        self.declare_parameter("waypoint_angular_gain", 1.4)
+        self.declare_parameter("waypoint_max_angular_speed", 0.6)
+        self.declare_parameter("waypoint_obstacle_linear_speed", 0.04)
+        self.declare_parameter("waypoint_obstacle_turn_speed", 0.45)
+        self.declare_parameter("waypoint_critical_turn_speed", 0.8)
 
         # read params
         scan_topic    = self.get_parameter("scan_topic").value
@@ -141,9 +166,16 @@ class Part2MissionController(Node):
         joy_topic     = self.get_parameter("joy_topic").value
         imu_topic     = self.get_parameter("imu_topic").value
         odom_topic    = self.get_parameter("odom_topic").value
+        pose_topic_alias = str(self.get_parameter("pose_topic").value)
+        if pose_topic_alias:
+            odom_topic = pose_topic_alias
         cmd_vel_topic = self.get_parameter("cmd_vel_topic").value
         mission_command_topic = self.get_parameter("mission_command_topic").value
         robot_state_topic = self.get_parameter("robot_state_topic").value
+        self.use_gazebo_tf_pose = bool(self.get_parameter("use_gazebo_tf_pose").value)
+        self.gazebo_tf_topic = str(self.get_parameter("gazebo_tf_topic").value)
+        self.gazebo_tf_frame_match = str(self.get_parameter("gazebo_tf_frame_match").value)
+        self.gazebo_tf_allow_unmatched = bool(self.get_parameter("gazebo_tf_allow_unmatched").value)
 
         self.joy_axis_linear   = int(self.get_parameter("joy_axis_linear").value)
         self.joy_axis_angular  = int(self.get_parameter("joy_axis_angular").value)
@@ -170,9 +202,30 @@ class Part2MissionController(Node):
         os.makedirs(self.photos_dir, exist_ok=True)
         self.binary_map_csv = str(self.get_parameter("binary_map_csv").value)
         self.map_yaml = str(self.get_parameter("map_yaml").value)
+        self.obstacle_waypoint_file = str(self.get_parameter("obstacle_waypoint_file").value)
+        waypoint_file_alias = str(self.get_parameter("waypoint_file").value)
+        if waypoint_file_alias and not self.obstacle_waypoint_file:
+            self.obstacle_waypoint_file = waypoint_file_alias
+        self.obstacle_waypoints_relative_to_start = bool(
+            self.get_parameter("obstacle_waypoints_relative_to_start").value
+        )
         self.csv_waypoint_count = int(self.get_parameter("csv_waypoint_count").value)
         self.use_test_waypoint = bool(self.get_parameter("use_test_waypoint").value)
         self.test_waypoint_distance = float(self.get_parameter("test_waypoint_distance").value)
+        self.waypoint_goal_tolerance = float(self.get_parameter("waypoint_goal_tolerance").value)
+        goal_tolerance_alias = float(self.get_parameter("goal_tolerance").value)
+        if goal_tolerance_alias > 0.0:
+            self.waypoint_goal_tolerance = goal_tolerance_alias
+        self.waypoint_linear_speed = float(self.get_parameter("waypoint_linear_speed").value)
+        self.waypoint_slow_linear_speed = float(self.get_parameter("waypoint_slow_linear_speed").value)
+        self.waypoint_heading_tolerance = math.radians(
+            float(self.get_parameter("waypoint_heading_tolerance_deg").value)
+        )
+        self.waypoint_angular_gain = float(self.get_parameter("waypoint_angular_gain").value)
+        self.waypoint_max_angular_speed = float(self.get_parameter("waypoint_max_angular_speed").value)
+        self.waypoint_obstacle_linear_speed = float(self.get_parameter("waypoint_obstacle_linear_speed").value)
+        self.waypoint_obstacle_turn_speed = float(self.get_parameter("waypoint_obstacle_turn_speed").value)
+        self.waypoint_critical_turn_speed = float(self.get_parameter("waypoint_critical_turn_speed").value)
 
         # -------------------------
         # mode state
@@ -194,6 +247,9 @@ class Part2MissionController(Node):
 
         self.current_heading = 0.0
         self.have_odom = False
+        self.have_gazebo_tf_pose = False
+        self._reported_gazebo_tf_pose = False
+        self.pose_source = "odom"
         self.current_x = 0.0
         self.current_y = 0.0
         self.current_yaw = 0.0
@@ -225,6 +281,8 @@ class Part2MissionController(Node):
         self.csv_waypoints: List[Tuple[float, float]] = []
         self.current_csv_waypoint_idx = 0
         self.goal_achieved_announced = False
+        self._last_waypoint_status_log = 0.0
+        self._last_announced_waypoint_idx = -1
 
         # -------------------------
         # pubs / subs
@@ -238,12 +296,28 @@ class Part2MissionController(Node):
         self.create_subscription(Imu,       imu_topic,   self.imu_callback,   10)
         self.create_subscription(Odometry,  odom_topic,  self.odom_callback,  10)
         self.create_subscription(String, mission_command_topic, self.command_callback, 10)
+        if self.use_gazebo_tf_pose:
+            self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_callback, 10)
 
         self.timer = self.create_timer(0.1, self.control_loop)
 
         self.get_logger().info("Part 2 mission controller started")
         self.get_logger().info(f"Local exploration enabled; max discoveries: {self.max_discoveries}")
-        self.get_logger().info(f"Mission commands: {mission_command_topic}; odom: {odom_topic}")
+        self.get_logger().info(
+            f"Mission commands: {mission_command_topic}; odom: {odom_topic}; "
+            f"scan: {scan_topic}; cmd_vel: {cmd_vel_topic}"
+        )
+        if self.use_gazebo_tf_pose:
+            self.get_logger().info(
+                f"Gazebo sim pose enabled: using {self.gazebo_tf_topic} "
+                f'(match="{self.gazebo_tf_frame_match}") when available.'
+            )
+        self.get_logger().info(
+            f"Waypoint params: file='{self.obstacle_waypoint_file or '<latest map waypoints>'}', "
+            f"relative_to_start={self.obstacle_waypoints_relative_to_start}, "
+            f"goal_tolerance={self.waypoint_goal_tolerance:.2f}m, "
+            f"speed={self.waypoint_linear_speed:.2f}m/s"
+        )
         self.get_logger().info("PS4: X=AUTO  O=MANUAL  Triangle=deadman (hold while in AUTO)")
         self.get_logger().info("Keyboard: a=AUTO  m=MANUAL  d=deadman  w/s/q/e/x")
 
@@ -262,13 +336,54 @@ class Part2MissionController(Node):
         self.have_imu = True
 
     def odom_callback(self, msg: Odometry):
+        if self.use_gazebo_tf_pose and self.have_gazebo_tf_pose:
+            self.have_odom = True
+            return
         self.have_odom = True
         self.current_x = msg.pose.pose.position.x
         self.current_y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
-        siny = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.current_yaw = math.atan2(siny, cosy)
+        self.current_yaw = yaw_from_quaternion(q)
+        self.pose_source = "odom"
+
+    def gazebo_tf_callback(self, msg: TFMessage):
+        if not msg.transforms:
+            return
+
+        selected = None
+        match = self.gazebo_tf_frame_match
+        for transform in msg.transforms:
+            child = transform.child_frame_id or ""
+            parent = transform.header.frame_id or ""
+            if match in child or match in parent:
+                selected = transform
+                break
+
+        if selected is None and (len(msg.transforms) == 1 or self.gazebo_tf_allow_unmatched):
+            selected = msg.transforms[0]
+
+        if selected is None:
+            frames = ", ".join(
+                (t.child_frame_id or t.header.frame_id or "<blank>") for t in msg.transforms[:8]
+            )
+            self.get_logger().warn(
+                f'Gazebo TF topic active, but no frame matched "{match}". Frames seen: {frames}',
+                throttle_duration_sec=5.0,
+            )
+            return
+
+        self.current_x = selected.transform.translation.x
+        self.current_y = selected.transform.translation.y
+        self.current_yaw = yaw_from_quaternion(selected.transform.rotation)
+        self.have_gazebo_tf_pose = True
+        self.have_odom = True
+        self.pose_source = "gazebo_tf"
+        if not self._reported_gazebo_tf_pose:
+            self._reported_gazebo_tf_pose = True
+            frame = selected.child_frame_id or selected.header.frame_id or "<blank>"
+            self.get_logger().info(
+                f'DistBug using Gazebo pose from {self.gazebo_tf_topic}, frame "{frame}".'
+            )
 
     def command_callback(self, msg: String):
         command = msg.data.strip().lower()
@@ -276,6 +391,8 @@ class Part2MissionController(Node):
             self.csv_waypoints = self.load_test_waypoint() if self.use_test_waypoint else self.load_csv_waypoints()
             self.current_csv_waypoint_idx = 0
             self.goal_achieved_announced = False
+            self._last_waypoint_status_log = 0.0
+            self._last_announced_waypoint_idx = -1
             if not self.csv_waypoints:
                 self.get_logger().error("Drive Waypoints requested, but no CSV waypoints could be generated.")
                 self.stop_robot()
@@ -284,13 +401,15 @@ class Part2MissionController(Node):
             self.auto_state = "CSV_WAYPOINTS"
             self.deadman_pressed = True
             self.publish_robot_state("WAYPOINT")
-            self.get_logger().info(f"Drive Waypoints command accepted: {len(self.csv_waypoints)} CSV waypoint(s).")
+            self.get_logger().info(f"Drive Waypoints command accepted: {len(self.csv_waypoints)} waypoint(s).")
+            for idx, (x, y) in enumerate(self.csv_waypoints, start=1):
+                self.get_logger().info(f"Waypoint {idx}/{len(self.csv_waypoints)} goal: x={x:.2f}, y={y:.2f}")
         elif command == "go_home":
             if self.auto_state == "CSV_WAYPOINTS":
                 self.mode = "MANUAL"
                 self.stop_robot()
                 self.publish_robot_state("RETURN_TO_CENTER")
-                self.get_logger().info("Go Home command received: distbug waypoint mode stopped.")
+                self.get_logger().info("Go Home command received: distbug waypoint mode stopped; control_node should return home.")
         elif command == "start_wandering":
             if self.auto_state in ["CSV_WAYPOINTS", "GOAL_ACHIEVED"]:
                 self.mode = "MANUAL"
@@ -298,7 +417,11 @@ class Part2MissionController(Node):
                 self.csv_waypoints = []
                 self.current_csv_waypoint_idx = 0
                 self.stop_robot()
-                self.get_logger().info("Start Wandering command received: distbug waypoint mode stopped.")
+                self.publish_robot_state("MAPPING")
+                self.get_logger().info(
+                    "Start Wandering command received: distbug waypoint mode stopped; "
+                    "control_node should now own autonomous wandering."
+                )
 
     def scan_callback(self, msg: LaserScan):
         self.have_scan = True
@@ -582,6 +705,10 @@ class Part2MissionController(Node):
         return resolution, origin_x, origin_y
 
     def load_csv_waypoints(self) -> List[Tuple[float, float]]:
+        obstacle_waypoints = self.load_obstacle_waypoints()
+        if obstacle_waypoints:
+            return obstacle_waypoints
+
         csv_path = self.binary_map_csv or self._default_map_path("my_map_binary.csv")
         try:
             grid = np.loadtxt(csv_path, delimiter=",", dtype=np.int8)
@@ -610,6 +737,58 @@ class Part2MissionController(Node):
 
         self.get_logger().info(f"Generated CSV waypoints from {csv_path}: {selected}")
         return selected
+
+    def load_obstacle_waypoints(self) -> List[Tuple[float, float]]:
+        path = self.obstacle_waypoint_file or self._latest_obstacle_waypoint_file()
+        if not path:
+            return []
+
+        waypoints = []
+        try:
+            with open(path, "r", encoding="utf-8") as waypoint_file:
+                for line in waypoint_file:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.replace(",", " ").split()
+                    if len(parts) < 2:
+                        continue
+                    x = float(parts[0])
+                    y = float(parts[1])
+                    if self.obstacle_waypoints_relative_to_start:
+                        if not self.have_odom:
+                            self.get_logger().warn(
+                                "No odom yet for centre-relative obstacle waypoints. "
+                                "Try Drive Waypoints again after /odom is live."
+                            )
+                            return []
+                        x += self.current_x
+                        y += self.current_y
+                    waypoints.append((x, y))
+        except (OSError, ValueError) as exc:
+            self.get_logger().warn(f"Could not load obstacle waypoint file '{path}': {exc}")
+            return []
+
+        frame_note = " using current pose as centre reference" if self.obstacle_waypoints_relative_to_start else ""
+        self.get_logger().info(f"Loaded {len(waypoints)} obstacle waypoint(s) from {path}{frame_note}")
+        return waypoints
+
+    def _latest_obstacle_waypoint_file(self) -> str:
+        maps_dir = os.path.dirname(self._default_map_path("my_map_binary.csv"))
+        latest_path = os.path.join(maps_dir, "latest_obstacle_waypoints.txt")
+        if os.path.exists(latest_path):
+            return latest_path
+        try:
+            candidates = [
+                os.path.join(maps_dir, name)
+                for name in os.listdir(maps_dir)
+                if name.endswith("_obstacle_waypoints.txt")
+            ]
+        except OSError:
+            return ""
+        if not candidates:
+            return ""
+        return max(candidates, key=os.path.getmtime)
 
     def load_test_waypoint(self) -> List[Tuple[float, float]]:
         if not self.have_odom:
@@ -734,10 +913,36 @@ class Part2MissionController(Node):
         dx = goal_x - self.current_x
         dy = goal_y - self.current_y
         distance = math.hypot(dx, dy)
+        waypoint_number = self.current_csv_waypoint_idx + 1
+        waypoint_count = len(self.csv_waypoints)
 
-        if distance < 0.25:
+        if self._last_announced_waypoint_idx != self.current_csv_waypoint_idx:
+            self._last_announced_waypoint_idx = self.current_csv_waypoint_idx
             self.get_logger().info(
-                f"Reached CSV waypoint {self.current_csv_waypoint_idx + 1}/{len(self.csv_waypoints)}"
+                f"Driving waypoint {waypoint_number}/{waypoint_count}: "
+                f"goal=({goal_x:.2f}, {goal_y:.2f}), "
+                f"pose=({self.current_x:.2f}, {self.current_y:.2f}, yaw={math.degrees(self.current_yaw):.1f} deg), "
+                f"distance={distance:.2f}m, pose_source={self.pose_source}"
+            )
+
+        now = time.time()
+        if now - self._last_waypoint_status_log >= 1.0:
+            self._last_waypoint_status_log = now
+            self.get_logger().info(
+                f"Waypoint {waypoint_number}/{waypoint_count} status: "
+                f"pose=({self.current_x:.2f}, {self.current_y:.2f}, yaw={math.degrees(self.current_yaw):.1f} deg), "
+                f"goal=({goal_x:.2f}, {goal_y:.2f}), "
+                f"distance_remaining={distance:.2f}m, "
+                f"front_clearance={self.front_min:.2f}m, "
+                f"pose_source={self.pose_source}"
+            )
+
+        if distance < self.waypoint_goal_tolerance:
+            self.get_logger().info(
+                f"Reached waypoint {waypoint_number}/{waypoint_count}: "
+                f"pose=({self.current_x:.2f}, {self.current_y:.2f}), "
+                f"goal=({goal_x:.2f}, {goal_y:.2f}), "
+                f"final_error={distance:.2f}m"
             )
             self.current_csv_waypoint_idx += 1
             self.stop_robot()
@@ -745,24 +950,38 @@ class Part2MissionController(Node):
                 self.mode = "MANUAL"
                 self.auto_state = "GOAL_ACHIEVED"
                 self.publish_robot_state("GOAL_ACHIEVED")
-                self.get_logger().info("GOAL ACHIEVED - final waypoint reached. Press Go Home to return to centre.")
+                self.get_logger().info(
+                    "GOAL ACHIEVED - last waypoint reached. "
+                    "Robot stopped. Press Go Home to return to centre."
+                )
                 self.goal_achieved_announced = True
             return
 
         if self.front_min < self.critical_obstacle_dist_m:
             turn_dir = -1.0 if self.left_min < self.right_min else 1.0
-            self.publish_cmd(0.0, 0.8 * turn_dir)
+            self.publish_cmd(0.0, self.waypoint_critical_turn_speed * turn_dir)
             return
 
         target_heading = math.atan2(dy, dx)
         heading_error = wrap_to_pi(target_heading - self.current_yaw)
-        angular = clamp(1.4 * heading_error, -0.6, 0.6)
-        linear = 0.18 if abs(heading_error) < math.radians(25) else 0.04
+        angular = clamp(
+            self.waypoint_angular_gain * heading_error,
+            -self.waypoint_max_angular_speed,
+            self.waypoint_max_angular_speed,
+        )
+        linear = (
+            self.waypoint_linear_speed
+            if abs(heading_error) < self.waypoint_heading_tolerance
+            else self.waypoint_slow_linear_speed
+        )
         linear = min(linear, distance * 0.5)
 
         if self.front_min < self.front_obstacle_dist_m:
             turn_dir = -1.0 if self.left_min < self.right_min else 1.0
-            self.publish_cmd(0.04, 0.45 * turn_dir)
+            self.publish_cmd(
+                self.waypoint_obstacle_linear_speed,
+                self.waypoint_obstacle_turn_speed * turn_dir,
+            )
             return
 
         self.publish_cmd(linear, angular)

@@ -1,387 +1,360 @@
 #!/usr/bin/env python3
 """
-waypoint_controller.py
-Stripped-down waypoint-following controller for Pioneer 3-AT — Python/ROS2.
+Basic waypoint follower for Pioneer 3-AT.
 
-Pose sources (set via ROS2 parameters):
-  pose_topic  : odometry topic  (default /odom)
-  pose_frame  : if set, reads TF map→base_link  ← set to "map" with slam_toolbox
-  base_frame  : robot base frame                 (default base_link)
-  waypoint_file: path to waypoints text file
+Default behaviour:
+- waits for /mission_command == "drive_waypoints"
+- loads ros2_ws/maps/latest_obstacle_waypoints.txt
+- treats waypoint x/y as centre-relative metres
+- anchors those relative waypoints at the robot's current pose when started
+- turns to face each waypoint, drives with heading correction, stops at the end
 
-Waypoint file format (one per line):
-  x_m  y_m  [yaw_rad]
-  # lines starting with # are ignored
+Waypoint file format:
+    target_x target_y [ignored...]
+
+The latest_obstacle_waypoints.txt file has four columns:
+    target_rel_x target_rel_y obstacle_rel_x obstacle_rel_y
+Only the first two columns are used for driving.
 """
 
 import math
+import os
+from pathlib import Path
+from typing import List, Tuple
+
 import rclpy
-from rclpy.node import Node
-from rclpy.duration import Duration
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
-from sensor_msgs.msg import Imu
-from tf2_ros import Buffer, TransformListener, TransformException
-
-# ── Tuning constants ──────────────────────────────────────────────────────────
-GOAL_TOLERANCE          = 150    # mm — distance that counts as "arrived"
-
-DRIVE_SPEED             = 300    # mm/s  normal cruise
-FINAL_SPEED             =  95    # mm/s  inside final-approach zone
-
-MAX_GOAL_STEER          =  30    # deg   cap on raw goal angle during normal driving
-MAX_TOTAL_STEER         =  55    # deg   absolute heading cap
-STEER_DEADBAND          =   2    # deg   below this, don't bother rotating
-HEADING_LIMIT           =  20    # deg   max change per control cycle (smoothing)
-TURN_SPEED              =  80    # deg/s cap on angular velocity published
-
-FINAL_APPROACH_DISTANCE = 1000   # mm    switch to slow/align inside this radius
-FINAL_ALIGN_STOP_ANGLE  =    8   # deg   stop linear motion and rotate in place
-FINAL_ALIGN_SLOW_ANGLE  =    3   # deg   slow to 30 % speed while aligning
-
-WAYPOINT_PROGRESS_EPS   =   60   # mm    improvement smaller than this doesn't count
-WAYPOINT_STUCK_TIMEOUT  =    6.0 # s     no progress for this long → skip waypoint
-BLOCKED_WAYPOINT_DIST   = 1200   # mm    only check stuck when closer than this
-
-CONTROL_PERIOD_MS       =   50   # ms    control loop rate
-# ─────────────────────────────────────────────────────────────────────────────
+from rclpy.node import Node
+from std_msgs.msg import String
+from tf2_msgs.msg import TFMessage
 
 
-def normalise_angle(angle_deg: float) -> float:
-    """Wrap angle to (-180, 180]."""
-    while angle_deg <= -180:
-        angle_deg += 360
-    while angle_deg > 180:
-        angle_deg -= 360
-    return angle_deg
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
 
-def clamp(value: float, limit: float) -> float:
-    return max(-limit, min(limit, value))
+def wrap_to_pi(angle: float) -> float:
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
 
 
-def pythag_mm(dx: int, dy: int) -> int:
-    return int(round(math.sqrt(dx * dx + dy * dy)))
-
-
-def quat_to_yaw_deg(x, y, z, w) -> float:
-    siny_cosp = 2.0 * (w * z + x * y)
-    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
-    return normalise_angle(math.degrees(math.atan2(siny_cosp, cosy_cosp)))
-
-
-def smooth_heading(desired: float, previous: float) -> float:
-    """Limit per-cycle heading change then clamp to MAX_TOTAL_STEER."""
-    delta = desired - previous
-    if delta > HEADING_LIMIT:
-        desired = previous + HEADING_LIMIT
-    elif delta < -HEADING_LIMIT:
-        desired = previous - HEADING_LIMIT
-    return clamp(desired, MAX_TOTAL_STEER)
-
-
-def load_waypoints(path: str) -> list:
-    """
-    Load waypoints from a text file.
-    Returns list of dicts with keys x, y, yaw (all floats, metres / radians).
-    """
-    waypoints = []
-    try:
-        with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                parts = line.split()
-                if len(parts) < 2:
-                    continue
-                wp = {
-                    'x':   float(parts[0]),
-                    'y':   float(parts[1]),
-                    'yaw': float(parts[2]) if len(parts) > 2 else 0.0,
-                }
-                waypoints.append(wp)
-    except (OSError, ValueError):
-        pass
-    return waypoints
+def yaw_from_quaternion(q) -> float:
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
 
 
 class WaypointController(Node):
-
     def __init__(self):
-        super().__init__('waypoint_controller')
+        super().__init__("waypoint_controller")
 
-        # ── Parameters ────────────────────────────────────────────────────────
-        self.declare_parameter('waypoint_file', '')
-        self.declare_parameter('pose_topic',    '/odom')
-        self.declare_parameter('pose_frame',    '')        # set to "map" for SLAM
-        self.declare_parameter('base_frame',    'base_link')
-        self.get_logger().info(f"WAYPOINT FILE USED: {wp_file}")
-        wp_file         = self.get_parameter('waypoint_file').value
-        self.pose_topic = self.get_parameter('pose_topic').value
-        self.pose_frame = self.get_parameter('pose_frame').value
-        self.base_frame = self.get_parameter('base_frame').value
+        self.declare_parameter("waypoint_file", "")
+        self.declare_parameter("obstacle_waypoint_file", "")
+        self.declare_parameter("pose_topic", "/odom")
+        self.declare_parameter("odom_topic", "")
+        self.declare_parameter("cmd_vel_topic", "/cmd_vel")
+        self.declare_parameter("mission_command_topic", "/mission_command")
+        self.declare_parameter("robot_state_topic", "/robot_state")
+        self.declare_parameter("use_gazebo_tf_pose", False)
+        self.declare_parameter("gazebo_tf_topic", "/world/pioneer_world/dynamic_pose/info")
+        self.declare_parameter("gazebo_tf_frame_match", "pioneer")
+        self.declare_parameter("gazebo_tf_allow_unmatched", False)
+        self.declare_parameter("relative_to_start", True)
+        self.declare_parameter("auto_start", False)
+        self.declare_parameter("use_test_waypoint", False)
+        self.declare_parameter("goal_tolerance", 0.35)
+        self.declare_parameter("waypoint_goal_tolerance", 0.0)
+        self.declare_parameter("heading_tolerance_deg", 10.0)
+        self.declare_parameter("linear_speed", 0.16)
+        self.declare_parameter("waypoint_linear_speed", 0.0)
+        self.declare_parameter("slow_linear_speed", 0.05)
+        self.declare_parameter("waypoint_slow_linear_speed", 0.0)
+        self.declare_parameter("waypoint_obstacle_linear_speed", 0.0)
+        self.declare_parameter("waypoint_obstacle_turn_speed", 0.0)
+        self.declare_parameter("angular_gain", 1.4)
+        self.declare_parameter("max_angular_speed", 0.55)
+        self.declare_parameter("control_rate_hz", 10.0)
 
-        # ── Waypoints ─────────────────────────────────────────────────────────
-        self.waypoints = load_waypoints(wp_file)
-        if not self.waypoints:
-            self.get_logger().warn(
-                f"No waypoints loaded from '{wp_file}'; using fallback (5 m ahead).")
-            self.waypoints = [{'x': 5.0, 'y': 0.0, 'yaw': 0.0}]
+        self.waypoint_file = str(self.get_parameter("waypoint_file").value)
+        obstacle_waypoint_file = str(self.get_parameter("obstacle_waypoint_file").value)
+        if obstacle_waypoint_file and not self.waypoint_file:
+            self.waypoint_file = obstacle_waypoint_file
+        self.pose_topic = str(self.get_parameter("pose_topic").value)
+        odom_topic = str(self.get_parameter("odom_topic").value)
+        if odom_topic:
+            self.pose_topic = odom_topic
+        self.cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value)
+        self.mission_command_topic = str(self.get_parameter("mission_command_topic").value)
+        self.robot_state_topic = str(self.get_parameter("robot_state_topic").value)
+        self.use_gazebo_tf_pose = bool(self.get_parameter("use_gazebo_tf_pose").value)
+        self.gazebo_tf_topic = str(self.get_parameter("gazebo_tf_topic").value)
+        self.gazebo_tf_frame_match = str(self.get_parameter("gazebo_tf_frame_match").value)
+        self.gazebo_tf_allow_unmatched = bool(self.get_parameter("gazebo_tf_allow_unmatched").value)
+        self.relative_to_start = bool(self.get_parameter("relative_to_start").value)
+        self.auto_start = bool(self.get_parameter("auto_start").value)
+        self.goal_tolerance = float(self.get_parameter("goal_tolerance").value)
+        waypoint_goal_tolerance = float(self.get_parameter("waypoint_goal_tolerance").value)
+        if waypoint_goal_tolerance > 0.0:
+            self.goal_tolerance = waypoint_goal_tolerance
+        self.heading_tolerance = math.radians(float(self.get_parameter("heading_tolerance_deg").value))
+        self.linear_speed = float(self.get_parameter("linear_speed").value)
+        waypoint_linear_speed = float(self.get_parameter("waypoint_linear_speed").value)
+        if waypoint_linear_speed > 0.0:
+            self.linear_speed = waypoint_linear_speed
+        self.slow_linear_speed = float(self.get_parameter("slow_linear_speed").value)
+        waypoint_slow_linear_speed = float(self.get_parameter("waypoint_slow_linear_speed").value)
+        if waypoint_slow_linear_speed > 0.0:
+            self.slow_linear_speed = waypoint_slow_linear_speed
+        self.angular_gain = float(self.get_parameter("angular_gain").value)
+        self.max_angular_speed = float(self.get_parameter("max_angular_speed").value)
+        control_rate_hz = max(1.0, float(self.get_parameter("control_rate_hz").value))
 
-        # ── State ─────────────────────────────────────────────────────────────
-        self.have_odom          = False
-        self.have_imu           = False
-        self.origin             = None          # (x_mm, y_mm) anchored on first pose
-        self.current_wp_idx     = 0
-        self.current_goal       = None          # (x_mm, y_mm) world-frame
-        self.mission_complete   = False
-        self.prev_heading       = 0.0
-        self.best_dist_mm       = 1_000_000_000
-        self.last_progress_time = self.get_clock().now()
-        self.imu_yaw_deg        = 0.0
-        self.using_tf_last      = None          # for one-shot log on source switch
+        self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self.robot_state_pub = self.create_publisher(String, self.robot_state_topic, 10)
+        self.create_subscription(Odometry, self.pose_topic, self.odom_callback, 10)
+        self.create_subscription(String, self.mission_command_topic, self.command_callback, 10)
+        if self.use_gazebo_tf_pose:
+            self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_callback, 10)
+        self.create_timer(1.0 / control_rate_hz, self.control_loop)
 
-        # Latest sensor messages
-        self.odom_msg  = None
+        self.have_pose = False
+        self.have_gazebo_tf_pose = False
+        self.pose_source = "odom"
+        self._reported_gazebo_tf_pose = False
+        self.current_x = 0.0
+        self.current_y = 0.0
+        self.current_yaw = 0.0
 
-        # ── TF (only when pose_frame is set) ──────────────────────────────────
-        if self.pose_frame:
-            self.tf_buffer   = Buffer()
-            self.tf_listener = TransformListener(self.tf_buffer, self)
-        else:
-            self.tf_buffer   = None
-            self.tf_listener = None
-
-        # ── ROS interfaces ────────────────────────────────────────────────────
-        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
-
-        self.create_subscription(
-            Odometry, self.pose_topic, self._odom_cb, 10)
-
-        self.create_subscription(
-            Imu, '/imu', self._imu_cb,
-            rclpy.qos.qos_profile_sensor_data)
-
-        self.create_timer(
-            CONTROL_PERIOD_MS / 1000.0, self._control_loop)
+        self.active = False
+        self.goal_achieved = False
+        self.relative_waypoints: List[Tuple[float, float]] = []
+        self.world_waypoints: List[Tuple[float, float]] = []
+        self.current_idx = 0
+        self.start_x = 0.0
+        self.start_y = 0.0
+        self._last_status_log = 0.0
 
         self.get_logger().info(
-            f"Loaded {len(self.waypoints)} waypoint(s). "
-            f"Pose source: {self.pose_frame or self.pose_topic}. "
-            f"First goal: ({self.waypoints[0]['x']:.2f}, {self.waypoints[0]['y']:.2f})")
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-
-    def _odom_cb(self, msg: Odometry):
-        self.odom_msg  = msg
-        self.have_odom = True
-
-    def _imu_cb(self, msg: Imu):
-        o = msg.orientation
-        # Skip zero-initialised messages (sensor not ready yet)
-        if o.w == 0.0 and o.z == 0.0:
-            return
-        self.imu_yaw_deg = quat_to_yaw_deg(o.x, o.y, o.z, o.w)
-        self.have_imu    = True
-
-    # ── Pose retrieval ────────────────────────────────────────────────────────
-
-    def _pose_from_odom(self):
-        """Return (x_mm, y_mm, yaw_deg) from latest odometry + optional IMU yaw."""
-        p   = self.odom_msg.pose.pose
-        x   = int(round(p.position.x * 1000))
-        y   = int(round(p.position.y * 1000))
-        o   = p.orientation
-        yaw = quat_to_yaw_deg(o.x, o.y, o.z, o.w)
-        if self.have_imu:
-            yaw = self.imu_yaw_deg     # IMU yaw is more accurate on real hardware
-        return x, y, yaw
-
-    def _pose_from_tf(self):
-        """
-        Return (x_mm, y_mm, yaw_deg) from TF map→base_link, or None if unavailable.
-        This is the pose to use when slam_toolbox is running — it gives a
-        globally-consistent position even as the map is being built.
-        """
-        if not self.tf_buffer:
-            return None
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                self.pose_frame, self.base_frame, rclpy.time.Time())
-            t  = tf.transform.translation
-            r  = tf.transform.rotation
-            x  = int(round(t.x * 1000))
-            y  = int(round(t.y * 1000))
-            yaw = quat_to_yaw_deg(r.x, r.y, r.z, r.w)
-            return x, y, yaw
-        except TransformException:
-            return None
-
-    def _get_pose(self):
-        """
-        Get the best available pose. TF (map frame) takes priority when available;
-        falls back to odom + IMU.
-        Returns (x_mm, y_mm, yaw_deg, using_tf: bool).
-        """
-        if self.pose_frame:
-            result = self._pose_from_tf()
-            if result:
-                return (*result, True)
-
-        return (*self._pose_from_odom(), False)
-
-    # ── Navigation helpers ────────────────────────────────────────────────────
-
-    def _world_goal(self, idx: int):
-        """Convert waypoint (relative to origin) to world-frame mm coordinates."""
-        wp = self.waypoints[idx]
-        return (
-            self.origin[0] + int(round(wp['x'] * 1000)),
-            self.origin[1] + int(round(wp['y'] * 1000)),
+            f"Waypoint controller ready. pose={self.pose_topic}, cmd_vel={self.cmd_vel_topic}, "
+            f"file={self.waypoint_file or self.default_waypoint_file()}"
         )
-
-    def _goal_relative(self, curr_x, curr_y, phi_deg):
-        """
-        Compute distance (mm) and relative angle (deg) from current pose to goal.
-        Relative angle is positive = goal is to the left, negative = right.
-        """
-        dx    = self.current_goal[0] - curr_x
-        dy    = self.current_goal[1] - curr_y
-        theta = normalise_angle(math.degrees(math.atan2(dy, dx)))
-        dist  = pythag_mm(int(dx), int(dy))
-        angle = normalise_angle(theta - phi_deg)
-        return dist, angle
-
-    def _at_goal(self, curr_x, curr_y) -> bool:
-        dx = self.current_goal[0] - curr_x
-        dy = self.current_goal[1] - curr_y
-        return pythag_mm(int(dx), int(dy)) <= GOAL_TOLERANCE
-
-    def _advance_waypoint(self, reason: str):
-        """Move to the next waypoint, or end the mission."""
-        self.best_dist_mm       = 1_000_000_000
-        self.last_progress_time = self.get_clock().now()
-        self.prev_heading       = 0.0
-
-        if self.current_wp_idx + 1 >= len(self.waypoints):
-            self.mission_complete = True
-            self._publish_stop()
-            self.get_logger().info(f'Mission complete: {reason}')
-            return
-
-        self.current_wp_idx += 1
-        self.current_goal    = self._world_goal(self.current_wp_idx)
-        self._publish_stop()
-        wp = self.waypoints[self.current_wp_idx]
-        self.get_logger().info(
-            f'{reason} → next waypoint ({wp["x"]:.2f}, {wp["y"]:.2f})')
-
-    def _publish_stop(self):
-        self.cmd_pub.publish(Twist())
-
-    # ── Control loop ──────────────────────────────────────────────────────────
-
-    def _control_loop(self):
-        if self.mission_complete:
-            self._publish_stop()
-            return
-
-        if not self.have_odom:
+        if self.use_gazebo_tf_pose:
             self.get_logger().info(
-                f'Waiting for odometry on {self.pose_topic}…',
-                throttle_duration_sec=2.0)
-            self._publish_stop()
+                f"Gazebo pose enabled: using {self.gazebo_tf_topic} "
+                f'(match="{self.gazebo_tf_frame_match}") when available.'
+            )
+
+        if self.auto_start:
+            self.start_waypoints()
+
+    def default_waypoint_file(self) -> str:
+        candidates = [
+            Path("/ros2_ws/maps/latest_obstacle_waypoints.txt"),
+            Path.cwd() / "maps" / "latest_obstacle_waypoints.txt",
+            Path.cwd() / "ros2_ws" / "maps" / "latest_obstacle_waypoints.txt",
+        ]
+        here = Path(__file__).resolve()
+        for parent in [here] + list(here.parents):
+            if parent.name == "ros2_ws":
+                candidates.insert(0, parent / "maps" / "latest_obstacle_waypoints.txt")
+                break
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return str(candidates[0])
+
+    def odom_callback(self, msg: Odometry):
+        if self.use_gazebo_tf_pose and self.have_gazebo_tf_pose:
+            return
+        self.have_pose = True
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
+        self.current_yaw = yaw_from_quaternion(msg.pose.pose.orientation)
+        self.pose_source = "odom"
+
+    def gazebo_tf_callback(self, msg: TFMessage):
+        if not msg.transforms:
             return
 
-        # ── Pose ──────────────────────────────────────────────────────────────
-        curr_x, curr_y, phi, using_tf = self._get_pose()
+        selected = None
+        match = self.gazebo_tf_frame_match
+        for transform in msg.transforms:
+            child = transform.child_frame_id or ""
+            parent = transform.header.frame_id or ""
+            if match in child or match in parent:
+                selected = transform
+                break
 
-        if using_tf != self.using_tf_last:
-            if using_tf:
-                self.get_logger().info(
-                    f'Using TF pose  ({self.pose_frame} → {self.base_frame})')
-            else:
-                self.get_logger().info(
-                    f'Using odom/IMU pose  (TF not yet available)')
-            self.using_tf_last = using_tf
+        if selected is None and (len(msg.transforms) == 1 or self.gazebo_tf_allow_unmatched):
+            selected = msg.transforms[0]
 
-        # ── Anchor origin on first valid pose ─────────────────────────────────
-        if self.origin is None:
-            self.origin       = (curr_x, curr_y)
-            self.current_goal = self._world_goal(0)
-            self.get_logger().info(
-                f'Origin anchored at ({curr_x/1000:.2f}, {curr_y/1000:.2f}). '
-                f'First world goal ({self.current_goal[0]/1000:.2f}, '
-                f'{self.current_goal[1]/1000:.2f}).')
-
-        # ── Goal reached? ─────────────────────────────────────────────────────
-        if self._at_goal(curr_x, curr_y):
-            is_last = self.current_wp_idx + 1 >= len(self.waypoints)
-            self._advance_waypoint('Goal reached' if is_last else 'Waypoint reached')
-            return
-
-        # ── Distance / angle to goal ──────────────────────────────────────────
-        dist_mm, goal_angle = self._goal_relative(curr_x, curr_y, phi)
-
-        # Progress tracking for stuck detection
-        if dist_mm + WAYPOINT_PROGRESS_EPS < self.best_dist_mm:
-            self.best_dist_mm       = dist_mm
-            self.last_progress_time = self.get_clock().now()
-
-        elapsed = (self.get_clock().now() - self.last_progress_time).nanoseconds / 1e9
-        stuck = (dist_mm < BLOCKED_WAYPOINT_DIST and elapsed > WAYPOINT_STUCK_TIMEOUT)
-        if stuck:
-            wp = self.waypoints[self.current_wp_idx]
+        if selected is None:
+            frames = ", ".join(
+                (t.child_frame_id or t.header.frame_id or "<blank>") for t in msg.transforms[:8]
+            )
             self.get_logger().warn(
-                f'Stuck {self.best_dist_mm/1000:.2f} m from waypoint '
-                f'({wp["x"]:.2f}, {wp["y"]:.2f}) — skipping.')
-            self._advance_waypoint('Stuck — advancing')
+                f'Gazebo TF topic active, but no frame matched "{match}". Frames seen: {frames}',
+                throttle_duration_sec=5.0,
+            )
             return
 
-        # ── Heading ───────────────────────────────────────────────────────────
-        final_approach = dist_mm < FINAL_APPROACH_DISTANCE
+        self.have_pose = True
+        self.have_gazebo_tf_pose = True
+        self.pose_source = "gazebo_tf"
+        self.current_x = selected.transform.translation.x
+        self.current_y = selected.transform.translation.y
+        self.current_yaw = yaw_from_quaternion(selected.transform.rotation)
+        if not self._reported_gazebo_tf_pose:
+            self._reported_gazebo_tf_pose = True
+            frame = selected.child_frame_id or selected.header.frame_id or "<blank>"
+            self.get_logger().info(f'Waypoint controller using Gazebo pose frame "{frame}".')
 
-        if final_approach:
-            raw_heading = clamp(goal_angle, MAX_TOTAL_STEER)
+    def command_callback(self, msg: String):
+        command = msg.data.strip().lower()
+        if command == "drive_waypoints":
+            self.start_waypoints()
+        elif command in {"go_home", "start_wandering", "stop_waypoints"}:
+            if self.active:
+                self.get_logger().info(f"Stopping waypoint controller because command '{command}' was received.")
+            self.active = False
+            self.stop_robot()
+
+    def load_waypoints(self) -> List[Tuple[float, float]]:
+        path = self.waypoint_file or self.default_waypoint_file()
+        waypoints = []
+        try:
+            with open(path, "r", encoding="utf-8") as waypoint_file:
+                for line in waypoint_file:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.replace(",", " ").split()
+                    if len(parts) < 2:
+                        continue
+                    waypoints.append((float(parts[0]), float(parts[1])))
+        except (OSError, ValueError) as exc:
+            self.get_logger().error(f"Could not load waypoint file '{path}': {exc}")
+            return []
+
+        self.get_logger().info(f"Loaded {len(waypoints)} waypoint(s) from {path}")
+        for idx, (x, y) in enumerate(waypoints, start=1):
+            self.get_logger().info(f"Waypoint {idx}/{len(waypoints)} relative/file target: ({x:.2f}, {y:.2f})")
+        return waypoints
+
+    def start_waypoints(self):
+        if not self.have_pose:
+            self.get_logger().warn("Drive Waypoints requested, but no pose has arrived yet.")
+            self.stop_robot()
+            return
+
+        self.relative_waypoints = self.load_waypoints()
+        if not self.relative_waypoints:
+            self.active = False
+            self.stop_robot()
+            return
+
+        self.start_x = self.current_x
+        self.start_y = self.current_y
+        if self.relative_to_start:
+            self.world_waypoints = [
+                (self.start_x + rel_x, self.start_y + rel_y)
+                for rel_x, rel_y in self.relative_waypoints
+            ]
         else:
-            raw_heading = clamp(goal_angle, MAX_GOAL_STEER)
+            self.world_waypoints = list(self.relative_waypoints)
 
-        heading = smooth_heading(raw_heading, self.prev_heading)
-        self.prev_heading = heading
+        self.current_idx = 0
+        self.goal_achieved = False
+        self.active = True
+        self._last_status_log = 0.0
+        self.publish_robot_state("WAYPOINT")
+        self.stop_robot()
 
-        # ── Speed ─────────────────────────────────────────────────────────────
-        base_speed = FINAL_SPEED if final_approach else DRIVE_SPEED
-        linear_mps = base_speed / 1000.0
-        angular_rps = math.radians(clamp(heading * 2, TURN_SPEED))
+        self.get_logger().info(
+            f"Waypoint drive started from pose=({self.start_x:.2f}, {self.start_y:.2f}, "
+            f"yaw={math.degrees(self.current_yaw):.1f} deg), relative_to_start={self.relative_to_start}"
+        )
+        for idx, (x, y) in enumerate(self.world_waypoints, start=1):
+            self.get_logger().info(f"Waypoint {idx}/{len(self.world_waypoints)} world goal: ({x:.2f}, {y:.2f})")
 
-        # Alignment-based speed shaping
-        if final_approach and abs(goal_angle) >= FINAL_ALIGN_STOP_ANGLE:
-            linear_mps = 0.0                   # rotate in place to align
-        elif final_approach and abs(goal_angle) >= FINAL_ALIGN_SLOW_ANGLE:
-            linear_mps *= 0.3
-        elif abs(heading) >= 18:
-            linear_mps = 0.0                   # large heading error → rotate in place
-        elif abs(heading) >= 10:
-            linear_mps *= 0.35
-        elif abs(heading) >= 5:
-            linear_mps *= 0.65
+    def control_loop(self):
+        if not self.active:
+            return
+        if not self.have_pose:
+            self.stop_robot()
+            self.get_logger().warn("Waypoint controller waiting for pose.", throttle_duration_sec=2.0)
+            return
 
-        # Tiny heading error? Don't bother rotating at all
-        if abs(heading) < STEER_DEADBAND:
-            angular_rps = 0.0
+        if self.current_idx >= len(self.world_waypoints):
+            self.finish_waypoints()
+            return
 
-        # ── Publish ───────────────────────────────────────────────────────────
-        cmd           = Twist()
-        cmd.linear.x  = linear_mps
-        cmd.angular.z = angular_rps
+        goal_x, goal_y = self.world_waypoints[self.current_idx]
+        dx = goal_x - self.current_x
+        dy = goal_y - self.current_y
+        distance = math.hypot(dx, dy)
+        target_yaw = math.atan2(dy, dx)
+        heading_error = wrap_to_pi(target_yaw - self.current_yaw)
+        waypoint_number = self.current_idx + 1
+        waypoint_count = len(self.world_waypoints)
+
+        now = self.get_clock().now().nanoseconds / 1e9
+        if now - self._last_status_log >= 1.0:
+            self._last_status_log = now
+            self.get_logger().info(
+                f"Waypoint {waypoint_number}/{waypoint_count}: "
+                f"pose=({self.current_x:.2f}, {self.current_y:.2f}, yaw={math.degrees(self.current_yaw):.1f} deg), "
+                f"goal=({goal_x:.2f}, {goal_y:.2f}), "
+                f"distance={distance:.2f}m, heading_error={math.degrees(heading_error):.1f} deg, "
+                f"pose_source={self.pose_source}"
+            )
+
+        if distance <= self.goal_tolerance:
+            self.get_logger().info(
+                f"Reached waypoint {waypoint_number}/{waypoint_count}: "
+                f"pose=({self.current_x:.2f}, {self.current_y:.2f}), "
+                f"goal=({goal_x:.2f}, {goal_y:.2f}), final_error={distance:.2f}m"
+            )
+            self.current_idx += 1
+            self.stop_robot()
+            if self.current_idx >= len(self.world_waypoints):
+                self.finish_waypoints()
+            return
+
+        angular = clamp(
+            self.angular_gain * heading_error,
+            -self.max_angular_speed,
+            self.max_angular_speed,
+        )
+        if abs(heading_error) > self.heading_tolerance:
+            linear = 0.0 if abs(heading_error) > math.radians(30.0) else self.slow_linear_speed
+        else:
+            linear = min(self.linear_speed, distance * 0.5)
+
+        cmd = Twist()
+        cmd.linear.x = linear
+        cmd.angular.z = angular
         self.cmd_pub.publish(cmd)
 
-        self.get_logger().info(
-            f'pos=({curr_x/1000:.2f}, {curr_y/1000:.2f})  '
-            f'goal=({self.current_goal[0]/1000:.2f}, {self.current_goal[1]/1000:.2f})  '
-            f'dist={dist_mm}mm  goal_ang={goal_angle:.1f}°  heading={heading:.1f}°',
-            throttle_duration_sec=1.0)
+    def finish_waypoints(self):
+        if self.goal_achieved:
+            self.stop_robot()
+            return
+        self.active = False
+        self.goal_achieved = True
+        self.stop_robot()
+        self.publish_robot_state("GOAL_ACHIEVED")
+        self.get_logger().info("GOAL ACHIEVED - final waypoint reached. Press Go Home to return to centre.")
+
+    def stop_robot(self):
+        self.cmd_pub.publish(Twist())
+
+    def publish_robot_state(self, state: str):
+        self.robot_state_pub.publish(String(data=state))
 
 
 def main(args=None):
@@ -392,9 +365,10 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        node.stop_robot()
         node.destroy_node()
         rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

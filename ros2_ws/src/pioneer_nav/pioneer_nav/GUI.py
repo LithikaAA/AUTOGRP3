@@ -125,6 +125,8 @@ class GUINode(Node):
         # Each subscription maps one ROS topic to one callback.
         # The callback converts the message and emits a signal.
         self.create_subscription(Image,         "/oak/rgb/image_raw", self._cb_camera,  10)
+        self.create_subscription(Image,         "/camera/image",      self._cb_camera,  10)
+        self.create_subscription(Image,         "/detections/image",  self._cb_camera,  10)
         self.create_subscription(String,        "/robot_state",       self._cb_state,   10)
         self.create_subscription(Pose,          "/robot/pose",        self._cb_pose,    10)
         self.create_subscription(String,        "/detected_letter",   self._cb_letter,  10)
@@ -336,6 +338,19 @@ class MapWidget(QWidget):
             self._path_trace.append((x, y))
             if len(self._path_trace) > self._max_trace_points:
                 self._path_trace = self._path_trace[-self._max_trace_points:]
+        self.update()
+
+    def reset_centre_reference(self):
+        if self._have_pose:
+            self._arena_origin_x = self._robot_x
+            self._arena_origin_y = self._robot_y
+        else:
+            self._arena_origin_x = None
+            self._arena_origin_y = None
+        self._free_cells.fill(False)
+        self._obstacle_cells.fill(False)
+        self._path_trace.clear()
+        self._scan_hits.clear()
         self.update()
 
     def update_scan(self, msg):
@@ -981,6 +996,7 @@ class RobotGUI(QMainWindow):
             "MAPPING":          GREEN,
             "WAYPOINT":         ACCENT,
             "GOAL_ACHIEVED":    GREEN,
+            "REACHED_HOME":     GREEN,
             "IDLE":             YELLOW,
             "STOPPED":          RED,
             "ESTOP":            RED,
@@ -993,6 +1009,7 @@ class RobotGUI(QMainWindow):
             "MAPPING":  "Exploring area and building map...",
             "WAYPOINT": "Driving to waypoints at maximum speed...",
             "GOAL_ACHIEVED": "Goal achieved. Press Go Home to return to centre.",
+            "REACHED_HOME": "Reached home. Waiting for next command.",
             "IDLE":     "Standing by.",
             "STOPPED":  "EMERGENCY STOP — all motion halted!",
             "ESTOP":    "EMERGENCY STOP — obstacle detected!",
@@ -1060,9 +1077,17 @@ class RobotGUI(QMainWindow):
         self._arena_panel.update(data)
 
     def _send_mission_command(self, command: str):
+        if command == "start_wandering":
+            self._map_widget.reset_centre_reference()
+            self._on_state("MAPPING")
+        elif command == "drive_waypoints":
+            self._on_state("WAYPOINT")
+        elif command == "go_home":
+            self._on_state("RETURN_TO_CENTER")
         self.signals.mission_command.emit(command)
         self._det_log.add_entry(f"Command -> {command}", ACCENT)
-        self._action_label.setText(f"Command sent: {command}")
+        if command not in {"start_wandering", "drive_waypoints", "go_home"}:
+            self._action_label.setText(f"Command sent: {command}")
 
     def _save_map(self):
         if self._latest_map_msg is None:
@@ -1100,6 +1125,8 @@ class RobotGUI(QMainWindow):
 
         image_path = f"{prefix}.png"
         yaml_path = f"{prefix}.yaml"
+        obstacle_waypoints_path = f"{prefix}_obstacle_waypoints.txt"
+        latest_obstacle_waypoints_path = os.path.join(out_dir, "latest_obstacle_waypoints.txt")
         if not cv2.imwrite(image_path, img):
             raise RuntimeError(f"Could not write {image_path}")
 
@@ -1116,7 +1143,80 @@ class RobotGUI(QMainWindow):
                 f"free_thresh: 0.25\n"
             )
 
+        waypoints = self._coverage_obstacle_standoff_waypoints()
+        self._write_obstacle_waypoints(obstacle_waypoints_path, waypoints)
+        self._write_obstacle_waypoints(latest_obstacle_waypoints_path, waypoints)
+
         return prefix
+
+    def _write_obstacle_waypoints(self, path, waypoints):
+        with open(path, "w", encoding="utf-8") as waypoint_file:
+            waypoint_file.write("# target_rel_x_m target_rel_y_m obstacle_rel_x_m obstacle_rel_y_m\n")
+            waypoint_file.write("# targets are 1.0 m in front of each obstacle from the centre reference\n")
+            for target_x, target_y, obstacle_x, obstacle_y in waypoints:
+                waypoint_file.write(
+                    f"{target_x:.3f} {target_y:.3f} {obstacle_x:.3f} {obstacle_y:.3f}\n"
+                )
+
+    def _coverage_obstacle_standoff_waypoints(self):
+        grid = self._map_widget
+        occupied = grid._obstacle_cells.copy()
+        visited = np.zeros_like(occupied, dtype=bool)
+        height, width = occupied.shape
+        clusters = []
+
+        for start_row in range(height):
+            for start_col in range(width):
+                if not occupied[start_row, start_col] or visited[start_row, start_col]:
+                    continue
+
+                stack = [(start_row, start_col)]
+                visited[start_row, start_col] = True
+                cells = []
+                while stack:
+                    row, col = stack.pop()
+                    cells.append((row, col))
+                    for drow, dcol in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        nr = row + drow
+                        nc = col + dcol
+                        if (
+                            0 <= nr < height
+                            and 0 <= nc < width
+                            and occupied[nr, nc]
+                            and not visited[nr, nc]
+                        ):
+                            visited[nr, nc] = True
+                            stack.append((nr, nc))
+
+                if len(cells) >= 3:
+                    clusters.append(cells)
+
+        waypoints = []
+        standoff_m = 1.0
+        min_spacing = 0.75
+        edge_margin = 0.35
+        for cells in clusters:
+            avg_row = sum(row for row, _col in cells) / len(cells)
+            avg_col = sum(col for _row, col in cells) / len(cells)
+            obstacle_x = (avg_col + 0.5) * grid._coverage_res - grid._arena_half
+            obstacle_y = grid._arena_half - (avg_row + 0.5) * grid._coverage_res
+            distance_from_centre = math.hypot(obstacle_x, obstacle_y)
+            if distance_from_centre < standoff_m + 0.2:
+                continue
+
+            unit_x = obstacle_x / distance_from_centre
+            unit_y = obstacle_y / distance_from_centre
+            target_x = obstacle_x - unit_x * standoff_m
+            target_y = obstacle_y - unit_y * standoff_m
+            target_x = max(-grid._arena_half + edge_margin, min(grid._arena_half - edge_margin, target_x))
+            target_y = max(-grid._arena_half + edge_margin, min(grid._arena_half - edge_margin, target_y))
+
+            if all(math.hypot(target_x - px, target_y - py) >= min_spacing for px, py, _ox, _oy in waypoints):
+                waypoints.append((target_x, target_y, obstacle_x, obstacle_y))
+
+        waypoints.sort(key=lambda item: math.hypot(item[0], item[1]))
+        waypoints = waypoints[:12]
+        return waypoints
 
     def _yaw_from_quaternion(self, q) -> float:
         siny = 2.0 * (q.w * q.z + q.x * q.y)

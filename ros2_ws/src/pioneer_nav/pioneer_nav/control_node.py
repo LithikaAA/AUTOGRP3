@@ -195,6 +195,7 @@ class ControlNode(Node):
         self.emergency_stop = False
         self.external_estop_status = ESTOP_CLEAR
         self.external_waypoint_active = False
+        self.reached_home = False
         self._last_auto_button = False
         self._last_manual_button = False
         self._last_stop_button = False
@@ -231,6 +232,7 @@ class ControlNode(Node):
         with self.mutex:
             if command == 'start_wandering':
                 self.external_waypoint_active = False
+                self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring start_wandering command while external e-stop is active.')
                     return
@@ -241,9 +243,14 @@ class ControlNode(Node):
                 self.start_position = (self.current_x, self.current_y)
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.publish_twist(0.0, 0.0)
-                self.get_logger().info('GUI command: starting autonomous wandering.')
+                self.publish_robot_state()
+                self.get_logger().info(
+                    'GUI command: Start Wandering accepted by control_node. '
+                    'control_node is now AUTO/WANDERING_TURN and owns /cmd_vel.'
+                )
             elif command == 'go_home':
                 self.external_waypoint_active = False
+                self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring go_home command while external e-stop is active.')
                     return
@@ -253,11 +260,14 @@ class ControlNode(Node):
                 self.target_yaw = None
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.publish_twist(0.0, 0.0)
-                self.get_logger().info('GUI command: returning to map/start center.')
+                self.publish_robot_state()
+                self.get_logger().info('GUI command: Go Home accepted by control_node. Returning to map/start center.')
             elif command == 'drive_waypoints':
                 self.external_waypoint_active = True
+                self.reached_home = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
+                self.publish_robot_state()
                 self.get_logger().info('GUI command: paused control_node for distbug waypoint driving.')
 
     def estop_status_cb(self, msg: Int8):
@@ -533,6 +543,9 @@ class ControlNode(Node):
 
             if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
                 self.get_logger().warn(f'EMERGENCY STOP! Obstacle at {self.front_min_distance:.2f}m.')
+                if self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
+                    self.handle_return_obstacle_avoidance(emergency=True)
+                    return
                 self.publish_twist(0.0, 0.0)
                 if self.auto_state not in [AUTO_STATE.OBSTACLE_REVERSE, AUTO_STATE.OBSTACLE_TURN,
                                            AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN,
@@ -771,12 +784,24 @@ class ControlNode(Node):
         rel_x, rel_y = self.relative_position()
         distance_to_center = math.hypot(rel_x - MAP_CENTER[0], rel_y - MAP_CENTER[1])
         if distance_to_center < RETURN_TO_CENTER_MIN_DISTANCE:
-            self.get_logger().info('Successfully returned to map center. Resuming wandering.')
-            self.auto_state = AUTO_STATE.WANDERING_TURN
+            self.get_logger().info(
+                f'REACHED_HOME - returned to map center. '
+                f'pose=({self.current_x:.2f}, {self.current_y:.2f}, yaw={self.current_yaw:.1f} deg), '
+                f'rel=({rel_x:.2f}, {rel_y:.2f}), center_error={distance_to_center:.2f}m. '
+                f'Waiting for Start Wandering or Drive Waypoints.'
+            )
+            self.reached_home = True
+            self.drive_mode = DRIVE_MODE.MANUAL
             self.target_yaw = None
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.publish_twist(0.0, 0.0)
+            self.publish_robot_state()
             return
+
+        if self.front_min_distance < OBSTACLE_BUFFER:
+            self.handle_return_obstacle_avoidance()
+            return
+
         vec_x = MAP_CENTER[0] - rel_x
         vec_y = MAP_CENTER[1] - rel_y
         target_yaw_to_center_rad = math.atan2(vec_y, vec_x)
@@ -796,6 +821,33 @@ class ControlNode(Node):
         else:
             angular_speed = 0.0
             linear_speed = self.return_to_center_speed
+        self.publish_twist(linear_speed, angular_speed)
+
+    def handle_return_obstacle_avoidance(self, emergency=False):
+        if self.left_min_distance > self.right_min_distance:
+            turn_direction = 1.0
+            side_name = 'left'
+        else:
+            turn_direction = -1.0
+            side_name = 'right'
+
+        angular_speed = turn_direction * math.radians(self.return_to_center_turn_speed_deg)
+        if emergency:
+            linear_speed = self.reverse_speed * 0.6
+            self.get_logger().warn(
+                f'Go Home obstacle avoidance: obstacle {self.front_min_distance:.2f}m ahead; '
+                f'reversing and turning {side_name}.',
+                throttle_duration_sec=1.0
+            )
+        else:
+            linear_speed = 0.0
+            self.get_logger().info(
+                f'Go Home obstacle avoidance: obstacle {self.front_min_distance:.2f}m ahead; '
+                f'turning {side_name} toward clearer side.',
+                throttle_duration_sec=1.0
+            )
+
+        self.target_yaw = None
         self.publish_twist(linear_speed, angular_speed)
 
     def near_boundary(self, buffer_distance):
@@ -902,7 +954,9 @@ class ControlNode(Node):
         elif self.external_estop_status == ESTOP_WARNING:
             state = 'STOPPED'
         elif self.external_waypoint_active:
-            return
+            state = 'WAYPOINT'
+        elif self.reached_home:
+            state = 'REACHED_HOME'
         elif self.drive_mode == DRIVE_MODE.AUTO:
             state = 'MAPPING'
         else:

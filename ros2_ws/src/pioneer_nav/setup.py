@@ -6,6 +6,12 @@ setup(
     name=package_name,
     version='0.0.0',
     packages=find_packages(exclude=['test']),
+    package_data={
+        package_name: [
+            'greek_classifier.onnx',
+            'greek_classes.txt',
+        ],
+    },
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
@@ -41,6 +47,7 @@ setup(
             'control_node = pioneer_nav.control_node:main',
             'odom_tf_broadcaster = pioneer_nav.odom_tf_broadcaster:main',
             'mission_manager = pioneer_nav.mission_manager:main',
+            'unified_detector = pioneer_nav.unified_detector_node:main',
             'colour_detector = pioneer_nav.colour_detector_node:main',
             'estoplidar = pioneer_nav.estoplidar:main',
             'estopconnect = pioneer_nav.estopconnect:main',
