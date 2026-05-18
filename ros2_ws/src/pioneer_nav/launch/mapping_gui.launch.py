@@ -15,8 +15,10 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     scan_frame = LaunchConfiguration('scan_frame')
+    control = LaunchConfiguration('control')
     gui = LaunchConfiguration('gui')
     estop = LaunchConfiguration('estop')
+    oak_camera = LaunchConfiguration('oak_camera')
     detector = LaunchConfiguration('detector')
     camera_topic = LaunchConfiguration('camera_topic')
     depth_topic = LaunchConfiguration('depth_topic')
@@ -50,8 +52,10 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('scan_frame', default_value='sick_laser'),
+        DeclareLaunchArgument('control', default_value='true'),
         DeclareLaunchArgument('gui', default_value='true'),
         DeclareLaunchArgument('estop', default_value='true'),
+        DeclareLaunchArgument('oak_camera', default_value='true'),
         DeclareLaunchArgument('detector', default_value='true'),
         DeclareLaunchArgument('camera_topic', default_value='/oak/rgb/image_raw'),
         DeclareLaunchArgument('depth_topic', default_value='/oak/stereo/image_raw'),
@@ -67,10 +71,51 @@ def generate_launch_description():
         slam_launch,
         Node(
             package='pioneer_nav',
+            executable='control_node',
+            name='pioneer_control_node',
+            output='screen',
+            condition=IfCondition(control),
+            parameters=[
+                {'joy_topic': '/joy'},
+                {'scan_topic': '/scan'},
+                {'odom_topic': '/odom'},
+                {'cmd_vel_topic': '/cmd_vel'},
+                {'estop_status_topic': '/estop_status'},
+                {'robot_pose_topic': '/robot/pose'},
+                {'arena_status_topic': '/arena_status'},
+                {'robot_state_topic': '/robot_state'},
+                {'mission_command_topic': '/mission_command'},
+                {'publish_gui_topics': True},
+                {'external_manual_control': True},
+                {'forward_speed': 0.15},
+                {'reverse_speed': -0.12},
+                {'turn_speed_deg': 20.0},
+                {'return_to_center_speed': 0.12},
+                {'return_to_center_turn_speed_deg': 20.0},
+                {'center_arena_on_start': True},
+                {'use_gazebo_tf_pose': False},
+            ],
+        ),
+        Node(
+            package='pioneer_nav',
             executable='estopconnect',
             name='estopconnect',
             output='screen',
             condition=IfCondition(estop),
+        ),
+        Node(
+            package='pioneer_nav',
+            executable='oak_camera',
+            name='oak_camera',
+            output='screen',
+            condition=IfCondition(oak_camera),
+            parameters=[
+                {'rgb_topic': camera_topic},
+                {'depth_topic': depth_topic},
+                {'frame_id': 'oak_camera'},
+                {'publish_rate_hz': 15.0},
+                {'webcam_fallback': False},
+            ],
         ),
         Node(
             package='pioneer_nav',

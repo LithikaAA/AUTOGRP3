@@ -48,6 +48,7 @@ setup(
             'control_node = pioneer_nav.control_node:main',
             'odom_tf_broadcaster = pioneer_nav.odom_tf_broadcaster:main',
             'mission_manager = pioneer_nav.mission_manager:main',
+            'oak_camera = pioneer_nav.oak_camera_node:main',
             'unified_detector = pioneer_nav.unified_detector_node:main',
             'colour_detector = pioneer_nav.colour_detector_node:main',
             'estoplidar = pioneer_nav.estoplidar:main',
