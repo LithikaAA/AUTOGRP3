@@ -63,6 +63,16 @@ docker run -it --privileged --device=/dev/ttyUSB0 --network=host pioneer_jazzy
 
 # or sometimes (for controller i think?)
 docker run -it --privileged --device=/dev/ttyUSB0 --device=/dev/input/js0 --network=host pioneer_jazzy
+
+#for camera use this
+docker run -it --privileged \
+  --device=/dev/ttyUSB0 \
+  --volume=/dev/bus/usb:/dev/bus/usb \
+  --volume=/run/udev:/run/udev:ro \
+  --volume=/home/team3/AUTOGRP3/AUTOGRP3/ros2_ws/src:/ros2_ws/src \
+  --network=host pioneer_jazzy
+
+
 ```
 
 ---
