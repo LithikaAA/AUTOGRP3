@@ -12,11 +12,12 @@ HOW THE NODES CONNECT TO THIS GUI:
   control_node.py     →  /robot/pose         →  map arrow + position display
   control_node.py     →  /arena_status       →  arena debug panel
   unified_detector    →  /detected_letter    →  detection log + status panel
-  unified_detector    →  /detections/colour  →  detection log + map markers
+  unified_detector    →  /detections/colour  →  detection log entry only
   unified_detector    →  /detections/image   →  bottom-right live photo panel
   slam_toolbox        →  /map                →  map panel background
   mission_manager.py  →  /planned_path       →  path overlay on map
   OAK-D driver        →  /oak/rgb/image_raw  →  camera feed panel
+  detections_log.jsonl (file, polled every 2s) → map markers (one per obstacle)
 
 Requirements:
     sudo apt install python3-pyqt5 python3-opencv
@@ -34,7 +35,6 @@ import sys
 import json
 import math
 import os
-import subprocess
 import threading
 import time
 from datetime import datetime
@@ -78,6 +78,9 @@ TEXT_DIM  = "#8b949e"
 
 FONT_UI   = "Ubuntu Mono"
 FONT_BODY = "DejaVu Sans"
+
+# Path to the detection log written by unified_detector_node
+DETECTION_LOG_PATH = os.path.expanduser("~/part3_logs/detections_log.jsonl")
 
 
 # ──────────────────────────────────────────────
@@ -141,7 +144,6 @@ class GUINode(Node):
         self.signals.camera_frame.emit(frame)
 
     def _cb_colour_image(self, msg):
-        """Receives /detections/image (annotated BGR frame from unified detector)."""
         frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
             (msg.height, msg.width, -1))
         if msg.encoding != "bgr8":
@@ -264,7 +266,10 @@ class MapWidget(QWidget):
         self._max_scan_hits = 5000
         self._scan_hit_lifetime = 10.0
 
+        # Each entry: (world_x, world_y, label, colour_str)
+        # Rebuilt every 2 seconds from detections_log.jsonl — never appended directly
         self._detections = []
+
         self._path = []
 
     def update_map(self, msg):
@@ -276,11 +281,9 @@ class MapWidget(QWidget):
 
         data = np.array(msg.data, dtype=np.int8).reshape((self._map_h, self._map_w))
         img  = np.zeros((self._map_h, self._map_w, 3), dtype=np.uint8)
-
         img[data == -1] = [18,  24,  31]
         img[data == 0]  = [220, 238, 225]
         img[data > 50]  = [248,  81,  73]
-
         img = np.flipud(img)
         h, w, _ = img.shape
         self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888)
@@ -376,8 +379,9 @@ class MapWidget(QWidget):
             if cell is not None:
                 self._obstacle_cells[cell] = True
 
-    def add_detection(self, x, y, label, colour):
-        self._detections.append((x, y, label, colour))
+    def set_detections(self, detections: list):
+        """Replace all detection markers. Called by the log poller."""
+        self._detections = detections
         self.update()
 
     def update_path(self, poses):
@@ -400,7 +404,6 @@ class MapWidget(QWidget):
             points = self._path_trace + scan_points + [(self._robot_x, self._robot_y)]
             if not points:
                 return (self.width()//2, self.height()//2)
-
             min_x = min(p[0] for p in points)
             max_x = max(p[0] for p in points)
             min_y = min(p[1] for p in points)
@@ -441,18 +444,15 @@ class MapWidget(QWidget):
                     continue
                 x = int(dx + col * cell)
                 w = max(1, int(math.ceil(cell)))
-                if self._obstacle_cells[row, col]:
-                    colour = QColor(248, 81, 73)
-                else:
-                    colour = QColor(63, 185, 80, 165)
+                colour = QColor(248, 81, 73) if self._obstacle_cells[row, col] \
+                         else QColor(63, 185, 80, 165)
                 painter.fillRect(x, y, w, h, colour)
 
         painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
         for i in range(self._coverage_n + 1):
             pos = int(dx + i * cell)
             painter.drawLine(pos, dy, pos, dy + size)
-            pos_y = int(dy + i * cell)
-            painter.drawLine(dx, pos_y, dx + size, pos_y)
+            painter.drawLine(dx, int(dy + i * cell), dx + size, int(dy + i * cell))
 
         metre_step = self._coverage_n / self._arena_size
         painter.setPen(QPen(QColor(88, 166, 255, 70), 1))
@@ -478,16 +478,17 @@ class MapWidget(QWidget):
                 p2 = self._world_to_px(*self._path[i+1])
                 painter.drawLine(*p1, *p2)
 
+        # Draw detection markers — one per unique obstacle from the log file
         for (wx, wy, label, col) in self._detections:
             px, py = self._world_to_px(wx, wy)
-            colour = QColor(RED) if "red" in col else \
+            colour = QColor(RED)    if "red"    in col else \
                      QColor(YELLOW) if "yellow" in col else QColor(GREEN)
             painter.setBrush(QBrush(colour))
             painter.setPen(QPen(QColor(TEXT), 1))
-            painter.drawEllipse(px-6, py-6, 12, 12)
-            painter.setFont(QFont(FONT_UI, 7))
+            painter.drawEllipse(px - 8, py - 8, 16, 16)
+            painter.setFont(QFont(FONT_UI, 7, QFont.Bold))
             painter.setPen(QColor(TEXT))
-            painter.drawText(px+8, py+4, label[:3])
+            painter.drawText(px + 10, py + 4, label[:3])
 
         rx, ry = self._world_to_px(self._robot_x, self._robot_y)
         painter.setBrush(QBrush(QColor(ACCENT)))
@@ -611,7 +612,6 @@ class ArenaPanel(QWidget):
         self._lbl_state.setText(state.replace('_', ' '))
         self._lbl_state.setStyleSheet(
             f"color: {sc}; border: none; background: transparent; font-weight: bold;")
-
         self._lbl_pos.setText(f"({rel_x:+.2f}, {rel_y:+.2f}) m")
         self._lbl_home.setText(f"{home:.2f} m")
         self._lbl_edge.setText(f"{edge:.2f} m")
@@ -639,9 +639,15 @@ class RobotGUI(QMainWindow):
         self.setMinimumSize(1400, 800)
         self.setStyleSheet(f"background: {BG}; color: {TEXT};")
         self._latest_map_msg = None
+        self._last_log_mtime = None   # track file modification time to avoid redundant reads
 
         self._build_ui()
         self._connect_signals()
+
+        # Poll detections_log.jsonl every 2 seconds to update map markers
+        self._log_poll_timer = QTimer()
+        self._log_poll_timer.timeout.connect(self._poll_detection_log)
+        self._log_poll_timer.start(2000)
 
     def _build_ui(self):
         central = QWidget()
@@ -716,54 +722,31 @@ class RobotGUI(QMainWindow):
         self._start_wandering_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._start_wandering_btn.setCursor(Qt.PointingHandCursor)
         self._start_wandering_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {GREEN}22;
-                color: {GREEN};
-                border: 1px solid {GREEN};
-                border-radius: 6px;
-                padding: 6px 12px;
-            }}
+            QPushButton {{ background: {GREEN}22; color: {GREEN};
+                border: 1px solid {GREEN}; border-radius: 6px; padding: 6px 12px; }}
         """)
         self._go_home_btn = QPushButton("Go Home")
         self._go_home_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._go_home_btn.setCursor(Qt.PointingHandCursor)
         self._go_home_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {ACCENT}22;
-                color: {ACCENT};
-                border: 1px solid {ACCENT};
-                border-radius: 6px;
-                padding: 6px 12px;
-            }}
+            QPushButton {{ background: {ACCENT}22; color: {ACCENT};
+                border: 1px solid {ACCENT}; border-radius: 6px; padding: 6px 12px; }}
         """)
         self._drive_waypoints_btn = QPushButton("Drive Waypoints")
         self._drive_waypoints_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._drive_waypoints_btn.setCursor(Qt.PointingHandCursor)
         self._drive_waypoints_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {YELLOW}22;
-                color: {YELLOW};
-                border: 1px solid {YELLOW};
-                border-radius: 6px;
-                padding: 6px 12px;
-            }}
+            QPushButton {{ background: {YELLOW}22; color: {YELLOW};
+                border: 1px solid {YELLOW}; border-radius: 6px; padding: 6px 12px; }}
         """)
         self._save_map_btn = QPushButton("Save Map")
         self._save_map_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._save_map_btn.setCursor(Qt.PointingHandCursor)
         self._save_map_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: {GREEN}22;
-                color: {GREEN};
-                border: 1px solid {GREEN};
-                border-radius: 6px;
-                padding: 6px 12px;
-            }}
-            QPushButton:disabled {{
-                background: {BORDER};
-                color: {TEXT_DIM};
-                border: 1px solid {BORDER};
-            }}
+            QPushButton {{ background: {GREEN}22; color: {GREEN};
+                border: 1px solid {GREEN}; border-radius: 6px; padding: 6px 12px; }}
+            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_DIM};
+                border: 1px solid {BORDER}; }}
         """)
         self._save_map_label = QLabel("Maps save to ros2_ws/maps")
         self._save_map_label.setFont(QFont(FONT_UI, 8))
@@ -786,7 +769,6 @@ class RobotGUI(QMainWindow):
         log_layout.addWidget(self._det_log)
         right.addWidget(log_frame, 3)
 
-        # Bottom-right panel — live feed from /detections/image
         photo_frame, photo_layout = make_panel("Last Detection  ( /detections/image )")
         self._photo_label = QLabel()
         self._photo_label.setAlignment(Qt.AlignCenter)
@@ -823,7 +805,7 @@ class RobotGUI(QMainWindow):
 
     def _connect_signals(self):
         self.signals.camera_frame.connect(self._on_camera)
-        self.signals.colour_image.connect(self._on_colour_image)   # /detections/image → photo panel
+        self.signals.colour_image.connect(self._on_colour_image)
         self.signals.robot_state.connect(self._on_state)
         self.signals.robot_pose.connect(self._on_pose)
         self.signals.letter_detected.connect(self._on_letter)
@@ -838,10 +820,66 @@ class RobotGUI(QMainWindow):
         self._drive_waypoints_btn.clicked.connect(lambda: self._send_mission_command("drive_waypoints"))
         self._save_map_btn.clicked.connect(self._save_map)
 
+    # ── Detection log poller ──────────────────────────────────────────────────
+
+    def _poll_detection_log(self):
+        """
+        Read detections_log.jsonl every 2 seconds.
+        Keeps only the closest reading per label (same logic as the detector).
+        Rebuilds map markers from scratch each poll so stale dots never accumulate.
+        """
+        if not os.path.exists(DETECTION_LOG_PATH):
+            return
+
+        # Skip re-reading if the file hasn't changed since last poll
+        try:
+            mtime = os.path.getmtime(DETECTION_LOG_PATH)
+        except OSError:
+            return
+        if mtime == self._last_log_mtime:
+            return
+        self._last_log_mtime = mtime
+
+        best: dict[str, dict] = {}
+        try:
+            with open(DETECTION_LOG_PATH) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                        name   = record.get("name", "")
+                        dist   = record.get("distance_m") or 999.0
+                        if name not in best or dist < (best[name].get("distance_m") or 999.0):
+                            best[name] = record
+                    except Exception:
+                        continue
+        except Exception:
+            return
+
+        # Build marker list from best records that have valid world coordinates
+        detections = []
+        for record in best.values():
+            obj_x = record.get("object_x")
+            obj_y = record.get("object_y")
+            name  = record.get("name", "")
+            kind  = record.get("type", "")
+            if obj_x is None or obj_y is None:
+                continue
+            colour = "red"    if "red"    in name else \
+                     "yellow" if "yellow" in name else "green"
+            detections.append((obj_x, obj_y, name, colour))
+
+        self._map_widget.set_detections(detections)
+
+        # Update detection count in status bar
+        self._save_map_label.setText(
+            f"Maps save to ros2_ws/maps  ·  {len(detections)} detection(s) logged")
+
     # ── Slot handlers ────────────────────────────
 
     def _on_camera(self, frame: np.ndarray):
-        """Main camera panel — raw feed from /oak/rgb/image_raw."""
         rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.tobytes(), w, h, ch*w, QImage.Format_RGB888)
@@ -863,7 +901,6 @@ class RobotGUI(QMainWindow):
     def _on_state(self, state: str):
         self._status_labels["State"].setText(state)
         self._state_badge.setText(state)
-
         colour_map = {
             "MAPPING":          GREEN,
             "WAYPOINT":         ACCENT,
@@ -876,16 +913,15 @@ class RobotGUI(QMainWindow):
         }
         colour = colour_map.get(state, TEXT_DIM)
         self._state_badge.setStyleSheet(self._badge_style(colour))
-
         action_map = {
-            "MAPPING":  "Exploring area and building map...",
-            "WAYPOINT": "Driving to waypoints at maximum speed...",
-            "GOAL_ACHIEVED": "Goal achieved. Press Go Home to return to centre.",
-            "REACHED_HOME": "Reached home. Waiting for next command.",
-            "IDLE":     "Standing by.",
-            "STOPPED":  "EMERGENCY STOP — all motion halted!",
-            "ESTOP":    "EMERGENCY STOP — obstacle detected!",
-            "RETURN_TO_CENTER": "Returning to arena centre...",
+            "MAPPING":           "Exploring area and building map...",
+            "WAYPOINT":          "Driving to waypoints at maximum speed...",
+            "GOAL_ACHIEVED":     "Goal achieved. Press Go Home to return to centre.",
+            "REACHED_HOME":      "Reached home. Waiting for next command.",
+            "IDLE":              "Standing by.",
+            "STOPPED":           "EMERGENCY STOP — all motion halted!",
+            "ESTOP":             "EMERGENCY STOP — obstacle detected!",
+            "RETURN_TO_CENTER":  "Returning to arena centre...",
         }
         action = action_map.get(state, state)
         self._status_labels["Action"].setText(action)
@@ -902,19 +938,13 @@ class RobotGUI(QMainWindow):
         self._det_log.add_entry(f"Greek letter detected: {name}", GREEN)
 
     def _on_colour(self, data: dict):
+        """Log entry only — map markers come from the log file poller."""
         label   = data.get("label", "unknown")
-        dist    = data.get("distance_m", 0.0)
         bearing = data.get("bearing_deg", 0.0)
-        rx      = data.get("robot_x", 0.0)
-        ry      = data.get("robot_y", 0.0)
-
-        colour = RED if "red" in label else YELLOW
+        elapsed = data.get("elapsed_s", 0.0)
+        colour  = RED if "red" in label else YELLOW
         self._det_log.add_entry(
-            f"{label}  dist={dist:.2f}m  bearing={bearing:.1f}°", colour)
-
-        wx = rx + dist * math.cos(math.radians(bearing))
-        wy = ry + dist * math.sin(math.radians(bearing))
-        self._map_widget.add_detection(wx, wy, label, label)
+            f"{label}  bearing={bearing:.1f}°  seen={elapsed:.1f}s", colour)
 
     def _on_map(self, msg):
         self._latest_map_msg = msg
@@ -948,7 +978,6 @@ class RobotGUI(QMainWindow):
         if self._latest_map_msg is None:
             self.signals.save_status.emit("No /map received yet", False)
             return
-
         self._save_map_btn.setEnabled(False)
         self._save_map_label.setText("Saving current /map...")
         self._save_map_label.setStyleSheet(f"color: {TEXT_DIM}; border: none; background: transparent;")
@@ -966,28 +995,28 @@ class RobotGUI(QMainWindow):
     def _save_occupancy_grid(self, msg) -> str:
         out_dir = self._map_output_dir()
         os.makedirs(out_dir, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
         prefix = os.path.join(out_dir, f"pioneer_map_{stamp}")
 
-        width = msg.info.width
+        width  = msg.info.width
         height = msg.info.height
-        data = np.array(msg.data, dtype=np.int16).reshape((height, width))
-
-        img = np.full((height, width), 205, dtype=np.uint8)
-        img[data == 0] = 254
-        img[data >= 65] = 0
+        data   = np.array(msg.data, dtype=np.int16).reshape((height, width))
+        img    = np.full((height, width), 205, dtype=np.uint8)
+        img[data == 0]   = 254
+        img[data >= 65]  = 0
         img = np.flipud(img)
 
         image_path = f"{prefix}.png"
         yaml_path  = f"{prefix}.yaml"
-        obstacle_waypoints_path = f"{prefix}_obstacle_waypoints.txt"
+        obstacle_waypoints_path        = f"{prefix}_obstacle_waypoints.txt"
         latest_obstacle_waypoints_path = os.path.join(out_dir, "latest_obstacle_waypoints.txt")
+
         if not cv2.imwrite(image_path, img):
             raise RuntimeError(f"Could not write {image_path}")
 
         yaw = self._yaw_from_quaternion(msg.info.origin.orientation)
-        with open(yaml_path, "w", encoding="utf-8") as yaml_file:
-            yaml_file.write(
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            f.write(
                 f"image: {os.path.basename(image_path)}\n"
                 f"mode: trinary\n"
                 f"resolution: {msg.info.resolution:.8f}\n"
@@ -1001,22 +1030,19 @@ class RobotGUI(QMainWindow):
         waypoints = self._coverage_obstacle_standoff_waypoints()
         self._write_obstacle_waypoints(obstacle_waypoints_path, waypoints)
         self._write_obstacle_waypoints(latest_obstacle_waypoints_path, waypoints)
-
         return prefix
 
     def _write_obstacle_waypoints(self, path, waypoints):
-        with open(path, "w", encoding="utf-8") as waypoint_file:
-            waypoint_file.write("# target_rel_x_m target_rel_y_m obstacle_rel_x_m obstacle_rel_y_m\n")
-            waypoint_file.write("# targets are 1.0 m in front of each obstacle from the centre reference\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("# target_rel_x_m target_rel_y_m obstacle_rel_x_m obstacle_rel_y_m\n")
+            f.write("# targets are 1.0 m in front of each obstacle from the centre reference\n")
             for target_x, target_y, obstacle_x, obstacle_y in waypoints:
-                waypoint_file.write(
-                    f"{target_x:.3f} {target_y:.3f} {obstacle_x:.3f} {obstacle_y:.3f}\n"
-                )
+                f.write(f"{target_x:.3f} {target_y:.3f} {obstacle_x:.3f} {obstacle_y:.3f}\n")
 
     def _coverage_obstacle_standoff_waypoints(self):
-        grid = self._map_widget
+        grid     = self._map_widget
         occupied = grid._obstacle_cells.copy()
-        visited = np.zeros_like(occupied, dtype=bool)
+        visited  = np.zeros_like(occupied, dtype=bool)
         height, width = occupied.shape
         clusters = []
 
@@ -1024,54 +1050,45 @@ class RobotGUI(QMainWindow):
             for start_col in range(width):
                 if not occupied[start_row, start_col] or visited[start_row, start_col]:
                     continue
-
                 stack = [(start_row, start_col)]
                 visited[start_row, start_col] = True
                 cells = []
                 while stack:
                     row, col = stack.pop()
                     cells.append((row, col))
-                    for drow, dcol in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                        nr = row + drow
-                        nc = col + dcol
-                        if (
-                            0 <= nr < height
-                            and 0 <= nc < width
-                            and occupied[nr, nc]
-                            and not visited[nr, nc]
-                        ):
+                    for drow, dcol in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nr, nc = row+drow, col+dcol
+                        if (0 <= nr < height and 0 <= nc < width
+                                and occupied[nr, nc] and not visited[nr, nc]):
                             visited[nr, nc] = True
                             stack.append((nr, nc))
-
                 if len(cells) >= 3:
                     clusters.append(cells)
 
-        waypoints = []
+        waypoints  = []
         standoff_m = 1.0
         min_spacing = 0.75
         edge_margin = 0.35
         for cells in clusters:
-            avg_row = sum(row for row, _col in cells) / len(cells)
-            avg_col = sum(col for _row, col in cells) / len(cells)
+            avg_row    = sum(r for r, _ in cells) / len(cells)
+            avg_col    = sum(c for _, c in cells) / len(cells)
             obstacle_x = (avg_col + 0.5) * grid._coverage_res - grid._arena_half
             obstacle_y = grid._arena_half - (avg_row + 0.5) * grid._coverage_res
-            distance_from_centre = math.hypot(obstacle_x, obstacle_y)
-            if distance_from_centre < standoff_m + 0.2:
+            dist_from_centre = math.hypot(obstacle_x, obstacle_y)
+            if dist_from_centre < standoff_m + 0.2:
                 continue
-
-            unit_x = obstacle_x / distance_from_centre
-            unit_y = obstacle_y / distance_from_centre
+            unit_x   = obstacle_x / dist_from_centre
+            unit_y   = obstacle_y / dist_from_centre
             target_x = obstacle_x - unit_x * standoff_m
             target_y = obstacle_y - unit_y * standoff_m
             target_x = max(-grid._arena_half + edge_margin, min(grid._arena_half - edge_margin, target_x))
             target_y = max(-grid._arena_half + edge_margin, min(grid._arena_half - edge_margin, target_y))
-
-            if all(math.hypot(target_x - px, target_y - py) >= min_spacing for px, py, _ox, _oy in waypoints):
+            if all(math.hypot(target_x - px, target_y - py) >= min_spacing
+                   for px, py, _ox, _oy in waypoints):
                 waypoints.append((target_x, target_y, obstacle_x, obstacle_y))
 
         waypoints.sort(key=lambda item: math.hypot(item[0], item[1]))
-        waypoints = waypoints[:12]
-        return waypoints
+        return waypoints[:12]
 
     def _yaw_from_quaternion(self, q) -> float:
         siny = 2.0 * (q.w * q.z + q.x * q.y)
@@ -1082,20 +1099,16 @@ class RobotGUI(QMainWindow):
         env_dir = os.environ.get("PIONEER_MAP_DIR")
         if env_dir:
             return os.path.expanduser(env_dir)
-
         here = FilePath(__file__).resolve()
         for parent in [here] + list(here.parents):
             if parent.name == "ros2_ws":
                 return str(parent / "maps")
-
         cwd = FilePath.cwd().resolve()
         if cwd.name == "ros2_ws":
             return str(cwd / "maps")
-
         docker_ws = FilePath("/ros2_ws")
         if docker_ws.exists():
             return str(docker_ws / "maps")
-
         return str(cwd / "maps")
 
     def _on_save_status(self, message: str, ok: bool):
