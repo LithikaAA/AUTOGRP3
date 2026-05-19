@@ -12,7 +12,8 @@ HOW THE NODES CONNECT TO THIS GUI:
   control_node.py     →  /robot/pose         →  map arrow + position display
   control_node.py     →  /arena_status       →  arena debug panel
   unified_detector    →  /detected_letter    →  detection log + status panel
-  unified_detector    →  /detections/colour  →  detection log + map markers + photo
+  unified_detector    →  /detections/colour  →  detection log + map markers
+  unified_detector    →  /detections/image   →  bottom-right live photo panel
   slam_toolbox        →  /map                →  map panel background
   mission_manager.py  →  /planned_path       →  path overlay on map
   OAK-D driver        →  /oak/rgb/image_raw  →  camera feed panel
@@ -64,52 +65,41 @@ from PyQt5.QtGui import (
 
 # ──────────────────────────────────────────────
 #  COLOUR PALETTE
-#  All colours defined once here so they're
-#  easy to change if needed.
 # ──────────────────────────────────────────────
-BG        = "#0d1117"   # main background
-PANEL     = "#161b22"   # panel background
-BORDER    = "#30363d"   # panel borders
-ACCENT    = "#58a6ff"   # blue — used for headings and neutral highlights
-GREEN     = "#3fb950"   # good / mapping
-YELLOW    = "#d29922"   # warning / idle
-RED       = "#f85149"   # danger / estop
-TEXT      = "#e6edf3"   # primary text
-TEXT_DIM  = "#8b949e"   # secondary / label text
+BG        = "#0d1117"
+PANEL     = "#161b22"
+BORDER    = "#30363d"
+ACCENT    = "#58a6ff"
+GREEN     = "#3fb950"
+YELLOW    = "#d29922"
+RED       = "#f85149"
+TEXT      = "#e6edf3"
+TEXT_DIM  = "#8b949e"
 
-# Changed from Courier New — using a clean sans-serif
-FONT_UI   = "Ubuntu Mono"   # monospaced but less obviously "AI generated"
+FONT_UI   = "Ubuntu Mono"
 FONT_BODY = "DejaVu Sans"
 
 
 # ──────────────────────────────────────────────
 #  SIGNALS
-#  PyQt5 requires that UI updates happen on the
-#  main thread. ROS callbacks run on a background
-#  thread. Signals are the thread-safe bridge
-#  between them — each signal carries data from
-#  a ROS callback to a Qt slot on the main thread.
 # ──────────────────────────────────────────────
 class Signals(QObject):
-    camera_frame    = pyqtSignal(np.ndarray)       # raw BGR frame from OAK-D
-    robot_state     = pyqtSignal(str)              # e.g. "MAPPING", "ESTOP"
-    robot_pose      = pyqtSignal(float, float, float)  # x, y, yaw (radians)
-    letter_detected = pyqtSignal(str)              # e.g. "alpha"
-    colour_detected = pyqtSignal(dict)             # JSON dict from /detections/colour
-    map_updated     = pyqtSignal(object)           # OccupancyGrid message
-    scan_updated    = pyqtSignal(object)           # LaserScan message
-    path_updated    = pyqtSignal(object)           # Path message
-    arena_updated   = pyqtSignal(dict)             # JSON dict from /arena_status
-    save_status     = pyqtSignal(str, bool)        # message, success flag
-    mission_command = pyqtSignal(str)              # GUI command to ROS
+    camera_frame    = pyqtSignal(np.ndarray)
+    colour_image    = pyqtSignal(np.ndarray)   # /detections/image → bottom-right panel
+    robot_state     = pyqtSignal(str)
+    robot_pose      = pyqtSignal(float, float, float)
+    letter_detected = pyqtSignal(str)
+    colour_detected = pyqtSignal(dict)
+    map_updated     = pyqtSignal(object)
+    scan_updated    = pyqtSignal(object)
+    path_updated    = pyqtSignal(object)
+    arena_updated   = pyqtSignal(dict)
+    save_status     = pyqtSignal(str, bool)
+    mission_command = pyqtSignal(str)
 
 
 # ──────────────────────────────────────────────
 #  ROS2 NODE
-#  This is the only ROS2 node in the GUI.
-#  It runs on a background thread (see main())
-#  and converts every incoming ROS message into
-#  a Qt signal so the UI can update safely.
 # ──────────────────────────────────────────────
 class GUINode(Node):
     def __init__(self, signals: Signals):
@@ -122,19 +112,21 @@ class GUINode(Node):
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
 
-        # Each subscription maps one ROS topic to one callback.
-        # The callback converts the message and emits a signal.
-        self.create_subscription(Image,         "/oak/rgb/image_raw", self._cb_camera,  10)
-        self.create_subscription(Image,         "/camera/image",      self._cb_camera,  10)
-        self.create_subscription(Image,         "/detections/image",  self._cb_camera,  10)
-        self.create_subscription(String,        "/robot_state",       self._cb_state,   10)
-        self.create_subscription(Pose,          "/robot/pose",        self._cb_pose,    10)
-        self.create_subscription(String,        "/detected_letter",   self._cb_letter,  10)
-        self.create_subscription(String,        "/detections/colour", self._cb_colour,  10)
-        self.create_subscription(OccupancyGrid, "/map",               self._cb_map,     map_qos)
-        self.create_subscription(LaserScan,     "/scan",              self._cb_scan,    10)
-        self.create_subscription(Path,          "/planned_path",      self._cb_path,    10)
-        self.create_subscription(String,        "/arena_status",      self._cb_arena,   10)
+        # Camera feed — raw topic for main camera panel
+        self.create_subscription(Image,         "/oak/rgb/image_raw", self._cb_camera,       10)
+        self.create_subscription(Image,         "/camera/image",      self._cb_camera,       10)
+
+        # Annotated detection image — feeds bottom-right photo panel
+        self.create_subscription(Image,         "/detections/image",  self._cb_colour_image, 10)
+
+        self.create_subscription(String,        "/robot_state",       self._cb_state,        10)
+        self.create_subscription(Pose,          "/robot/pose",        self._cb_pose,         10)
+        self.create_subscription(String,        "/detected_letter",   self._cb_letter,       10)
+        self.create_subscription(String,        "/detections/colour", self._cb_colour,       10)
+        self.create_subscription(OccupancyGrid, "/map",               self._cb_map,          map_qos)
+        self.create_subscription(LaserScan,     "/scan",              self._cb_scan,         10)
+        self.create_subscription(Path,          "/planned_path",      self._cb_path,         10)
+        self.create_subscription(String,        "/arena_status",      self._cb_arena,        10)
         self.command_pub = self.create_publisher(String, "/mission_command", 10)
 
     def publish_command(self, command: str):
@@ -142,21 +134,24 @@ class GUINode(Node):
         self.get_logger().info(f"GUI command published: {command}")
 
     def _cb_camera(self, msg):
-        # Convert raw bytes to numpy array, fix channel order if needed
         frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
             (msg.height, msg.width, -1))
         if msg.encoding != "bgr8":
-            # OAK-D publishes rgb8 by default — swap to BGR for OpenCV
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
         self.signals.camera_frame.emit(frame)
 
+    def _cb_colour_image(self, msg):
+        """Receives /detections/image (annotated BGR frame from unified detector)."""
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            (msg.height, msg.width, -1))
+        if msg.encoding != "bgr8":
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        self.signals.colour_image.emit(frame)
+
     def _cb_state(self, msg):
-        # Published by mission_manager.py at 2Hz
         self.signals.robot_state.emit(msg.data)
 
     def _cb_pose(self, msg):
-        # Published by control_node.py every odom tick
-        # Extract yaw angle from quaternion for the map arrow rotation
         q    = msg.orientation
         siny = 2.0 * (q.w * q.z + q.x * q.y)
         cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
@@ -164,30 +159,24 @@ class GUINode(Node):
         self.signals.robot_pose.emit(msg.position.x, msg.position.y, yaw)
 
     def _cb_letter(self, msg):
-        # Published by unified_detector_node.py when a greek letter is confirmed
         self.signals.letter_detected.emit(msg.data)
 
     def _cb_colour(self, msg):
-        # Published by unified_detector_node.py as a JSON string
-        # Contains label, distance, bearing, robot position, photo path
         try:
             self.signals.colour_detected.emit(json.loads(msg.data))
         except Exception:
             pass
 
     def _cb_map(self, msg):
-        # Published by slam_toolbox during mapping phase
         self.signals.map_updated.emit(msg)
 
     def _cb_scan(self, msg):
         self.signals.scan_updated.emit(msg)
 
     def _cb_path(self, msg):
-        # Published by mission_manager.py during waypoint phase
         self.signals.path_updated.emit(msg)
 
     def _cb_arena(self, msg):
-        # Published by control_node.py — contains drive state, distances etc.
         try:
             self.signals.arena_updated.emit(json.loads(msg.data))
         except Exception:
@@ -199,10 +188,6 @@ class GUINode(Node):
 # ──────────────────────────────────────────────
 
 def make_panel(title: str) -> tuple:
-    """
-    Creates a styled panel with a title bar.
-    Returns (QFrame, QVBoxLayout) — add widgets to the layout.
-    """
     frame = QFrame()
     frame.setStyleSheet(f"""
         QFrame {{
@@ -230,10 +215,6 @@ def make_panel(title: str) -> tuple:
 
 
 def status_row(grid: QGridLayout, row: int, key: str, val: str = "—", val_colour: str = TEXT):
-    """
-    Adds a key/value row to a grid layout.
-    Returns the value QLabel so it can be updated later.
-    """
     k = QLabel(key)
     k.setFont(QFont(FONT_UI, 9))
     k.setStyleSheet(f"color: {TEXT_DIM}; border: none; background: transparent;")
@@ -247,9 +228,6 @@ def status_row(grid: QGridLayout, row: int, key: str, val: str = "—", val_colo
 
 # ──────────────────────────────────────────────
 #  MAP WIDGET
-#  Draws the occupancy grid map, the robot's
-#  position as an arrow, detection markers,
-#  and the planned path as a dashed line.
 # ──────────────────────────────────────────────
 class MapWidget(QWidget):
     def __init__(self):
@@ -258,16 +236,14 @@ class MapWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet(f"background: {BG};")
 
-        # Map metadata — updated when /map is received
-        self._map_img   = None   # QImage of the occupancy grid
-        self._map_res   = 0.05   # metres per cell
-        self._map_ox    = 0.0    # map origin x (world coords)
-        self._map_oy    = 0.0    # map origin y (world coords)
-        self._map_w     = 0      # map width in cells
-        self._map_h     = 0      # map height in cells
+        self._map_img   = None
+        self._map_res   = 0.05
+        self._map_ox    = 0.0
+        self._map_oy    = 0.0
+        self._map_w     = 0
+        self._map_h     = 0
         self._last_map_time = None
 
-        # Robot pose — updated from /robot/pose
         self._robot_x   = 0.0
         self._robot_y   = 0.0
         self._robot_yaw = 0.0
@@ -275,7 +251,6 @@ class MapWidget(QWidget):
         self._arena_origin_x = None
         self._arena_origin_y = None
 
-        # 15x15m live coverage grid. The first robot pose is the centre.
         self._arena_size = 15.0
         self._arena_half = self._arena_size / 2.0
         self._coverage_res = 0.25
@@ -283,22 +258,16 @@ class MapWidget(QWidget):
         self._free_cells = np.zeros((self._coverage_n, self._coverage_n), dtype=bool)
         self._obstacle_cells = np.zeros((self._coverage_n, self._coverage_n), dtype=bool)
 
-        # Live fallback map from LaserScan, shown before /map arrives.
         self._path_trace = []
         self._scan_hits = []
         self._max_trace_points = 2000
         self._max_scan_hits = 5000
         self._scan_hit_lifetime = 10.0
 
-        # Detection markers — accumulated over the run
-        # Each entry: (world_x, world_y, label_string, colour_string)
         self._detections = []
-
-        # Planned path — list of (world_x, world_y) tuples
         self._path = []
 
     def update_map(self, msg):
-        """Convert OccupancyGrid message to a QImage for painting."""
         self._map_res = msg.info.resolution
         self._map_ox  = msg.info.origin.position.x
         self._map_oy  = msg.info.origin.position.y
@@ -308,20 +277,15 @@ class MapWidget(QWidget):
         data = np.array(msg.data, dtype=np.int8).reshape((self._map_h, self._map_w))
         img  = np.zeros((self._map_h, self._map_w, 3), dtype=np.uint8)
 
-        # OccupancyGrid cell colours:
-        # -1 unknown, 0 free, >50 occupied/non-free.
-        # Use high-contrast colours so the map reads like a grid,
-        # not a blurry lidar sweep.
         img[data == -1] = [18,  24,  31]
         img[data == 0]  = [220, 238, 225]
         img[data > 50]  = [248,  81,  73]
 
-        # ROS map origin is bottom-left, Qt is top-left — flip vertically
         img = np.flipud(img)
         h, w, _ = img.shape
         self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888)
         self._last_map_time = time.time()
-        self.update()   # trigger repaint
+        self.update()
 
     def update_pose(self, x, y, yaw):
         self._robot_x   = x
@@ -421,10 +385,6 @@ class MapWidget(QWidget):
         self.update()
 
     def _world_to_px(self, wx, wy):
-        """
-        Convert world coordinates (metres) to widget pixel coordinates.
-        Accounts for map scale and centres the map in the widget.
-        """
         if self._arena_origin_x is not None and self._arena_origin_y is not None:
             size = min(self.width(), self.height()) - 20
             size = max(10, size)
@@ -447,10 +407,7 @@ class MapWidget(QWidget):
             max_y = max(p[1] for p in points)
             span = max(max_x - min_x, max_y - min_y, 1.0)
             pad = max(1.0, span * 0.15)
-            min_x -= pad
-            max_x += pad
-            min_y -= pad
-            max_y += pad
+            min_x -= pad; max_x += pad; min_y -= pad; max_y += pad
             sx = self.width() / max(max_x - min_x, 0.1)
             sy = self.height() / max(max_y - min_y, 0.1)
             scale = min(sx, sy)
@@ -460,11 +417,8 @@ class MapWidget(QWidget):
             py = int((max_y - wy) * scale + (self.height() - used_h) / 2)
             return (px, py)
 
-        # World → grid cell
         gx    = (wx - self._map_ox) / self._map_res
-        gy    = self._map_h - (wy - self._map_oy) / self._map_res  # flip y
-
-        # Scale to fit widget while keeping aspect ratio
+        gy    = self._map_h - (wy - self._map_oy) / self._map_res
         scale = min(self.width() / self._map_w, self.height() / self._map_h)
         px = int(gx * scale + (self.width()  - self._map_w * scale) / 2)
         py = int(gy * scale + (self.height() - self._map_h * scale) / 2)
@@ -500,7 +454,6 @@ class MapWidget(QWidget):
             pos_y = int(dy + i * cell)
             painter.drawLine(dx, pos_y, dx + size, pos_y)
 
-        # Stronger metre grid lines for quick 15x15 visual debugging.
         metre_step = self._coverage_n / self._arena_size
         painter.setPen(QPen(QColor(88, 166, 255, 70), 1))
         for metre in range(16):
@@ -513,73 +466,11 @@ class MapWidget(QWidget):
         painter.drawText(dx + 8, dy + 18, "15 x 15 m LiDAR coverage grid")
 
     def paintEvent(self, event):
-        """Called by Qt whenever the widget needs to be redrawn."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(BG))
         self._draw_coverage_grid(painter)
 
-        # Draw occupancy grid map
-        if False and self._map_img:
-            scale = min(self.width() / self._map_w, self.height() / self._map_h)
-            dw    = int(self._map_w * scale)
-            dh    = int(self._map_h * scale)
-            dx    = (self.width()  - dw) // 2
-            dy    = (self.height() - dh) // 2
-            pix   = QPixmap.fromImage(self._map_img).scaled(
-                dw, dh, Qt.KeepAspectRatio, Qt.FastTransformation)
-            painter.drawPixmap(dx, dy, pix)
-
-            cell_px = scale
-            if cell_px >= 4:
-                painter.setPen(QPen(QColor(255, 255, 255, 35), 1))
-                for col in range(self._map_w + 1):
-                    x = int(dx + col * scale)
-                    painter.drawLine(x, dy, x, dy + dh)
-                for row in range(self._map_h + 1):
-                    y = int(dy + row * scale)
-                    painter.drawLine(dx, y, dx + dw, y)
-            else:
-                major = max(5, int(0.5 / max(self._map_res, 0.001)))
-                painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
-                for col in range(0, self._map_w + 1, major):
-                    x = int(dx + col * scale)
-                    painter.drawLine(x, dy, x, dy + dh)
-                for row in range(0, self._map_h + 1, major):
-                    y = int(dy + row * scale)
-                    painter.drawLine(dx, y, dx + dw, y)
-        elif False:
-            # Live scan fallback: draw accumulated lidar hits and robot path
-            # while slam_toolbox is still preparing the occupancy grid.
-            if self._scan_hits:
-                painter.setPen(QPen(QColor(200, 200, 200, 160), 2))
-                for wx, wy, _stamp in self._scan_hits[-self._max_scan_hits:]:
-                    px, py = self._world_to_px(wx, wy)
-                    painter.drawPoint(px, py)
-
-            if len(self._path_trace) >= 2:
-                painter.setPen(QPen(QColor(ACCENT), 2))
-                for i in range(len(self._path_trace) - 1):
-                    p1 = self._world_to_px(*self._path_trace[i])
-                    p2 = self._world_to_px(*self._path_trace[i + 1])
-                    painter.drawLine(*p1, *p2)
-
-            painter.setPen(QColor(TEXT_DIM))
-            painter.setFont(QFont(FONT_UI, 10))
-            label = "Live LiDAR trace — waiting for /map..."
-            painter.drawText(self.rect().adjusted(0, 14, 0, 0), Qt.AlignHCenter | Qt.AlignTop, label)
-
-        if False and self._map_img:
-            age = 0.0 if self._last_map_time is None else time.time() - self._last_map_time
-            painter.setPen(QColor(TEXT_DIM))
-            painter.setFont(QFont(FONT_UI, 10))
-            painter.drawText(
-                self.rect().adjusted(0, 14, 0, 0),
-                Qt.AlignHCenter | Qt.AlignTop,
-                f"SLAM map live  |  last update {age:.1f}s ago",
-            )
-
-        # Draw planned path as dashed line
         if len(self._path) >= 2:
             painter.setPen(QPen(QColor(ACCENT), 2, Qt.DashLine))
             for i in range(len(self._path) - 1):
@@ -587,7 +478,6 @@ class MapWidget(QWidget):
                 p2 = self._world_to_px(*self._path[i+1])
                 painter.drawLine(*p1, *p2)
 
-        # Draw detection markers as coloured dots
         for (wx, wy, label, col) in self._detections:
             px, py = self._world_to_px(wx, wy)
             colour = QColor(RED) if "red" in col else \
@@ -599,7 +489,6 @@ class MapWidget(QWidget):
             painter.setPen(QColor(TEXT))
             painter.drawText(px+8, py+4, label[:3])
 
-        # Draw robot as a single point.
         rx, ry = self._world_to_px(self._robot_x, self._robot_y)
         painter.setBrush(QBrush(QColor(ACCENT)))
         painter.setPen(QPen(QColor(TEXT), 2))
@@ -609,8 +498,6 @@ class MapWidget(QWidget):
 
 # ──────────────────────────────────────────────
 #  DETECTION LOG WIDGET
-#  A scrolling list of timestamped log entries.
-#  Each entry is colour-coded by type.
 # ──────────────────────────────────────────────
 class DetectionLog(QWidget):
     def __init__(self):
@@ -643,24 +530,17 @@ class DetectionLog(QWidget):
         lbl.setFont(QFont(FONT_UI, 9))
         lbl.setStyleSheet("background: transparent; border: none;")
         lbl.setWordWrap(True)
-        # Insert before the bottom stretch so new entries appear at the bottom
         count = self._inner_layout.count()
         self._inner_layout.insertWidget(count - 1, lbl)
-        # Auto-scroll to latest entry
         QTimer.singleShot(50, lambda: self._scroll.verticalScrollBar().setValue(
             self._scroll.verticalScrollBar().maximum()))
 
 
 # ──────────────────────────────────────────────
 #  ARENA DEBUG PANEL
-#  Shows the live arena status data published
-#  by control_node.py on /arena_status.
-#  Includes a colour-changing progress bar for
-#  edge clearance (how close the robot is to
-#  the boundary of the 15x15m area).
 # ──────────────────────────────────────────────
 class ArenaPanel(QWidget):
-    ARENA_HALF = 7.5   # half of 15m arena
+    ARENA_HALF = 7.5
 
     def __init__(self):
         super().__init__()
@@ -672,7 +552,6 @@ class ArenaPanel(QWidget):
         grid.setSpacing(4)
         grid.setColumnStretch(1, 1)
 
-        # These labels are updated every time /arena_status is received
         self._lbl_state  = status_row(grid, 0, "Drive state",    "—",      ACCENT)
         self._lbl_pos    = status_row(grid, 1, "Position",       "(—, —)", TEXT)
         self._lbl_home   = status_row(grid, 2, "Dist from home", "— m",    TEXT)
@@ -686,8 +565,6 @@ class ArenaPanel(QWidget):
         bar_label.setStyleSheet(f"color: {TEXT_DIM}; border: none; background: transparent;")
         layout.addWidget(bar_label)
 
-        # Progress bar: full = at centre, empty = at boundary
-        # Colour changes green → yellow → red as robot approaches boundary
         self._edge_bar = QProgressBar()
         self._edge_bar.setRange(0, 100)
         self._edge_bar.setValue(100)
@@ -710,7 +587,6 @@ class ArenaPanel(QWidget):
         """)
 
     def update(self, data: dict):
-        """Called every time a new /arena_status message arrives."""
         state  = data.get('state', '—')
         rel_x  = data.get('rel_x', 0.0)
         rel_y  = data.get('rel_y', 0.0)
@@ -719,7 +595,6 @@ class ArenaPanel(QWidget):
         yaw    = data.get('yaw', 0.0)
         source = data.get('pose_source', '—')
 
-        # Colour-code the drive state label
         state_colours = {
             'WANDERING_DRIVE':       GREEN,
             'WANDERING_TURN':        ACCENT,
@@ -743,7 +618,6 @@ class ArenaPanel(QWidget):
         self._lbl_yaw.setText(f"{yaw:.1f}°")
         self._lbl_source.setText(source)
 
-        # Update progress bar — green when safe, yellow when close, red when critical
         pct = min(100, int(edge / self.ARENA_HALF * 100))
         self._edge_bar.setValue(pct)
         if pct > 50:
@@ -756,10 +630,6 @@ class ArenaPanel(QWidget):
 
 # ──────────────────────────────────────────────
 #  MAIN WINDOW
-#  Layout:
-#    LEFT   — camera feed, robot status, arena debug
-#    MIDDLE — map
-#    RIGHT  — detection log, last photo
 # ──────────────────────────────────────────────
 class RobotGUI(QMainWindow):
     def __init__(self, signals: Signals):
@@ -788,7 +658,6 @@ class RobotGUI(QMainWindow):
         header.addWidget(title)
         header.addStretch()
 
-        # State badge — updates colour based on robot state
         self._state_badge = QLabel("IDLE")
         self._state_badge.setFont(QFont(FONT_UI, 11, QFont.Bold))
         self._state_badge.setAlignment(Qt.AlignCenter)
@@ -805,7 +674,6 @@ class RobotGUI(QMainWindow):
         left = QVBoxLayout()
         left.setSpacing(10)
 
-        # Camera feed — from /oak/rgb/image_raw via unified_detector
         cam_frame, cam_layout = make_panel("Camera Feed")
         self._cam_label = QLabel()
         self._cam_label.setAlignment(Qt.AlignCenter)
@@ -816,7 +684,6 @@ class RobotGUI(QMainWindow):
         cam_layout.addWidget(self._cam_label)
         left.addWidget(cam_frame, 3)
 
-        # Robot status — position/heading from control_node, state from mission_manager
         status_frame, status_layout = make_panel("Robot Status")
         sg = QGridLayout()
         sg.setSpacing(6)
@@ -832,7 +699,6 @@ class RobotGUI(QMainWindow):
         status_layout.addLayout(sg)
         left.addWidget(status_frame, 1)
 
-        # Arena debug — from control_node /arena_status
         arena_frame, arena_layout = make_panel("Arena Debug")
         self._arena_panel = ArenaPanel()
         arena_layout.addWidget(self._arena_panel)
@@ -840,7 +706,7 @@ class RobotGUI(QMainWindow):
 
         content.addLayout(left, 5)
 
-        # MIDDLE COLUMN — map from slam_toolbox /map
+        # MIDDLE COLUMN
         map_frame, map_layout = make_panel("Map")
         self._map_widget = MapWidget()
         map_layout.addWidget(self._map_widget)
@@ -914,20 +780,19 @@ class RobotGUI(QMainWindow):
         right = QVBoxLayout()
         right.setSpacing(10)
 
-        # Detection log — entries from /detected_letter and /detections/colour
         log_frame, log_layout = make_panel("Detection Log")
         self._det_log = DetectionLog()
         self._det_log.setMinimumHeight(200)
         log_layout.addWidget(self._det_log)
         right.addWidget(log_frame, 3)
 
-        # Last photo — saved by unified_detector_node to ~/part3_logs/
-        photo_frame, photo_layout = make_panel("Last Detection Photo")
+        # Bottom-right panel — live feed from /detections/image
+        photo_frame, photo_layout = make_panel("Last Detection  ( /detections/image )")
         self._photo_label = QLabel()
         self._photo_label.setAlignment(Qt.AlignCenter)
         self._photo_label.setMinimumHeight(160)
         self._photo_label.setStyleSheet("background: #000; border: none;")
-        self._photo_label.setText("No photo yet")
+        self._photo_label.setText("Waiting for detection...")
         photo_layout.addWidget(self._photo_label)
         right.addWidget(photo_frame, 2)
 
@@ -947,7 +812,6 @@ class RobotGUI(QMainWindow):
         bottom.addWidget(self._clock_label)
         root.addLayout(bottom)
 
-        # Clock updates every second
         self._clock_timer = QTimer()
         self._clock_timer.timeout.connect(self._tick_clock)
         self._clock_timer.start(1000)
@@ -958,8 +822,8 @@ class RobotGUI(QMainWindow):
                 f"border: 1px solid {colour}; border-radius: 6px; padding: 2px 14px;")
 
     def _connect_signals(self):
-        """Wire each signal from GUINode to its handler slot."""
         self.signals.camera_frame.connect(self._on_camera)
+        self.signals.colour_image.connect(self._on_colour_image)   # /detections/image → photo panel
         self.signals.robot_state.connect(self._on_state)
         self.signals.robot_pose.connect(self._on_pose)
         self.signals.letter_detected.connect(self._on_letter)
@@ -975,10 +839,9 @@ class RobotGUI(QMainWindow):
         self._save_map_btn.clicked.connect(self._save_map)
 
     # ── Slot handlers ────────────────────────────
-    # These run on the Qt main thread, safe to update UI
 
     def _on_camera(self, frame: np.ndarray):
-        """Display latest camera frame in the camera panel."""
+        """Main camera panel — raw feed from /oak/rgb/image_raw."""
         rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.tobytes(), w, h, ch*w, QImage.Format_RGB888)
@@ -987,8 +850,17 @@ class RobotGUI(QMainWindow):
             Qt.KeepAspectRatio, Qt.SmoothTransformation)
         self._cam_label.setPixmap(pix)
 
+    def _on_colour_image(self, frame: np.ndarray):
+        """Bottom-right panel — annotated frame from /detections/image."""
+        rgb  = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QImage(rgb.tobytes(), w, h, ch*w, QImage.Format_RGB888)
+        pix  = QPixmap.fromImage(qimg).scaled(
+            self._photo_label.width(), self._photo_label.height(),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self._photo_label.setPixmap(pix)
+
     def _on_state(self, state: str):
-        """Update state badge colour and action description."""
         self._status_labels["State"].setText(state)
         self._state_badge.setText(state)
 
@@ -1021,45 +893,28 @@ class RobotGUI(QMainWindow):
         self._det_log.add_entry(f"State → {state}", colour)
 
     def _on_pose(self, x: float, y: float, yaw: float):
-        """Update position display and move robot point on map."""
         self._status_labels["Pos X"].setText(f"{x:.2f} m")
         self._status_labels["Pos Y"].setText(f"{y:.2f} m")
         self._map_widget.update_pose(x, y, yaw)
 
     def _on_letter(self, name: str):
-        """Log a detected greek letter."""
         self._status_labels["Last Letter"].setText(name)
         self._det_log.add_entry(f"Greek letter detected: {name}", GREEN)
 
     def _on_colour(self, data: dict):
-        """Log a colour detection, place marker on map, show photo."""
-        label      = data.get("label", "unknown")
-        dist       = data.get("distance_m", 0.0)
-        bearing    = data.get("bearing_deg", 0.0)
-        rx         = data.get("robot_x", 0.0)
-        ry         = data.get("robot_y", 0.0)
-        photo_path = data.get("photo_path", "")
+        label   = data.get("label", "unknown")
+        dist    = data.get("distance_m", 0.0)
+        bearing = data.get("bearing_deg", 0.0)
+        rx      = data.get("robot_x", 0.0)
+        ry      = data.get("robot_y", 0.0)
 
         colour = RED if "red" in label else YELLOW
         self._det_log.add_entry(
             f"{label}  dist={dist:.2f}m  bearing={bearing:.1f}°", colour)
 
-        # Estimate world position of detected object from robot pose + bearing
         wx = rx + dist * math.cos(math.radians(bearing))
         wy = ry + dist * math.sin(math.radians(bearing))
         self._map_widget.add_detection(wx, wy, label, label)
-
-        # Load and display photo if the detector saved one
-        if photo_path:
-            img = cv2.imread(photo_path)
-            if img is not None:
-                rgb  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                h, w, ch = rgb.shape
-                qimg = QImage(rgb.tobytes(), w, h, ch*w, QImage.Format_RGB888)
-                pix  = QPixmap.fromImage(qimg).scaled(
-                    self._photo_label.width(), self._photo_label.height(),
-                    Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self._photo_label.setPixmap(pix)
 
     def _on_map(self, msg):
         self._latest_map_msg = msg
@@ -1124,7 +979,7 @@ class RobotGUI(QMainWindow):
         img = np.flipud(img)
 
         image_path = f"{prefix}.png"
-        yaml_path = f"{prefix}.yaml"
+        yaml_path  = f"{prefix}.yaml"
         obstacle_waypoints_path = f"{prefix}_obstacle_waypoints.txt"
         latest_obstacle_waypoints_path = os.path.join(out_dir, "latest_obstacle_waypoints.txt")
         if not cv2.imwrite(image_path, img):
@@ -1256,9 +1111,6 @@ class RobotGUI(QMainWindow):
 
 # ──────────────────────────────────────────────
 #  ENTRY POINT
-#  ROS2 runs on a background daemon thread.
-#  Qt must run on the main thread.
-#  Signals safely bridge data between them.
 # ──────────────────────────────────────────────
 def main():
     rclpy.init()
@@ -1266,12 +1118,10 @@ def main():
     node    = GUINode(signals)
     signals.mission_command.connect(node.publish_command)
 
-    # Spin ROS2 in background — this processes all incoming messages
     ros_thread = threading.Thread(
         target=rclpy.spin, args=(node,), daemon=True)
     ros_thread.start()
 
-    # Qt takes over the main thread
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     win = RobotGUI(signals)
