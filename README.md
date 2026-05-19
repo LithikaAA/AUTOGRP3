@@ -131,6 +131,13 @@ ros2 launch sick_scan_xd sick_tim_7xx.launch.py hostname:=192.168.0.1
 - `/scan` should begin publishing
 - If package missing, add it to Dockerfile and rebuild
 
+Starting camera
+```
+source /opt/ros/jazzy/setup.bash
+ros2 launch depthai_ros_driver camera.launch.py
+```
+Wait till it prints "camera ready"
+
 3. **Verify all required topics exist**
 
 The controller will not run unless the required data streams are alive.
@@ -154,6 +161,13 @@ Confirm the robot is receiving commands.
 `ros2 topic echo /cmd_vel`
 - Values should change as the robot moves
 - If always zero, check LIDAR, camera, odom, and deadman
+
+To see detecion results
+`ros2 topic echo /detected_letter `        # letters 
+`ros2 topic echo /detections/colour `     # colour JSON
+
+
+
 
 6. **Confirm movement**
 If `/cmd_vel` is non-zero, ARIA will drive the robot.
