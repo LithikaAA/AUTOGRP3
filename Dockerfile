@@ -12,12 +12,8 @@ RUN apt-get update && apt-get install -y \
     cmake \
     iputils-ping \
     net-tools \
-    xauth \
-    x11-apps \
     python3-pip \
     python3-opencv \
-    python3-pyqt5 \
-    python3-numpy \
     doxygen \
     python3-colcon-common-extensions \
     ros-jazzy-ros-base \
@@ -37,17 +33,16 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-nmea-navsat-driver \
     ros-jazzy-teleop-twist-keyboard \
     ros-jazzy-cv-bridge \
-    ros-jazzy-ros-gz-bridge \
-    ros-jazzy-ros-gz-sim \
-    ros-jazzy-ros-gz-interfaces \
+    # lidar
     ros-jazzy-sick-scan-xd \
     ros-jazzy-diagnostic-updater \
+    ros-jazzy-depthai-ros \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python packages
-RUN pip install --break-system-packages \
-    depthai \
-    onnxruntime
+RUN pip install depthai --break-system-packages
+# Install Python packages
+RUN pip install depthai onnxruntime --break-system-packages
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
@@ -61,9 +56,6 @@ RUN git clone https://github.com/reedhedges/AriaCoda.git /opt/AriaCoda && \
     make install
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
-ENV QT_X11_NO_MITSHM=1
-ENV PIONEER_MAP_DIR=/ros2_ws/maps
-ENV ROS_DOMAIN_ID=8
 
 # Copy your project
 COPY ros2_ws/src /ros2_ws/src
