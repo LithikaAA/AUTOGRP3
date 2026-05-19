@@ -16,9 +16,11 @@ services:
       - /dev:/dev
       - ./ros2_ws/maps:/ros2_ws/maps
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      - ${XAUTHORITY:-/home/team3/.Xauthority}:/root/.Xauthority:ro
     environment:
       - ROS_DOMAIN_ID=${ROS_DOMAIN_ID:-8}
       - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/root/.Xauthority
       - QT_X11_NO_MITSHM=1
       - PIONEER_MAP_DIR=/ros2_ws/maps
     command: /bin/bash

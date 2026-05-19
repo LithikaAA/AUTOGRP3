@@ -35,6 +35,7 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-cv-bridge \
     # lidar
     ros-jazzy-sick-scan-xd \
+    ros-jazzy-depthai-ros \
     ros-jazzy-diagnostic-updater \
     ros-jazzy-depthai-ros \
     && rm -rf /var/lib/apt/lists/*
