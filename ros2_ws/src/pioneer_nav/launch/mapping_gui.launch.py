@@ -15,6 +15,8 @@ def generate_launch_description():
 
     use_sim_time = LaunchConfiguration('use_sim_time')
     scan_frame = LaunchConfiguration('scan_frame')
+    aria = LaunchConfiguration('aria')
+    aria_port = LaunchConfiguration('aria_port')
     control = LaunchConfiguration('control')
     gui = LaunchConfiguration('gui')
     estop = LaunchConfiguration('estop')
@@ -52,6 +54,8 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
         DeclareLaunchArgument('scan_frame', default_value='sick_laser'),
+        DeclareLaunchArgument('aria', default_value='false'),
+        DeclareLaunchArgument('aria_port', default_value='/dev/ttyUSB0'),
         DeclareLaunchArgument('control', default_value='true'),
         DeclareLaunchArgument('gui', default_value='true'),
         DeclareLaunchArgument('estop', default_value='true'),
@@ -68,6 +72,14 @@ def generate_launch_description():
         DeclareLaunchArgument('waypoint_obstacle_turn_speed', default_value='0.45'),
         DeclareLaunchArgument('slam_start_delay', default_value='8.0'),
         DeclareLaunchArgument('odom_tf_stamp_with_current_time', default_value='true'),
+        Node(
+            package='ariaNode',
+            executable='ariaNode',
+            name='aria_node',
+            output='screen',
+            condition=IfCondition(aria),
+            arguments=['-rp', aria_port],
+        ),
         slam_launch,
         Node(
             package='pioneer_nav',
