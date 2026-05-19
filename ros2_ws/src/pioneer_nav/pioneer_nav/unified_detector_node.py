@@ -24,21 +24,24 @@ Both letters and colour objects use the same rule:
   - Must be detected continuously for `confident_duration_s` (default 2.0 s)
   - On crossing that threshold, depth is sampled from /oak/stereo/image_raw at
     the centre of the bounding box to get distance in metres
-  - A record is appended to ~/part3_logs/detections_log.jsonl:
-      type, name, confidence, distance_m, bearing_deg,
-      object_x, object_y  (world-frame estimate),
-      robot_x, robot_y, robot_yaw_deg, timestamp
+  - A record is appended to ~/part3_logs/detections_log.jsonl
   - Once logged, won't log again until the object disappears and reappears
-  - Photos saved to ~/part3_logs/colour_detections/ for colour detections
+  - Re-logs if object reappears closer — final log holds best observation
 
-HSV tuning notes
+Low-light tuning
 ----------------
-Red:   tightened saturation min to 150 and value min to 100 to reject skin tones
-       (skin is low-saturation red, typically S < 100)
-Yellow: raised saturation min to 150 and value min to 120, narrowed hue to 22-32
-       to reject gold/tan (gold has lower saturation and sits around hue 20-25
-       but with S ~80-120 — raising S floor to 150 pushes it out)
-Both:  min_colour_area raised to 3000 px to ignore small stray blobs
+If running in lower light conditions, drop these parameters:
+  -p brightness_threshold:=100      lower = finds less-bright paper
+  -p min_paper_brightness:=100      lower = accepts dimmer paper regions
+  -p min_dark_ratio:=0.01           lower = accepts fewer dark pixels (faint letters)
+
+Full launch example:
+  python3 unified_detector_node.py \
+    --ros-args \
+    -p brightness_threshold:=100 \
+    -p min_paper_brightness:=100 \
+    -p min_dark_ratio:=0.01 \
+    -p confident_duration_s:=2.0
 """
 
 import json
@@ -56,20 +59,13 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 # ── HSV colour ranges ────────────────────────────────────────────────────────
-# Red wraps around 0/180 in HSV.
-# Tightened: S >= 150, V >= 100  →  rejects skin (low S) and dark reds
 RED_LOWER_1  = np.array([  0, 150, 100], dtype=np.uint8)
 RED_UPPER_1  = np.array([ 10, 255, 255], dtype=np.uint8)
 RED_LOWER_2  = np.array([168, 150, 100], dtype=np.uint8)
 RED_UPPER_2  = np.array([179, 255, 255], dtype=np.uint8)
-
-# Yellow: narrowed hue to 22–32, S >= 150, V >= 150
-# Gold/tan sits at hue ~20-25 but with S 80-130 → pushed out by S floor
-# Bright safety-yellow obstacles have S > 180, V > 180 → well inside range
 YELLOW_LOWER = np.array([ 22, 150, 150], dtype=np.uint8)
 YELLOW_UPPER = np.array([ 32, 255, 255], dtype=np.uint8)
 
-# OAK-D horizontal field of view
 HFOV_RAD = math.radians(71.0)
 
 
@@ -81,11 +77,6 @@ def yaw_from_quaternion(q) -> float:
 
 def depth_at_point(depth_image: np.ndarray, cx: int, cy: int,
                    patch: int = 5) -> float | None:
-    """
-    Sample depth from a 16UC1 image (millimetres) at (cx, cy).
-    Uses the median of a small patch to avoid noisy single-pixel reads.
-    Returns metres, or None if the value is zero/invalid.
-    """
     h, w    = depth_image.shape
     x0, x1  = max(0, cx - patch), min(w, cx + patch)
     y0, y1  = max(0, cy - patch), min(h, cy + patch)
@@ -93,19 +84,16 @@ def depth_at_point(depth_image: np.ndarray, cx: int, cy: int,
     valid   = region[region > 0]
     if valid.size == 0:
         return None
-    return float(np.median(valid)) / 1000.0   # mm → m
+    return float(np.median(valid)) / 1000.0
 
 
-def world_position(robot_x: float, robot_y: float, robot_yaw: float,
-                   distance_m: float, bearing_rad: float):
+def world_position(robot_x, robot_y, robot_yaw, distance_m, bearing_rad):
     angle = robot_yaw + bearing_rad
     return (round(robot_x + distance_m * math.cos(angle), 3),
             round(robot_y + distance_m * math.sin(angle), 3))
 
 
 class DetectionTracker:
-    """Tracks how long a single label has been seen continuously."""
-
     def __init__(self):
         self.first_seen: float = 0.0
         self.logged:     bool  = False
@@ -131,7 +119,10 @@ class UnifiedDetectorNode(Node):
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter("topic",                  "/oak/rgb/image_raw")
         self.declare_parameter("depth_topic",            "/oak/stereo/image_raw")
-        self.declare_parameter("brightness_threshold",   170)
+        self.declare_parameter("brightness_threshold",   170)   # Canny/threshold gate
+        self.declare_parameter("min_paper_brightness",   150)   # mean brightness of region
+        self.declare_parameter("min_dark_ratio",         0.02)  # min fraction of dark px
+        self.declare_parameter("max_dark_ratio",         0.5)   # max fraction of dark px
         self.declare_parameter("confidence_threshold",   0.5)
         self.declare_parameter("process_every_n_frames", 3)
         self.declare_parameter("confirmations_required", 3)
@@ -140,16 +131,26 @@ class UnifiedDetectorNode(Node):
         self.declare_parameter("confident_duration_s",   2.0)
         self.declare_parameter("photo_cooldown_s",       5.0)
 
-        topic                = self.get_parameter("topic").value
-        depth_topic          = self.get_parameter("depth_topic").value
-        self.bright_thresh   = self.get_parameter("brightness_threshold").value
-        self.conf_thresh     = self.get_parameter("confidence_threshold").value
-        self.process_every   = int(self.get_parameter("process_every_n_frames").value)
-        self.confirms_req    = int(self.get_parameter("confirmations_required").value)
-        self.min_colour_area = float(self.get_parameter("min_colour_area").value)
-        self.require_mapping = bool(self.get_parameter("require_mapping_state").value)
-        self.confident_dur   = float(self.get_parameter("confident_duration_s").value)
-        self.photo_cooldown  = float(self.get_parameter("photo_cooldown_s").value)
+        topic                  = self.get_parameter("topic").value
+        depth_topic            = self.get_parameter("depth_topic").value
+        self.bright_thresh     = self.get_parameter("brightness_threshold").value
+        self.min_paper_bright  = self.get_parameter("min_paper_brightness").value
+        self.min_dark_ratio    = self.get_parameter("min_dark_ratio").value
+        self.max_dark_ratio    = self.get_parameter("max_dark_ratio").value
+        self.conf_thresh       = self.get_parameter("confidence_threshold").value
+        self.process_every     = int(self.get_parameter("process_every_n_frames").value)
+        self.confirms_req      = int(self.get_parameter("confirmations_required").value)
+        self.min_colour_area   = float(self.get_parameter("min_colour_area").value)
+        self.require_mapping   = bool(self.get_parameter("require_mapping_state").value)
+        self.confident_dur     = float(self.get_parameter("confident_duration_s").value)
+        self.photo_cooldown    = float(self.get_parameter("photo_cooldown_s").value)
+
+        self.get_logger().info(
+            f"Paper detection thresholds: "
+            f"brightness>={self.bright_thresh}  "
+            f"mean>={self.min_paper_bright}  "
+            f"dark_ratio={self.min_dark_ratio:.3f}–{self.max_dark_ratio:.2f}"
+        )
 
         # ── ONNX model ────────────────────────────────────────────────────────
         model_path = os.path.join(os.path.dirname(__file__), "greek_classifier.onnx")
@@ -170,19 +171,16 @@ class UnifiedDetectorNode(Node):
         self.frame_count    = 0
         self.depth_image: np.ndarray | None = None
 
-        # Odometry
         self.robot_x   = 0.0
         self.robot_y   = 0.0
         self.robot_yaw = 0.0
 
-        # Letter tracking
         self.letter_last_label  : str | None = None
         self.letter_frame_count : int        = 0
         self.letter_cx          : int        = 0
         self.letter_cy          : int        = 0
         self.letter_tracker = DetectionTracker()
 
-        # Colour tracking
         self.colour_trackers: dict[str, DetectionTracker] = {
             "red_obstacle":    DetectionTracker(),
             "yellow_obstacle": DetectionTracker(),
@@ -217,9 +215,6 @@ class UnifiedDetectorNode(Node):
     # ── ROS callbacks ────────────────────────────────────────────────────────
 
     def state_callback(self, msg: String):
-        if not self.require_mapping:
-            self.active = True
-            return
         self.active = (msg.data == "MAPPING")
 
     def odom_callback(self, msg: Odometry):
@@ -250,15 +245,13 @@ class UnifiedDetectorNode(Node):
         self._publish_image(bgr, msg)
         cv2.imwrite("/tmp/unified_detection.png", bgr)
 
-    # ── Shared depth sample ───────────────────────────────────────────────────
+    # ── Shared helpers ────────────────────────────────────────────────────────
 
     def _get_depth(self, cx: int, cy: int) -> float | None:
         if self.depth_image is None:
             return None
         d = depth_at_point(self.depth_image, cx, cy)
         return d if (d is not None and d > 0.05) else None
-
-    # ── Shared log helper ─────────────────────────────────────────────────────
 
     def _log_detection(self, kind: str, name: str, confidence: float,
                        cx: int, cy: int, img_width: int):
@@ -296,8 +289,6 @@ class UnifiedDetectorNode(Node):
             f"robot=({self.robot_x:.2f},{self.robot_y:.2f})  "
             f"obj=({obj_x},{obj_y})"
         )
-
-    # ── Overlay helper — shows depth if available, else '?' ──────────────────
 
     def _depth_label(self, cx: int, cy: int) -> str:
         d = self._get_depth(cx, cy)
@@ -431,7 +422,7 @@ class UnifiedDetectorNode(Node):
         out.data         = bgr.tobytes()
         self.image_pub.publish(out)
 
-    # ── Letter helpers (identical to working version) ─────────────────────────
+    # ── Letter helpers ────────────────────────────────────────────────────────
 
     def find_sign_region(self, gray: np.ndarray):
         h, w   = gray.shape
@@ -460,11 +451,16 @@ class UnifiedDetectorNode(Node):
             if not (0.3 < aspect < 2.5):
                 continue
             region = gray[y:y + ch, x:x + cw]
-            if region.mean() < 150:
+
+            # ── Low-light tunable checks ──────────────────────────────────
+            if region.mean() < self.min_paper_bright:
                 continue
+
             dark_ratio = np.sum(region < 100) / region.size
-            if not (0.02 <= dark_ratio <= 0.5):
+            if not (self.min_dark_ratio <= dark_ratio <= self.max_dark_ratio):
                 continue
+            # ─────────────────────────────────────────────────────────────
+
             cx_r  = x + cw // 2
             cy_r  = y + ch // 2
             dist  = math.hypot(cx_r - img_cx, cy_r - img_cy)
