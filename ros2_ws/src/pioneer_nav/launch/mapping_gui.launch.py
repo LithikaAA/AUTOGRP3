@@ -99,7 +99,7 @@ def generate_launch_description():
                 {'mission_command_topic': '/mission_command'},
                 {'publish_gui_topics': True},
                 {'external_manual_control': True},
-                {'forward_speed': 0.15},
+                {'forward_speed': 0.50},
                 {'reverse_speed': -0.12},
                 {'turn_speed_deg': 20.0},
                 {'return_to_center_speed': 0.12},
