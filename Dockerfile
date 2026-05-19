@@ -5,46 +5,6 @@ FROM ros:jazzy-ros-core
 RUN echo 'Acquire::ForceIPv4 "true";' > /etc/apt/apt.conf.d/99force-ipv4
 
 # Basic tools + ROS Jazzy packages
-<<<<<<< HEAD
-RUN apt-get update && apt-get install -y \
-    locales \
-    git \
-    build-essential \
-    cmake \
-    iputils-ping \
-    net-tools \
-    python3-pip \
-    python3-opencv \
-    doxygen \
-    python3-colcon-common-extensions \
-    ros-jazzy-ros-base \
-    ros-jazzy-rviz2 \
-    ros-jazzy-robot-state-publisher \
-    ros-jazzy-tf2-ros \
-    ros-jazzy-tf2-tools \
-    ros-jazzy-tf2-msgs \
-    ros-jazzy-nav-msgs \
-    ros-jazzy-sensor-msgs \
-    ros-jazzy-geometry-msgs \
-    ros-jazzy-slam-toolbox \
-    ros-jazzy-nav2-map-server \
-    ros-jazzy-nav2-lifecycle-manager \
-    ros-jazzy-joy \
-    ros-jazzy-teleop-twist-joy \
-    ros-jazzy-nmea-navsat-driver \
-    ros-jazzy-teleop-twist-keyboard \
-    ros-jazzy-cv-bridge \
-    # lidar
-    ros-jazzy-sick-scan-xd \
-    ros-jazzy-diagnostic-updater \
-    ros-jazzy-depthai-ros \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install Python packages
-RUN pip install depthai --break-system-packages
-# Install Python packages
-RUN pip install depthai onnxruntime --break-system-packages
-=======
 RUN apt-get update && apt-get install -y \
     locales \
     git \
@@ -88,7 +48,6 @@ RUN apt-get update && apt-get install -y \
 RUN pip install --break-system-packages \
     depthai \
     onnxruntime
->>>>>>> d3eb9d3 (Update Docker configuration and mapping launch)
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
