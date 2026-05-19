@@ -274,13 +274,30 @@ python3 ros2_ws/src/pioneer_nav/scripts/map_to_binary.py \
 2.  Start up aria node as normal
 3.  Start up LiDAR
 4.  To run the GUI (gooooooeeeeeyyy)
+Normal daylight launch
 ```
-    ros2 launch pioneer_nav mapping_gui.launch.py \
-    use_sim_time:=false \
-    scan_frame:=sick_laser \
-    gui:=true \
-    estop:=true
+  ros2 launch pioneer_nav mapping_gui.launch.py \
+  use_sim_time:=false \
+  scan_frame:=sick_laser \
+  gui:=true \
+  estop:=true
 ```
+thats: brightness_threshold:=170
+min_paper_brightness:=150 
+min_dark_ratio:=0.02
+
+Lowlight launch
+```ros2 launch pioneer_nav mapping_gui.launch.py \
+  use_sim_time:=false \
+  scan_frame:=sick_laser \
+  gui:=true \
+  estop:=true \
+  brightness_threshold:=110 \
+  min_paper_brightness:=110 \
+  min_dark_ratio:=0.01
+```
+
+
 6.  Potential issues:
 SLAM: potentially need to kill other sessions and make sure \map topic is up
 kill sessions:
