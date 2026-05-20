@@ -22,8 +22,9 @@ BOUNDARY_BUFFER = 1.0
 MAP_SIZE = 15.0
 MAP_HALF_SIZE = MAP_SIZE / 2
 MAP_CENTER = (0.0, 0.0)
-
 OBSTACLE_BUFFER = 0.6
+MAX_LIDAR_RANGE = 16.0 # fix?
+OBSTACLE_PERSIST_REQUIRED = 5  # consecutive scans before triggering avoidance
 EMERGENCY_STOP_DISTANCE = 0.3
 LIDAR_FRONT_ANGLE_FOV = math.radians(60)
 LIDAR_SIDE_ANGLE_FOV = math.radians(30)
@@ -203,6 +204,7 @@ class ControlNode(Node):
         self.front_min_distance = float('inf')
         self.left_min_distance = float('inf')
         self.right_min_distance = float('inf')
+        self.front_obstacle_hits = 0 # "persistance"
 
         self.mutex = threading.Lock()
         self.create_timer(0.1, self.control_loop)
@@ -381,17 +383,22 @@ class ControlNode(Node):
             half_front_idx = int((LIDAR_FRONT_ANGLE_FOV / 2) / angle_inc)
 
             front_indices = [i % n for i in range(center_idx - half_front_idx, center_idx + half_front_idx + 1)]
-            self.front_min_distance = min([ranges[i] for i in front_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            self.front_min_distance = min([ranges[i] for i in front_indices if not math.isinf(ranges[i]) and 0.1 < ranges[i] < MAX_LIDAR_RANGE] or [float('inf')])
 
+            if self.front_min_distance < OBSTACLE_BUFFER:
+                self.front_obstacle_hits += 1
+            else:
+                self.front_obstacle_hits = 0
+            
             left_start_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
             left_end_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2 + LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
             left_indices = [i % n for i in range(left_start_idx, left_end_idx + 1)]
-            self.left_min_distance = min([ranges[i] for i in left_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            self.left_min_distance = min([ranges[i] for i in left_indices if not math.isinf(ranges[i]) and 0.1 < ranges[i] < MAX_LIDAR_RANGE] or [float('inf')])
 
             right_start_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
             right_end_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2 - LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
             right_indices = [i % n for i in range(right_start_idx, right_end_idx + 1)]
-            self.right_min_distance = min([ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            self.right_min_distance = min([ranges[i] for i in right_indices if not math.isinf(ranges[i]) and 0.1 < ranges[i] < MAX_LIDAR_RANGE] or [float('inf')])
 
     def odom_cb(self, msg: Odometry):
         with self.mutex:
@@ -582,7 +589,7 @@ class ControlNode(Node):
                 self.reverse_start_time = time.time()
                 return
 
-            if self.front_min_distance < OBSTACLE_BUFFER and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
+            if self.front_obstacle_hits >= OBSTACLE_PERSIST_REQUIRED and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
                 self.get_logger().info(f'Obstacle detected in front (LIDAR) at {self.front_min_distance:.2f}m. Initiating avoidance.')
                 self.auto_state = AUTO_STATE.OBSTACLE_REVERSE
                 self.obstacle_maneuver_start_time = time.time()
@@ -798,7 +805,7 @@ class ControlNode(Node):
             self.publish_robot_state()
             return
 
-        if self.front_min_distance < OBSTACLE_BUFFER:
+        if self.front_obstacle_hits >= OBSTACLE_PERSIST_REQUIRED:
             self.handle_return_obstacle_avoidance()
             return
 
