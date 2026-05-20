@@ -1,6 +1,47 @@
+from pathlib import Path
+import os
+
 from setuptools import find_packages, setup
 
 package_name = 'pioneer_nav'
+here = Path(__file__).resolve().parent
+workspace_root = here.parents[1]
+repo_root = here.parents[2]
+
+
+def first_existing(*paths):
+    for path in paths:
+        if path.exists():
+            return path
+    return paths[0]
+
+
+def rel(path):
+    return os.path.relpath(path, here)
+
+
+robots_dir = first_existing(workspace_root / 'robots', repo_root / 'robots')
+world_file = first_existing(workspace_root / 'basic_urdf.sdf', repo_root / 'ros2_ws' / 'basic_urdf.sdf')
+
+asset_data_files = []
+if (robots_dir / 'pioneer.urdf').exists():
+    asset_data_files.append(
+        ('share/' + package_name + '/robots', [rel(robots_dir / 'pioneer.urdf')])
+    )
+    meshes_dir = robots_dir / 'meshes'
+    if meshes_dir.exists():
+        mesh_groups = {}
+        for mesh_path in meshes_dir.rglob('*'):
+            if mesh_path.is_file():
+                rel_dir = mesh_path.parent.relative_to(meshes_dir)
+                dest = Path('share') / package_name / 'robots' / 'meshes' / rel_dir
+                mesh_groups.setdefault(str(dest), []).append(rel(mesh_path))
+        asset_data_files.extend((dest, files) for dest, files in mesh_groups.items())
+
+if world_file.exists():
+    asset_data_files.append(
+        ('share/' + package_name + '/worlds', [rel(world_file)])
+    )
 
 setup(
     name=package_name,
@@ -29,7 +70,7 @@ setup(
             'config/slam_toolbox_mapping.yaml',
             'config/slam_mapping.rviz',
         ]),
-    ],
+    ] + asset_data_files,
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='lilac',

@@ -29,6 +29,19 @@ def generate_launch_description():
     waypoint_goal_tolerance = LaunchConfiguration('waypoint_goal_tolerance')
     waypoint_linear_speed = LaunchConfiguration('waypoint_linear_speed')
     waypoint_slow_linear_speed = LaunchConfiguration('waypoint_slow_linear_speed')
+    coverage_area_size_m = LaunchConfiguration('coverage_area_size_m')
+    coverage_boundary_margin_m = LaunchConfiguration('coverage_boundary_margin_m')
+    coverage_sweep_spacing_m = LaunchConfiguration('coverage_sweep_spacing_m')
+    coverage_pattern = LaunchConfiguration('coverage_pattern')
+    coverage_scan_spin_s = LaunchConfiguration('coverage_scan_spin_s')
+    coverage_scan_turn_speed = LaunchConfiguration('coverage_scan_turn_speed')
+    coverage_adaptive_viewpoints = LaunchConfiguration('coverage_adaptive_viewpoints')
+    coverage_occlusion_probe_offset_m = LaunchConfiguration('coverage_occlusion_probe_offset_m')
+    coverage_max_adaptive_viewpoints = LaunchConfiguration('coverage_max_adaptive_viewpoints')
+    coverage_initial_arc_scan_s = LaunchConfiguration('coverage_initial_arc_scan_s')
+    coverage_initial_arc_linear_speed = LaunchConfiguration('coverage_initial_arc_linear_speed')
+    coverage_initial_arc_turn_speed = LaunchConfiguration('coverage_initial_arc_turn_speed')
+    enable_waypoint_obstacle_avoidance = LaunchConfiguration('enable_waypoint_obstacle_avoidance')
     waypoint_obstacle_linear_speed = LaunchConfiguration('waypoint_obstacle_linear_speed')
     waypoint_obstacle_turn_speed = LaunchConfiguration('waypoint_obstacle_turn_speed')
     slam_start_delay = LaunchConfiguration('slam_start_delay')
@@ -74,6 +87,19 @@ def generate_launch_description():
         DeclareLaunchArgument('waypoint_goal_tolerance', default_value='0.8'),
         DeclareLaunchArgument('waypoint_linear_speed', default_value='0.18'),
         DeclareLaunchArgument('waypoint_slow_linear_speed', default_value='0.04'),
+        DeclareLaunchArgument('coverage_area_size_m', default_value='15.0'),
+        DeclareLaunchArgument('coverage_boundary_margin_m', default_value='0.75'),
+        DeclareLaunchArgument('coverage_sweep_spacing_m', default_value='1.5'),
+        DeclareLaunchArgument('coverage_pattern', default_value='serpentine'),
+        DeclareLaunchArgument('coverage_scan_spin_s', default_value='3.0'),
+        DeclareLaunchArgument('coverage_scan_turn_speed', default_value='0.45'),
+        DeclareLaunchArgument('coverage_adaptive_viewpoints', default_value='true'),
+        DeclareLaunchArgument('coverage_occlusion_probe_offset_m', default_value='2.0'),
+        DeclareLaunchArgument('coverage_max_adaptive_viewpoints', default_value='4'),
+        DeclareLaunchArgument('coverage_initial_arc_scan_s', default_value='8.0'),
+        DeclareLaunchArgument('coverage_initial_arc_linear_speed', default_value='0.08'),
+        DeclareLaunchArgument('coverage_initial_arc_turn_speed', default_value='0.22'),
+        DeclareLaunchArgument('enable_waypoint_obstacle_avoidance', default_value='false'),
         DeclareLaunchArgument('waypoint_obstacle_linear_speed', default_value='0.04'),
         DeclareLaunchArgument('waypoint_obstacle_turn_speed', default_value='0.45'),
         DeclareLaunchArgument('slam_start_delay', default_value='8.0'),
@@ -187,9 +213,22 @@ def generate_launch_description():
                         {'obstacle_waypoint_file': obstacle_waypoint_file},
                         {'relative_to_start': True},
                         {'use_test_waypoint': False},
+                        {'coverage_area_size_m': ParameterValue(coverage_area_size_m, value_type=float)},
+                        {'coverage_boundary_margin_m': ParameterValue(coverage_boundary_margin_m, value_type=float)},
+                        {'coverage_sweep_spacing_m': ParameterValue(coverage_sweep_spacing_m, value_type=float)},
+                        {'coverage_pattern': coverage_pattern},
+                        {'coverage_scan_spin_s': ParameterValue(coverage_scan_spin_s, value_type=float)},
+                        {'coverage_scan_turn_speed': ParameterValue(coverage_scan_turn_speed, value_type=float)},
+                        {'coverage_adaptive_viewpoints': ParameterValue(coverage_adaptive_viewpoints, value_type=bool)},
+                        {'coverage_occlusion_probe_offset_m': ParameterValue(coverage_occlusion_probe_offset_m, value_type=float)},
+                        {'coverage_max_adaptive_viewpoints': ParameterValue(coverage_max_adaptive_viewpoints, value_type=int)},
+                        {'coverage_initial_arc_scan_s': ParameterValue(coverage_initial_arc_scan_s, value_type=float)},
+                        {'coverage_initial_arc_linear_speed': ParameterValue(coverage_initial_arc_linear_speed, value_type=float)},
+                        {'coverage_initial_arc_turn_speed': ParameterValue(coverage_initial_arc_turn_speed, value_type=float)},
                         {'waypoint_goal_tolerance': ParameterValue(waypoint_goal_tolerance, value_type=float)},
                         {'waypoint_linear_speed': ParameterValue(waypoint_linear_speed, value_type=float)},
                         {'waypoint_slow_linear_speed': ParameterValue(waypoint_slow_linear_speed, value_type=float)},
+                        {'enable_waypoint_obstacle_avoidance': ParameterValue(enable_waypoint_obstacle_avoidance, value_type=bool)},
                         {'waypoint_obstacle_linear_speed': ParameterValue(waypoint_obstacle_linear_speed, value_type=float)},
                         {'waypoint_obstacle_turn_speed': ParameterValue(waypoint_obstacle_turn_speed, value_type=float)},
                     ],

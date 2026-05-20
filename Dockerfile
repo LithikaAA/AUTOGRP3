@@ -44,6 +44,7 @@ RUN apt-get update && apt-get install -y \
 RUN pip install depthai --break-system-packages
 # Install Python packages
 RUN pip install depthai onnxruntime --break-system-packages
+RUN pip install onnxruntime
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
@@ -74,6 +75,8 @@ ENV LD_LIBRARY_PATH=/usr/local/lib
 
 # Copy your project
 COPY ros2_ws/src /ros2_ws/src
+COPY ros2_ws/basic_urdf.sdf /ros2_ws/basic_urdf.sdf
+COPY robots /ros2_ws/robots
 COPY ariaNode /ros2_ws/src/ariaNode
 
 # Build workspace

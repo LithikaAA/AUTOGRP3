@@ -120,7 +120,7 @@ def generate_launch_description():
         DeclareLaunchArgument('coverage_area_size_m', default_value='15.0'),
         DeclareLaunchArgument('coverage_boundary_margin_m', default_value='0.75'),
         DeclareLaunchArgument('coverage_sweep_spacing_m', default_value='1.5'),
-        DeclareLaunchArgument('coverage_pattern', default_value='adaptive_arc'),
+        DeclareLaunchArgument('coverage_pattern', default_value='serpentine'),
         DeclareLaunchArgument('coverage_probe_radius_ratio', default_value='0.45'),
         DeclareLaunchArgument('coverage_scan_spin_s', default_value='3.0'),
         DeclareLaunchArgument('coverage_scan_turn_speed', default_value='0.45'),

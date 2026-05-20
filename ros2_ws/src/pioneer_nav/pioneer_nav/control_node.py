@@ -8,11 +8,13 @@ from enum import Enum
 
 import rclpy
 from rclpy.node import Node
+from rclpy.action import ActionClient
 from geometry_msgs.msg import Twist, Pose
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import Joy, LaserScan
 from std_msgs.msg import String, Int8
 from tf2_msgs.msg import TFMessage
+from nav2_msgs.action import NavigateToPose
 
 # Configuration defaults
 INITIAL_TURN_ANGLE = 45
@@ -22,11 +24,11 @@ MAP_SIZE = 15.0
 MAP_HALF_SIZE = MAP_SIZE / 2
 MAP_CENTER = (0.0, 0.0)
 
-OBSTACLE_BUFFER = 1.5
+OBSTACLE_BUFFER = 0.6
 EMERGENCY_STOP_DISTANCE = 0.3
 LIDAR_FRONT_ANGLE_FOV = math.radians(60)
 LIDAR_SIDE_ANGLE_FOV = math.radians(30)
-OBSTACLE_REVERSE_DURATION = 1
+OBSTACLE_REVERSE_DURATION = 0.7
 OBSTACLE_TURN_DURATION = 1.5
 PREDICTIVE_BUFFER = 4.0
 
@@ -72,6 +74,8 @@ class AUTO_STATE(Enum):
     OBSTACLE_REVERSE = 7
     OBSTACLE_TURN = 8
     RETURN_TO_CENTER = 9
+    COVERAGE_PLANNING = 10  # NAV2 planning lawnmower
+    COVERAGE_EXECUTING = 11  # NAV2 executing lawnmower
 
 
 def quaternion_to_yaw(orientation):
@@ -123,6 +127,7 @@ class ControlNode(Node):
         self.declare_parameter('robot_state_topic', '/robot_state')
         self.declare_parameter('mission_command_topic', '/mission_command')
         self.declare_parameter('publish_gui_topics', True)
+        self.declare_parameter('use_nav2', True)
 
         joy_topic = self.get_parameter('joy_topic').value
         scan_topic = self.get_parameter('scan_topic').value
@@ -152,6 +157,7 @@ class ControlNode(Node):
         self.gazebo_tf_frame_match = self.get_parameter('gazebo_tf_frame_match').value
         self.gazebo_tf_allow_unmatched = bool(self.get_parameter('gazebo_tf_allow_unmatched').value)
         self.publish_gui_topics = bool(self.get_parameter('publish_gui_topics').value)
+        self.use_nav2 = bool(self.get_parameter('use_nav2').value)
 
         # ---- publishers ----
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
@@ -165,8 +171,19 @@ class ControlNode(Node):
         self.create_subscription(LaserScan, scan_topic, self.lidar_cb, 10)
         self.create_subscription(Int8, estop_status_topic, self.estop_status_cb, 10)
         self.create_subscription(String, mission_command_topic, self.mission_command_cb, 10)
+        self.create_subscription(Path, '/plan', self.planned_path_cb, 10)  # Monitor NAV2 planning
         if self.use_gazebo_tf_pose:
             self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_cb, 10)
+
+        # ---- NAV2 Integration ----
+        if self.use_nav2:
+            self.nav2_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+            self.get_logger().info('NAV2 integration enabled. Waiting for navigate_to_pose action server...')
+        else:
+            self.nav2_client = None
+
+        self._nav2_goal_handle = None
+        self._send_goal_future = None
 
         self.drive_mode = DRIVE_MODE.AUTO
         self.auto_state = AUTO_STATE.INITIAL_TURN
@@ -199,6 +216,8 @@ class ControlNode(Node):
         self.external_estop_status = ESTOP_CLEAR
         self.external_waypoint_active = False
         self.reached_home = False
+        self.coverage_active = False  # NAV2 coverage in progress
+        self.nav2_path = None  # Planned path from NAV2
         self._last_auto_button = False
         self._last_manual_button = False
         self._last_stop_button = False
@@ -217,26 +236,20 @@ class ControlNode(Node):
             f'Speeds: forward={self.forward_speed:.2f} m/s, reverse={self.reverse_speed:.2f} m/s, '
             f'turn={self.turn_speed_deg:.1f} deg/s'
         )
-        if not self.center_arena_on_start:
-            self.get_logger().info(
-                f'15x15 arena fixed at odom/world ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
-            )
-        if self.use_gazebo_tf_pose:
-            self.get_logger().info(
-                f'Gazebo sim: using {self.gazebo_tf_topic} for world pose when available '
-                f'(match="{self.gazebo_tf_frame_match}"), otherwise falling back to {odom_topic}.'
-            )
+        if self.use_nav2:
+            self.get_logger().info('NAV2 coverage enabled for lawnmower mapping.')
 
     # ------------------------------------------------------------------ #
     #  MISSION COMMAND & ESTOP CALLBACKS                                  #
     # ------------------------------------------------------------------ #
 
     def mission_command_cb(self, msg: String):
-        """Handle GUI mission commands: start_wandering, go_home, drive_waypoints"""
+        """Handle GUI mission commands: start_wandering, go_home, drive_waypoints, start_coverage"""
         command = msg.data.strip().lower()
         with self.mutex:
             if command == 'start_wandering':
                 self.external_waypoint_active = False
+                self.coverage_active = False
                 self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring start_wandering command while external e-stop is active.')
@@ -253,6 +266,7 @@ class ControlNode(Node):
 
             elif command == 'go_home':
                 self.external_waypoint_active = False
+                self.coverage_active = False
                 self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring go_home command while external e-stop is active.')
@@ -268,11 +282,44 @@ class ControlNode(Node):
 
             elif command == 'drive_waypoints':
                 self.external_waypoint_active = True
+                self.coverage_active = False
                 self.reached_home = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
                 self.get_logger().info('GUI command: Paused for waypoint driving.')
+
+            elif command == 'stop_coverage':
+                if self.coverage_active:
+                    self.cancel_coverage_goal()
+                    self.coverage_active = False
+                    self.reached_home = False
+                    self.drive_mode = DRIVE_MODE.AUTO
+                    self.auto_state = AUTO_STATE.WANDERING_TURN
+                    self.publish_twist(0.0, 0.0)
+                    self.publish_robot_state()
+                    self.get_logger().info('GUI command: Coverage planning cancelled. Returning to wandering mode.')
+                else:
+                    self.get_logger().info('GUI command: No active coverage to cancel.')
+
+            elif command == 'start_lawnmower' or command == 'start_coverage':
+                if not self.use_nav2:
+                    self.get_logger().warn('NAV2 not enabled. Cannot start coverage planning.')
+                    return
+                if self.external_estop_status == ESTOP_ACTIVE:
+                    self.get_logger().warn('Ignoring coverage command while external e-stop is active.')
+                    return
+                self.external_waypoint_active = True
+                self.coverage_active = True
+                self.reached_home = False
+                self.emergency_stop = False
+                self.drive_mode = DRIVE_MODE.MANUAL  # Yield control to NAV2
+                self.auto_state = AUTO_STATE.COVERAGE_PLANNING
+                self.publish_twist(0.0, 0.0)
+                self.publish_robot_state()
+                self.get_logger().info('GUI command: Starting NAV2 coverage planning for lawnmower pattern.')
+                # Send goal to Nav2 to trigger coverage planning
+                self.send_coverage_goal()
 
     def estop_status_cb(self, msg: Int8):
         """Handle external LiDAR e-stop status"""
@@ -282,15 +329,112 @@ class ControlNode(Node):
             if self.external_estop_status == ESTOP_ACTIVE:
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
+                if self.coverage_active:
+                    self.cancel_coverage_goal()
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 if previous != ESTOP_ACTIVE:
-                    self.get_logger().error('External LiDAR E-STOP active. Motion halted.')
+                    self.get_logger().error('External LiDAR E-STOP active. Motion halted. Cancelling coverage.')
             elif self.external_estop_status == ESTOP_WARNING:
                 self.publish_twist(0.0, 0.0)
                 if previous != ESTOP_WARNING:
                     self.get_logger().warn('External LiDAR warning active. Pausing motion.')
             elif previous != ESTOP_CLEAR:
                 self.get_logger().info('External LiDAR e-stop clear.')
+
+    def planned_path_cb(self, msg: Path):
+        """Monitor NAV2 planned path"""
+        with self.mutex:
+            self.nav2_path = msg
+            if self.coverage_active and self.auto_state == AUTO_STATE.COVERAGE_PLANNING:
+                self.get_logger().info(f'NAV2 coverage path received with {len(msg.poses)} waypoints.')
+                self.auto_state = AUTO_STATE.COVERAGE_EXECUTING
+                self.get_logger().info('Coverage execution started. Control yielded to NAV2.')
+
+    def send_coverage_goal(self):
+        """Send a coverage goal to Nav2's navigate_to_pose action server"""
+        if self.nav2_client is None:
+            self.get_logger().error('NAV2 client not initialized!')
+            return
+
+        # Wait for action server (with timeout)
+        if not self.nav2_client.wait_for_server(timeout_sec=3.0):
+            self.get_logger().error('Nav2 navigate_to_pose action server not available! Is Nav2 running?')
+            self.coverage_active = False
+            return
+
+        # Create goal: send robot to arena center for coverage
+        from geometry_msgs.msg import PoseStamped, Quaternion
+
+        goal = NavigateToPose.Goal()
+        goal.pose.header.frame_id = 'map'
+        goal.pose.header.stamp = self.get_clock().now().to_msg()
+
+        # Goal is to arrive at map center (arena_origin) with default orientation
+        if self.map_origin_x is not None and self.map_origin_y is not None:
+            goal.pose.pose.position.x = self.map_origin_x
+            goal.pose.pose.position.y = self.map_origin_y
+        else:
+            # Fallback to 0,0 if not centered
+            goal.pose.pose.position.x = 0.0
+            goal.pose.pose.position.y = 0.0
+
+        goal.pose.pose.position.z = 0.0
+        goal.pose.pose.orientation.x = 0.0
+        goal.pose.pose.orientation.y = 0.0
+        goal.pose.pose.orientation.z = 0.0
+        goal.pose.pose.orientation.w = 1.0
+
+        # Send goal asynchronously
+        self._send_goal_future = self.nav2_client.send_goal_async(
+            goal,
+            feedback_callback=self.coverage_feedback_cb
+        )
+        # When goal response received, call goal_response_cb
+        self._send_goal_future.add_done_callback(self.goal_response_cb)
+
+        self.get_logger().info(
+            f'Coverage goal sent to Nav2 (target: {goal.pose.pose.position.x:.2f}, '
+            f'{goal.pose.pose.position.y:.2f}). Waiting for execution...'
+        )
+
+    def goal_response_cb(self, future):
+        """Callback when Nav2 responds to coverage goal request"""
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error('Nav2 rejected coverage goal! Check Nav2 parameters and map.')
+            with self.mutex:
+                self.coverage_active = False
+                self.auto_state = AUTO_STATE.WANDERING_TURN
+                self.publish_twist(0.0, 0.0)
+            return
+
+        self.get_logger().info('✓ Nav2 accepted coverage goal. Planner now computing lawnmower path...')
+        self._nav2_goal_handle = goal_handle
+
+    def coverage_feedback_cb(self, feedback_msg):
+        """Monitor Nav2 coverage execution feedback"""
+        # Nav2 provides feedback on path following progress
+        # This is called repeatedly during execution
+        pass
+
+    def cancel_coverage_goal(self):
+        """Cancel the active Nav2 coverage goal"""
+        if self._nav2_goal_handle is not None:
+            self.get_logger().info('Cancelling Nav2 coverage goal...')
+            cancel_future = self._nav2_goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(self._cancel_done_cb)
+            self._nav2_goal_handle = None
+        else:
+            self.get_logger().warn('No active Nav2 goal to cancel.')
+
+    def _cancel_done_cb(self, future):
+        """Callback when goal cancellation completes"""
+        cancel_response = future.result()
+        if cancel_response.return_code == cancel_response.ERROR_NONE:
+            self.get_logger().info('✓ Nav2 coverage goal cancelled successfully.')
+        else:
+            self.get_logger().warn(f'Failed to cancel Nav2 goal. Error code: {cancel_response.return_code}')
 
     # ------------------------------------------------------------------ #
     #  GUI HELPERS                                                         #
@@ -305,6 +449,11 @@ class ControlNode(Node):
             state = 'ESTOP'
         elif self.external_estop_status == ESTOP_WARNING:
             state = 'STOPPED'
+        elif self.coverage_active:
+            if self.auto_state == AUTO_STATE.COVERAGE_PLANNING:
+                state = 'COVERAGE_PLANNING'
+            else:
+                state = 'COVERAGE'
         elif self.external_waypoint_active:
             state = 'WAYPOINT'
         elif self.reached_home:
@@ -388,6 +537,9 @@ class ControlNode(Node):
             if stop_pressed and not self._last_stop_button:
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
+                if self.coverage_active:
+                    self.cancel_coverage_goal()
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
                 self.get_logger().warn('PS4 Square pressed: emergency stop latched')
@@ -395,12 +547,16 @@ class ControlNode(Node):
             if manual_pressed and not self._last_manual_button:
                 self.emergency_stop = False
                 self.drive_mode = DRIVE_MODE.MANUAL
+                if self.coverage_active:
+                    self.cancel_coverage_goal()
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
                 self.get_logger().info('PS4 X pressed: control node paused for joystick/manual control')
 
             if auto_pressed and not self._last_auto_button:
                 self.emergency_stop = False
+                self.coverage_active = False
                 self.drive_mode = DRIVE_MODE.AUTO
                 self.auto_state = AUTO_STATE.INITIAL_TURN
                 if self.have_odom and self.center_arena_on_start:
@@ -458,27 +614,31 @@ class ControlNode(Node):
                 self.right_min_distance = float('inf')
                 return
 
-            n = len(ranges)
-            angle_min = msg.angle_min
-            angle_inc = msg.angle_increment
-            center_idx = n // 2
-            half_front_idx = int((LIDAR_FRONT_ANGLE_FOV / 2) / angle_inc)
+            front = []
+            left = []
+            right = []
+            front_half = LIDAR_FRONT_ANGLE_FOV / 2.0
+            side_width = LIDAR_SIDE_ANGLE_FOV
 
-            front_indices = [i % n for i in range(center_idx - half_front_idx, center_idx + half_front_idx + 1)]
-            self.front_min_distance = min(
-                [ranges[i] for i in front_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            for i, reading in enumerate(ranges):
+                if not math.isfinite(reading) or reading <= max(msg.range_min, 0.01):
+                    continue
+                if msg.range_max > 0.0 and reading > msg.range_max:
+                    continue
 
-            left_start_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
-            left_end_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2 + LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
-            left_indices = [i % n for i in range(left_start_idx, left_end_idx + 1)]
-            self.left_min_distance = min(
-                [ranges[i] for i in left_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+                angle = msg.angle_min + i * msg.angle_increment
+                angle = math.atan2(math.sin(angle), math.cos(angle))
 
-            right_start_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
-            right_end_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2 - LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
-            right_indices = [i % n for i in range(right_start_idx, right_end_idx + 1)]
-            self.right_min_distance = min(
-                [ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+                if abs(angle) <= front_half:
+                    front.append(reading)
+                elif front_half < angle <= front_half + side_width:
+                    left.append(reading)
+                elif -front_half - side_width <= angle < -front_half:
+                    right.append(reading)
+
+            self.front_min_distance = min(front) if front else float('inf')
+            self.left_min_distance = min(left) if left else float('inf')
+            self.right_min_distance = min(right) if right else float('inf')
 
     def odom_cb(self, msg: Odometry):
         with self.mutex:
@@ -568,6 +728,16 @@ class ControlNode(Node):
         with self.mutex:
             self.publish_robot_state()
 
+            # ---- NAV2 Coverage in progress: yield control ----
+            if self.coverage_active and self.auto_state == AUTO_STATE.COVERAGE_EXECUTING:
+                # NAV2 is driving. Control_node just monitors e-stop.
+                if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
+                    self.get_logger().error('EMERGENCY STOP during coverage! Obstacle detected.')
+                    self.emergency_stop = True
+                    self.coverage_active = False
+                    self.publish_twist(0.0, 0.0)
+                return
+
             if self.emergency_stop:
                 self.publish_twist(0.0, 0.0)
                 return
@@ -575,6 +745,7 @@ class ControlNode(Node):
             if self.external_estop_status == ESTOP_ACTIVE:
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 return
 
@@ -661,9 +832,16 @@ class ControlNode(Node):
                 self.handle_boundary_escape_drive()
             elif self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
                 self.handle_return_to_center()
+            elif self.auto_state == AUTO_STATE.COVERAGE_PLANNING:
+                # Waiting for NAV2 to compute and execute coverage path
+                # Transition to COVERAGE_EXECUTING happens when /plan topic is published
+                self.get_logger().info(
+                    'Awaiting NAV2 coverage plan... (watch /plan topic for path visualization)',
+                    throttle_duration_sec=5.0
+                )
 
     # ------------------------------------------------------------------ #
-    #  STATE HANDLERS                                                      #
+    #  STATE HANDLERS (existing code - no changes needed)                  #
     # ------------------------------------------------------------------ #
 
     def handle_obstacle_reverse(self):

@@ -115,6 +115,12 @@ class GUINode(Node):
             reliability=ReliabilityPolicy.RELIABLE,
             durability=DurabilityPolicy.TRANSIENT_LOCAL,
         )
+        live_map_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+        )
 
         # Camera feed — raw topic for main camera panel
         self.create_subscription(Image,         "/oak/rgb/image_raw", self._cb_camera,       10)
@@ -129,6 +135,7 @@ class GUINode(Node):
         self.create_subscription(String,        "/detections/colour", self._cb_colour,       10)
         self.create_subscription(String,        "/detections/object", self._cb_object,       10)
         self.create_subscription(OccupancyGrid, "/map",               self._cb_map,          map_qos)
+        self.create_subscription(OccupancyGrid, "/map",               self._cb_map,          live_map_qos)
         self.create_subscription(LaserScan,     "/scan",              self._cb_scan,         10)
         self.create_subscription(Path,          "/planned_path",      self._cb_path,         10)
         self.create_subscription(String,        "/arena_status",      self._cb_arena,        10)
@@ -839,7 +846,7 @@ class RobotGUI(QMainWindow):
         self.signals.robot_pose.connect(self._on_pose)
         self.signals.letter_detected.connect(self._on_letter)
         self.signals.colour_detected.connect(self._on_colour)
-        self.signals.object_detected.connect(self._on_object_detection)
+        #self.signals.object_detected.connect(self._on_object_detection)
         self.signals.map_updated.connect(self._on_map)
         self.signals.scan_updated.connect(self._on_scan)
         self.signals.path_updated.connect(self._on_path)

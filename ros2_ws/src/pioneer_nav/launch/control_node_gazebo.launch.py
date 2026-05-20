@@ -17,10 +17,10 @@ def generate_launch_description():
     pkg_pioneer_nav = get_package_share_directory('pioneer_nav')
     pkg_ros_gz_sim = get_package_share_directory('ros_gz_sim')
 
-    # Path to existing Pioneer URDF
-    robot_file = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/AUTOGRP3/robots/pioneer.urdf'
-    mesh_dir = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/AUTOGRP3/robots/meshes'
-    source_world_file = '/mnt/c/Users/rahma/Downloads/AUTOGRP3-main/worlds/basic_urdf.sdf'
+    # Packaged Pioneer robot/world assets.
+    robot_file = os.path.join(pkg_pioneer_nav, 'robots', 'pioneer.urdf')
+    mesh_dir = os.path.join(pkg_pioneer_nav, 'robots', 'meshes')
+    source_world_file = os.path.join(pkg_pioneer_nav, 'worlds', 'basic_urdf.sdf')
 
     with open(robot_file, 'r') as infp:
         robot_desc = infp.read()

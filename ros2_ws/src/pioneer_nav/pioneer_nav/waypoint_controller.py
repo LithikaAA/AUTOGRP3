@@ -75,7 +75,7 @@ class WaypointController(Node):
         self.declare_parameter("coverage_area_size_m", 15.0)
         self.declare_parameter("coverage_boundary_margin_m", 0.75)
         self.declare_parameter("coverage_sweep_spacing_m", 1.5)
-        self.declare_parameter("coverage_pattern", "adaptive_arc")
+        self.declare_parameter("coverage_pattern", "serpentine")
         self.declare_parameter("coverage_probe_radius_ratio", 0.45)
         self.declare_parameter("coverage_scan_spin_s", 3.0)
         self.declare_parameter("coverage_scan_turn_speed", 0.45)
