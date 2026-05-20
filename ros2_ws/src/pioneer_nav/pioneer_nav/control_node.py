@@ -26,8 +26,9 @@ MAP_CENTER = (0.0, 0.0)
 
 OBSTACLE_BUFFER = 0.6
 EMERGENCY_STOP_DISTANCE = 0.3
-LIDAR_FRONT_ANGLE_FOV = math.radians(60)
+LIDAR_FRONT_ANGLE_FOV = math.radians(35)
 LIDAR_SIDE_ANGLE_FOV = math.radians(30)
+LIDAR_SELF_FILTER_MIN_RANGE = 0.25
 OBSTACLE_REVERSE_DURATION = 0.7
 OBSTACLE_TURN_DURATION = 1.5
 PREDICTIVE_BUFFER = 4.0
@@ -114,6 +115,9 @@ class ControlNode(Node):
         self.declare_parameter('turn_speed_deg', TURN_SPEED_DEG)
         self.declare_parameter('return_to_center_speed', RETURN_TO_CENTER_SPEED)
         self.declare_parameter('return_to_center_turn_speed_deg', RETURN_TO_CENTER_TURN_SPEED_DEG)
+        self.declare_parameter('lidar_front_angle_deg', math.degrees(LIDAR_FRONT_ANGLE_FOV))
+        self.declare_parameter('lidar_side_angle_deg', math.degrees(LIDAR_SIDE_ANGLE_FOV))
+        self.declare_parameter('lidar_self_filter_min_range', LIDAR_SELF_FILTER_MIN_RANGE)
         self.declare_parameter('center_arena_on_start', True)
         self.declare_parameter('arena_origin_x', 0.0)
         self.declare_parameter('arena_origin_y', 0.0)
@@ -149,6 +153,9 @@ class ControlNode(Node):
         self.turn_speed_deg = float(self.get_parameter('turn_speed_deg').value)
         self.return_to_center_speed = float(self.get_parameter('return_to_center_speed').value)
         self.return_to_center_turn_speed_deg = float(self.get_parameter('return_to_center_turn_speed_deg').value)
+        self.lidar_front_angle_fov = math.radians(float(self.get_parameter('lidar_front_angle_deg').value))
+        self.lidar_side_angle_fov = math.radians(float(self.get_parameter('lidar_side_angle_deg').value))
+        self.lidar_self_filter_min_range = float(self.get_parameter('lidar_self_filter_min_range').value)
         self.center_arena_on_start = bool(self.get_parameter('center_arena_on_start').value)
         self.configured_arena_origin_x = float(self.get_parameter('arena_origin_x').value)
         self.configured_arena_origin_y = float(self.get_parameter('arena_origin_y').value)
@@ -617,11 +624,11 @@ class ControlNode(Node):
             front = []
             left = []
             right = []
-            front_half = LIDAR_FRONT_ANGLE_FOV / 2.0
-            side_width = LIDAR_SIDE_ANGLE_FOV
+            front_half = self.lidar_front_angle_fov / 2.0
+            side_width = self.lidar_side_angle_fov
 
             for i, reading in enumerate(ranges):
-                if not math.isfinite(reading) or reading <= max(msg.range_min, 0.01):
+                if not math.isfinite(reading) or reading <= max(msg.range_min, self.lidar_self_filter_min_range):
                     continue
                 if msg.range_max > 0.0 and reading > msg.range_max:
                     continue
