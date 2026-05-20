@@ -18,23 +18,29 @@ Subscribes
 /odom                   nav_msgs/Odometry  — robot pose + heading
 /robot_state            std_msgs/String    — optional; "MAPPING" gates detection
 
-Sign region detection
----------------------
-Uses adaptive thresholding on local contrast rather than absolute brightness,
-so white paper on a dark background (e.g. black bin) is detected reliably
-regardless of overall lighting conditions.
+Sign region detection — letter-first approach
+---------------------------------------------
+Rather than finding white paper and hoping the letter is inside it, this
+approach finds the letter strokes first (thick dark edges) and works outwards
+to locate the paper boundary. This is robust to any background because the
+thick black marker strokes are the most consistent feature regardless of
+lighting, background colour, or paper placement.
 
-Low-light tuning (all have sensible defaults, tune at launch if needed):
-  -p min_paper_brightness:=80     lower = accepts dimmer paper
-  -p min_dark_ratio:=0.01         lower = accepts fewer dark pixels (faint letters)
-  -p confident_duration_s:=2.0    seconds detection must be held before logging
+Pipeline:
+  1. Canny edge detection on blurred grayscale
+  2. Dilate edges to connect nearby strokes into solid blobs
+  3. Find contours — look for blobs with the right size and aspect ratio
+     to be a hand-drawn Greek letter (not too small, not too large)
+  4. Expand the bounding box outward by a margin to estimate the paper area
+  5. Verify the expanded region is actually bright (paper is white/light)
+  6. Score candidates by size and proximity to image centre
 
-Full low-light example:
-  python3 unified_detector_node.py \
-    --ros-args \
-    -p min_paper_brightness:=80 \
-    -p min_dark_ratio:=0.01 \
-    -p confident_duration_s:=2.0
+Parameters (all tunable at launch):
+  -p min_letter_area:=500        min contour area to be considered a letter stroke
+  -p max_letter_area_frac:=0.15  max fraction of image area for a letter stroke
+  -p paper_expand:=0.6           how much to expand letter bbox to find paper (fraction)
+  -p min_paper_brightness:=80    min mean brightness of expanded paper region
+  -p confident_duration_s:=2.0   seconds detection must be held before logging
 """
 
 import json
@@ -110,24 +116,26 @@ class UnifiedDetectorNode(Node):
         super().__init__("unified_detector")
 
         # ── Parameters ───────────────────────────────────────────────────────
-        self.declare_parameter("topic",                  "/oak/rgb/image_raw")
-        self.declare_parameter("depth_topic",            "/oak/stereo/image_raw")
-        self.declare_parameter("min_paper_brightness",   80)    # min mean brightness of paper region
-        self.declare_parameter("min_dark_ratio",         0.01)  # min dark pixel fraction (letter)
-        self.declare_parameter("max_dark_ratio",         0.6)   # max dark pixel fraction
-        self.declare_parameter("confidence_threshold",   0.5)
-        self.declare_parameter("process_every_n_frames", 3)
-        self.declare_parameter("confirmations_required", 3)
-        self.declare_parameter("min_colour_area",        3000.0)
-        self.declare_parameter("require_mapping_state",  False)
-        self.declare_parameter("confident_duration_s",   2.0)
-        self.declare_parameter("photo_cooldown_s",       5.0)
+        self.declare_parameter("topic",                   "/oak/rgb/image_raw")
+        self.declare_parameter("depth_topic",             "/oak/stereo/image_raw")
+        self.declare_parameter("min_letter_area",         500)    # min px² for a letter stroke blob
+        self.declare_parameter("max_letter_area_frac",    0.15)   # max fraction of image area
+        self.declare_parameter("paper_expand",            0.6)    # expand factor to find paper from letter
+        self.declare_parameter("min_paper_brightness",    80)     # min mean brightness of paper region
+        self.declare_parameter("confidence_threshold",    0.5)
+        self.declare_parameter("process_every_n_frames",  3)
+        self.declare_parameter("confirmations_required",  3)
+        self.declare_parameter("min_colour_area",         3000.0)
+        self.declare_parameter("require_mapping_state",   False)
+        self.declare_parameter("confident_duration_s",    2.0)
+        self.declare_parameter("photo_cooldown_s",        5.0)
 
         topic                  = self.get_parameter("topic").value
         depth_topic            = self.get_parameter("depth_topic").value
-        self.min_paper_bright  = self.get_parameter("min_paper_brightness").value
-        self.min_dark_ratio    = self.get_parameter("min_dark_ratio").value
-        self.max_dark_ratio    = self.get_parameter("max_dark_ratio").value
+        self.min_letter_area   = int(self.get_parameter("min_letter_area").value)
+        self.max_letter_frac   = float(self.get_parameter("max_letter_area_frac").value)
+        self.paper_expand      = float(self.get_parameter("paper_expand").value)
+        self.min_paper_bright  = int(self.get_parameter("min_paper_brightness").value)
         self.conf_thresh       = self.get_parameter("confidence_threshold").value
         self.process_every     = int(self.get_parameter("process_every_n_frames").value)
         self.confirms_req      = int(self.get_parameter("confirmations_required").value)
@@ -137,8 +145,10 @@ class UnifiedDetectorNode(Node):
         self.photo_cooldown    = float(self.get_parameter("photo_cooldown_s").value)
 
         self.get_logger().info(
-            f"Sign detection: min_paper_brightness={self.min_paper_bright}  "
-            f"dark_ratio={self.min_dark_ratio:.3f}–{self.max_dark_ratio:.2f}"
+            f"Letter-first detection: "
+            f"min_letter_area={self.min_letter_area}  "
+            f"paper_expand={self.paper_expand}  "
+            f"min_paper_brightness={self.min_paper_bright}"
         )
 
         # ── ONNX model ────────────────────────────────────────────────────────
@@ -287,7 +297,7 @@ class UnifiedDetectorNode(Node):
 
     def _process_letter(self, gray: np.ndarray, bgr: np.ndarray,
                         img_width: int, now: float):
-        region_rect = self.find_sign_region(gray, bgr)
+        region_rect = self.find_sign_region(gray)
 
         if region_rect is None:
             self.letter_last_label  = None
@@ -339,56 +349,43 @@ class UnifiedDetectorNode(Node):
                                  self.letter_cx, self.letter_cy, img_width)
             self.letter_tracker.logged = True
 
-    # ── Sign region detection (rewritten) ─────────────────────────────────────
+    # ── Sign region detection — letter-first ──────────────────────────────────
 
-    def find_sign_region(self, gray: np.ndarray, bgr: np.ndarray):
+    def find_sign_region(self, gray: np.ndarray):
         """
-        Locate a white A4 paper sign in the frame.
+        Find the paper sign by locating the letter strokes first.
 
-        Uses adaptive thresholding on local contrast so white paper on any
-        background (including dark bins) is found reliably regardless of
-        overall scene brightness.
+        Greek letters drawn with thick black marker on white paper produce
+        strong, consistent edge blobs regardless of the background or lighting.
+        We find these blobs, then expand outward to recover the full paper area.
 
-        Pipeline:
-          1. Adaptive threshold — finds locally bright regions (paper is
-             brighter than whatever is directly next to it)
-          2. Morphological close — fills gaps within the paper region
-          3. Contour extraction — finds candidate white blobs
-          4. Filter by:
-               - absolute size (1%–50% of image)
-               - aspect ratio (0.3–2.5, covers portrait and landscape A4)
-               - solidity (contour area / bounding box area >= 0.5,
-                           rejects irregular shapes like foliage)
-               - mean brightness >= min_paper_brightness (paper is white)
-               - dark pixel ratio inside region (letter pixels must be present)
-          5. Score by size and distance from image centre — prefer central,
-             appropriately sized regions.
+        Steps:
+          1. Blur to reduce noise, then Canny edge detection
+          2. Dilate heavily to merge nearby strokes into solid blobs
+          3. Find contours — filter for blobs sized like a letter
+             (not tiny noise, not huge background objects)
+          4. For each letter-sized blob, expand its bounding box by
+             paper_expand fraction in each direction to estimate paper area
+          5. Check the expanded region is bright (white paper)
+          6. Score by size and distance from image centre
         """
         h, w   = gray.shape
         img_cx = w // 2
         img_cy = h // 2
+        img_area = h * w
 
-        # Step 1 — adaptive threshold finds locally bright regions.
-        # blockSize=51 is intentionally large so the threshold adapts to the
-        # overall local illumination rather than fine texture.
-        # THRESH_BINARY gives white pixels where the region is brighter than
-        # its local neighbourhood — paper against a dark bin lights up strongly.
+        # Step 1 — blur and edge detection
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        adaptive = cv2.adaptiveThreshold(
-            blurred, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY,
-            blockSize=51,
-            C=-10          # negative C means pixel must be 10 brighter than local mean
-        )
+        edges   = cv2.Canny(blurred, 30, 100)
 
-        # Step 2 — close small holes within the paper region
-        kernel = np.ones((15, 15), np.uint8)
-        closed = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
+        # Step 2 — dilate to connect nearby strokes into solid blobs
+        # A larger kernel merges the strokes of a single letter together
+        kernel  = np.ones((25, 25), np.uint8)
+        dilated = cv2.dilate(edges, kernel, iterations=2)
 
         # Step 3 — find contours
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
-                                       cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
+                                        cv2.CHAIN_APPROX_SIMPLE)
 
         best       = None
         best_score = 0.0
@@ -396,48 +393,52 @@ class UnifiedDetectorNode(Node):
         for cnt in contours:
             area = cv2.contourArea(cnt)
 
-            # Filter 1 — size: must be between 1% and 50% of image
-            if not (h * w * 0.01 < area < h * w * 0.50):
+            # Filter: blob must be letter-sized
+            # Too small = noise, too large = background object
+            if not (self.min_letter_area < area < img_area * self.max_letter_frac):
                 continue
 
-            x, y, cw, ch = cv2.boundingRect(cnt)
+            lx, ly, lw, lh = cv2.boundingRect(cnt)
 
-            # Filter 2 — aspect ratio: A4 paper is roughly 0.5–2.0
-            aspect = cw / ch if ch > 0 else 0
-            if not (0.3 < aspect < 2.5):
+            # Filter: aspect ratio of the letter blob itself
+            # Greek letters fit roughly in a 0.2–3.0 aspect range
+            aspect = lw / lh if lh > 0 else 0
+            if not (0.2 < aspect < 3.0):
                 continue
 
-            # Filter 3 — solidity: reject irregular shapes like foliage or
-            # window frames. Solid rectangular paper has solidity near 1.0.
-            bbox_area = cw * ch
-            solidity  = area / bbox_area if bbox_area > 0 else 0
-            if solidity < 0.5:
+            # Step 4 — expand bounding box to estimate paper area
+            # The letter is smaller than the paper, so expand outward
+            expand_x = int(lw * self.paper_expand)
+            expand_y = int(lh * self.paper_expand)
+
+            px = max(0, lx - expand_x)
+            py = max(0, ly - expand_y)
+            pw = min(w, lx + lw + expand_x) - px
+            ph = min(h, ly + lh + expand_y) - py
+
+            if pw <= 0 or ph <= 0:
                 continue
 
-            # Filter 4 — mean brightness of the region must be paper-white
-            region = gray[y:y + ch, x:x + cw]
-            if region.mean() < self.min_paper_bright:
+            # Filter: expanded region aspect ratio should look like paper
+            paper_aspect = pw / ph if ph > 0 else 0
+            if not (0.3 < paper_aspect < 2.5):
                 continue
 
-            # Filter 5 — dark pixel ratio: needs a letter drawn on it
-            # Use a relative threshold (below 60% of mean) so it works in
-            # varying light rather than a fixed pixel value
-            region_mean = region.mean()
-            dark_thresh = max(80, int(region_mean * 0.6))
-            dark_ratio  = np.sum(region < dark_thresh) / region.size
-            if not (self.min_dark_ratio <= dark_ratio <= self.max_dark_ratio):
+            # Step 5 — check the expanded region is actually bright (paper)
+            paper_region = gray[py:py + ph, px:px + pw]
+            if paper_region.mean() < self.min_paper_bright:
                 continue
 
-            # Score: prefer regions near image centre and of good size
-            cx_r  = x + cw // 2
-            cy_r  = y + ch // 2
+            # Step 6 — score by size and centre proximity
+            cx_r  = px + pw // 2
+            cy_r  = py + ph // 2
             dist  = math.hypot(cx_r - img_cx, cy_r - img_cy)
             max_d = math.hypot(img_cx, img_cy)
-            score = (area / (h * w)) * (1 - 0.5 * dist / max_d)
+            score = (area / img_area) * (1 - 0.5 * dist / max_d)
 
             if score > best_score:
                 best_score = score
-                best       = (x, y, cw, ch)
+                best       = (px, py, pw, ph)
 
         return best
 
