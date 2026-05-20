@@ -43,8 +43,8 @@ RUN apt-get update && apt-get install -y \
 # Install Python packages
 RUN pip install depthai --break-system-packages
 # Install Python packages
-RUN pip install onnxruntime
 RUN pip install depthai onnxruntime --break-system-packages
+
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
