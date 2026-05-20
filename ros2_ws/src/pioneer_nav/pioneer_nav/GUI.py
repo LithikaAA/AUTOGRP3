@@ -82,6 +82,7 @@ FONT_BODY = "DejaVu Sans"
 # Path to the detection log written by unified_detector_node
 DETECTION_LOG_PATH = os.path.expanduser("~/part3_logs/detections_log.jsonl")
 LIDAR_SELF_MASK_MIN_RANGE = float(os.environ.get("PIONEER_GUI_LIDAR_SELF_MASK_MIN_RANGE", "0.18"))
+ARENA_SIZE_M = float(os.environ.get("PIONEER_GUI_ARENA_SIZE_M", "15.0"))
 
 
 # ──────────────────────────────────────────────
@@ -269,7 +270,7 @@ class MapWidget(QWidget):
         self._arena_origin_x = None
         self._arena_origin_y = None
 
-        self._arena_size = 15.0
+        self._arena_size = ARENA_SIZE_M
         self._arena_half = self._arena_size / 2.0
         self._coverage_res = 0.25
         self._coverage_n = int(self._arena_size / self._coverage_res)
@@ -495,14 +496,14 @@ class MapWidget(QWidget):
 
         metre_step = self._coverage_n / self._arena_size
         painter.setPen(QPen(QColor(88, 166, 255, 70), 1))
-        for metre in range(16):
+        for metre in range(int(self._arena_size) + 1):
             offset = int(metre * metre_step * cell)
             painter.drawLine(dx + offset, dy, dx + offset, dy + size)
             painter.drawLine(dx, dy + offset, dx + size, dy + offset)
 
         painter.setPen(QPen(QColor(TEXT_DIM), 1))
         painter.setFont(QFont(FONT_UI, 9))
-        painter.drawText(dx + 8, dy + 18, "15 x 15 m LiDAR coverage grid")
+        painter.drawText(dx + 8, dy + 18, f"{self._arena_size:g} x {self._arena_size:g} m LiDAR coverage grid")
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -580,7 +581,7 @@ class DetectionLog(QWidget):
 #  ARENA DEBUG PANEL
 # ──────────────────────────────────────────────
 class ArenaPanel(QWidget):
-    ARENA_HALF = 7.5
+    ARENA_HALF = ARENA_SIZE_M / 2.0
 
     def __init__(self):
         super().__init__()

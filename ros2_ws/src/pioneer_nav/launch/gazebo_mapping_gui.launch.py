@@ -65,6 +65,7 @@ def generate_launch_description():
         ),
         launch_arguments={
             'rviz': 'false',
+            'arena_size_m': coverage_area_size_m,
         }.items(),
     )
 
@@ -254,6 +255,7 @@ def generate_launch_description():
                     name='robot_gui',
                     output='screen',
                     condition=IfCondition(gui),
+                    additional_env={'PIONEER_GUI_ARENA_SIZE_M': coverage_area_size_m},
                 ),
             ],
         ),

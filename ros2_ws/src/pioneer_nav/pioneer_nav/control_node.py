@@ -120,6 +120,7 @@ class ControlNode(Node):
         self.declare_parameter('lidar_front_angle_deg', math.degrees(LIDAR_FRONT_ANGLE_FOV))
         self.declare_parameter('lidar_side_angle_deg', math.degrees(LIDAR_SIDE_ANGLE_FOV))
         self.declare_parameter('lidar_self_filter_min_range', LIDAR_SELF_FILTER_MIN_RANGE)
+        self.declare_parameter('arena_size_m', MAP_SIZE)
         self.declare_parameter('center_arena_on_start', True)
         self.declare_parameter('arena_origin_x', 0.0)
         self.declare_parameter('arena_origin_y', 0.0)
@@ -160,6 +161,8 @@ class ControlNode(Node):
         self.lidar_front_angle_fov = math.radians(float(self.get_parameter('lidar_front_angle_deg').value))
         self.lidar_side_angle_fov = math.radians(float(self.get_parameter('lidar_side_angle_deg').value))
         self.lidar_self_filter_min_range = float(self.get_parameter('lidar_self_filter_min_range').value)
+        self.arena_size_m = max(1.0, float(self.get_parameter('arena_size_m').value))
+        self.arena_half_size_m = self.arena_size_m / 2.0
         self.center_arena_on_start = bool(self.get_parameter('center_arena_on_start').value)
         self.configured_arena_origin_x = float(self.get_parameter('arena_origin_x').value)
         self.configured_arena_origin_y = float(self.get_parameter('arena_origin_y').value)
@@ -497,10 +500,10 @@ class ControlNode(Node):
     def publish_arena_status(self, rel_x, rel_y):
         """Publish arena debug data to /arena_status — feeds GUI arena panel."""
         distance_from_center = math.hypot(rel_x, rel_y)
-        outside_x = max(0.0, abs(rel_x) - MAP_HALF_SIZE)
-        outside_y = max(0.0, abs(rel_y) - MAP_HALF_SIZE)
+        outside_x = max(0.0, abs(rel_x) - self.arena_half_size_m)
+        outside_y = max(0.0, abs(rel_y) - self.arena_half_size_m)
         outside_distance = math.hypot(outside_x, outside_y)
-        clearance_to_edge = min(MAP_HALF_SIZE - abs(rel_x), MAP_HALF_SIZE - abs(rel_y))
+        clearance_to_edge = min(self.arena_half_size_m - abs(rel_x), self.arena_half_size_m - abs(rel_y))
 
         self.get_logger().info(
             f'Arena status: state={self.auto_state.name} '
@@ -803,8 +806,8 @@ class ControlNode(Node):
             rel_x, rel_y = self.relative_position()
             self.publish_arena_status(rel_x, rel_y)
 
-            if not (-MAP_HALF_SIZE <= rel_x <= MAP_HALF_SIZE and -MAP_HALF_SIZE <= rel_y <= MAP_HALF_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
-                self.get_logger().warn(f'Robot outside 15x15 arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
+            if not (-self.arena_half_size_m <= rel_x <= self.arena_half_size_m and -self.arena_half_size_m <= rel_y <= self.arena_half_size_m) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
+                self.get_logger().warn(f'Robot outside {self.arena_size_m:.1f}x{self.arena_size_m:.1f} arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
                 self.auto_state = AUTO_STATE.RETURN_TO_CENTER
                 self.target_yaw = None
                 self.publish_twist(0.0, 0.0)
@@ -986,10 +989,10 @@ class ControlNode(Node):
         if self.target_yaw is None:
             rel_x, rel_y = self.relative_position()
             boundaries = {
-                'east': MAP_HALF_SIZE - rel_x,
-                'west': rel_x + MAP_HALF_SIZE,
-                'north': MAP_HALF_SIZE - rel_y,
-                'south': rel_y + MAP_HALF_SIZE,
+                'east': self.arena_half_size_m - rel_x,
+                'west': rel_x + self.arena_half_size_m,
+                'north': self.arena_half_size_m - rel_y,
+                'south': rel_y + self.arena_half_size_m,
             }
             closest_boundary = min(boundaries, key=boundaries.get)
             base_angle = {'east': 180, 'west': 0, 'north': 270, 'south': 90}[closest_boundary]
@@ -1098,10 +1101,10 @@ class ControlNode(Node):
 
     def near_boundary(self, buffer_distance):
         rel_x, rel_y = self.relative_position()
-        return (rel_x < -MAP_HALF_SIZE + buffer_distance or
-                rel_x > MAP_HALF_SIZE - buffer_distance or
-                rel_y < -MAP_HALF_SIZE + buffer_distance or
-                rel_y > MAP_HALF_SIZE - buffer_distance)
+        return (rel_x < -self.arena_half_size_m + buffer_distance or
+                rel_x > self.arena_half_size_m - buffer_distance or
+                rel_y < -self.arena_half_size_m + buffer_distance or
+                rel_y > self.arena_half_size_m - buffer_distance)
 
     def predictive_boundary_check(self):
         if self.near_boundary(PREDICTIVE_BUFFER) and not self.near_boundary(BOUNDARY_BUFFER):
@@ -1115,13 +1118,13 @@ class ControlNode(Node):
         dir_x = math.cos(yaw_rad)
         dir_y = math.sin(yaw_rad)
         escape_angle = None
-        if rel_x < -MAP_HALF_SIZE + PREDICTIVE_BUFFER and dir_x < 0:
+        if rel_x < -self.arena_half_size_m + PREDICTIVE_BUFFER and dir_x < 0:
             escape_angle = (self.current_yaw + random.uniform(90, 180)) % 360
-        elif rel_x > MAP_HALF_SIZE - PREDICTIVE_BUFFER and dir_x > 0:
+        elif rel_x > self.arena_half_size_m - PREDICTIVE_BUFFER and dir_x > 0:
             escape_angle = (self.current_yaw - random.uniform(90, 180)) % 360
-        elif rel_y < -MAP_HALF_SIZE + PREDICTIVE_BUFFER and dir_y < 0:
+        elif rel_y < -self.arena_half_size_m + PREDICTIVE_BUFFER and dir_y < 0:
             escape_angle = (self.current_yaw - random.uniform(90, 180)) % 360
-        elif rel_y > MAP_HALF_SIZE - PREDICTIVE_BUFFER and dir_y > 0:
+        elif rel_y > self.arena_half_size_m - PREDICTIVE_BUFFER and dir_y > 0:
             escape_angle = (self.current_yaw + random.uniform(90, 180)) % 360
         if escape_angle is not None:
             angle_diff_to_center = (angle_to_center - escape_angle + 360) % 360
@@ -1142,13 +1145,13 @@ class ControlNode(Node):
         yaw_rad = math.radians(self.current_yaw)
         dir_x = math.cos(yaw_rad)
         dir_y = math.sin(yaw_rad)
-        if rel_y < -MAP_HALF_SIZE + check_buffer and dir_y < 0:
+        if rel_y < -self.arena_half_size_m + check_buffer and dir_y < 0:
             return True
-        if rel_y > MAP_HALF_SIZE - check_buffer and dir_y > 0:
+        if rel_y > self.arena_half_size_m - check_buffer and dir_y > 0:
             return True
-        if rel_x < -MAP_HALF_SIZE + check_buffer and dir_x < 0:
+        if rel_x < -self.arena_half_size_m + check_buffer and dir_x < 0:
             return True
-        if rel_x > MAP_HALF_SIZE - check_buffer and dir_x > 0:
+        if rel_x > self.arena_half_size_m - check_buffer and dir_x > 0:
             return True
         return False
 

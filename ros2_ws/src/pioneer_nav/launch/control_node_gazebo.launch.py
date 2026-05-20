@@ -11,6 +11,7 @@ from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -55,6 +56,11 @@ def generate_launch_description():
     control_mode_arg = DeclareLaunchArgument(
         'control_mode', default_value='auto',
         description='Control mode: auto, manual, or joy'
+    )
+
+    arena_size_arg = DeclareLaunchArgument(
+        'arena_size_m', default_value='15.0',
+        description='Square arena side length in metres.'
     )
 
     # ==================== Gazebo ====================
@@ -116,6 +122,7 @@ def generate_launch_description():
             {'turn_speed_deg': 35.0},
             {'return_to_center_speed': 0.25},
             {'return_to_center_turn_speed_deg': 30.0},
+            {'arena_size_m': ParameterValue(LaunchConfiguration('arena_size_m'), value_type=float)},
             {'center_arena_on_start': False},
             {'arena_origin_x': 0.0},
             {'arena_origin_y': 0.0},
@@ -160,6 +167,7 @@ def generate_launch_description():
     return LaunchDescription([
         rviz_launch_arg,
         control_mode_arg,
+        arena_size_arg,
         gazebo,
         robot,
         robot_state_publisher,
