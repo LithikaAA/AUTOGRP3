@@ -63,6 +63,10 @@ OBSTACLE_REVERSE_DURATION = 0.7
 OBSTACLE_TURN_TIMEOUT = 4.0
 OBSTACLE_TURN_ANGLE = math.radians(90.0)
 OBSTACLE_TURN_TOLERANCE = math.radians(7.0)
+OBSTACLE_BYPASS_DURATION = 3.0
+OBSTACLE_BYPASS_SPEED = 0.14
+OBSTACLE_BYPASS_TURN_SPEED = 0.18
+OBSTACLE_REJOIN_COOLDOWN = 1.2
 
 
 class WaypointController(Node):
@@ -119,11 +123,11 @@ class WaypointController(Node):
         self.declare_parameter("enable_waypoint_obstacle_avoidance", True)
         self.declare_parameter("waypoint_obstacle_linear_speed", 0.0)
         self.declare_parameter("waypoint_obstacle_turn_speed", 0.0)
-        self.declare_parameter("front_obstacle_dist_m", 0.6)
-        self.declare_parameter("critical_obstacle_dist_m", 0.3)
+        self.declare_parameter("front_obstacle_dist_m", 1.35)
+        self.declare_parameter("critical_obstacle_dist_m", 0.75)
         self.declare_parameter("waypoint_critical_turn_speed", 0.55)
         self.declare_parameter("waypoint_critical_reverse_speed", -0.25)
-        self.declare_parameter("front_obstacle_fov_deg", 90.0)
+        self.declare_parameter("front_obstacle_fov_deg", 130.0)
         self.declare_parameter("side_obstacle_fov_deg", 90.0)
         self.declare_parameter("angular_gain", 1.4)
         self.declare_parameter("max_angular_speed", 0.55)
@@ -270,6 +274,8 @@ class WaypointController(Node):
         self.obstacle_avoidance_phase = "clear"
         self.obstacle_avoidance_started = 0.0
         self.obstacle_turn_target_yaw = None
+        self.obstacle_turn_dir = 1.0
+        self.obstacle_rejoin_ignore_until = 0.0
         self.external_estop_status = ESTOP_CLEAR
 
         self.active = False
@@ -1152,6 +1158,8 @@ class WaypointController(Node):
         self.obstacle_avoidance_active = False
         self.obstacle_avoidance_phase = "clear"
         self.obstacle_turn_target_yaw = None
+        self.obstacle_turn_dir = 1.0
+        self.obstacle_rejoin_ignore_until = 0.0
         self.coverage_scan_until = 0.0
         self.coverage_scan_active_idx = -1
         self.coverage_arc_scan_until = 0.0
@@ -1345,16 +1353,22 @@ class WaypointController(Node):
         if not self.have_scan:
             return None
 
-        if self.obstacle_avoidance_phase == "clear" and self.front_min >= self.front_obstacle_dist_m:
-            return None
+        if self.obstacle_avoidance_phase == "clear":
+            if now < self.obstacle_rejoin_ignore_until:
+                return None
+            if self.front_min >= self.front_obstacle_dist_m:
+                return None
 
-        turn_dir = -1.0 if self.left_min < self.right_min else 1.0
-        clearer_side = "left" if turn_dir > 0 else "right"
+        # Keep a consistent traffic rule around obstacles: pass on the left,
+        # so the obstacle remains on the robot's right-hand side.
+        turn_dir = 1.0
+        clearer_side = "left"
 
         if self.obstacle_avoidance_phase == "clear":
             self.obstacle_avoidance_phase = "reverse"
             self.obstacle_avoidance_started = now
             self.obstacle_turn_target_yaw = None
+            self.obstacle_turn_dir = turn_dir
             self.obstacle_avoidance_active = True
             self.publish_robot_state("OBSTACLE_AVOIDANCE")
             self.get_logger().warn(
@@ -1372,7 +1386,7 @@ class WaypointController(Node):
 
             self.obstacle_avoidance_phase = "turn"
             self.obstacle_avoidance_started = now
-            self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * turn_dir)
+            self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir)
             self.stop_robot()
             self.get_logger().info(
                 f"Waypoint obstacle avoidance: reverse complete; turning {clearer_side} before resuming route."
@@ -1381,17 +1395,51 @@ class WaypointController(Node):
 
         if self.obstacle_avoidance_phase == "turn":
             if self.obstacle_turn_target_yaw is None:
-                self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * turn_dir)
+                self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir)
             angle_error = wrap_to_pi(self.obstacle_turn_target_yaw - self.current_yaw)
             if abs(angle_error) <= OBSTACLE_TURN_TOLERANCE or now - self.obstacle_avoidance_started >= OBSTACLE_TURN_TIMEOUT:
-                self.obstacle_avoidance_phase = "clear"
+                self.obstacle_avoidance_phase = "bypass"
+                self.obstacle_avoidance_started = now
                 self.obstacle_turn_target_yaw = None
                 self.stop_robot()
+                self.get_logger().info("Waypoint obstacle avoidance: turn complete; driving bypass leg.")
                 return Twist()
 
             cmd.linear.x = 0.0
             cmd.angular.z = math.copysign(max(abs(self.waypoint_obstacle_turn_speed), 0.35), angle_error)
             return cmd
+
+        if self.obstacle_avoidance_phase == "bypass":
+            if self.front_min < self.critical_obstacle_dist_m:
+                cmd.linear.x = min(self.waypoint_critical_reverse_speed, -0.05)
+                cmd.angular.z = max(abs(self.waypoint_obstacle_turn_speed), 0.35) * self.obstacle_turn_dir
+                self.get_logger().warn(
+                    f"Waypoint obstacle avoidance: obstacle still critical at {self.front_min:.2f}m; backing out.",
+                    throttle_duration_sec=1.0,
+                )
+                return cmd
+
+            if now - self.obstacle_avoidance_started < OBSTACLE_BYPASS_DURATION:
+                cmd.linear.x = min(max(OBSTACLE_BYPASS_SPEED, self.slow_linear_speed), self.linear_speed)
+                cmd.angular.z = OBSTACLE_BYPASS_TURN_SPEED * self.obstacle_turn_dir
+                return cmd
+
+            if self.front_min < self.front_obstacle_dist_m:
+                self.obstacle_avoidance_phase = "turn"
+                self.obstacle_avoidance_started = now
+                self.obstacle_turn_target_yaw = wrap_to_pi(
+                    self.current_yaw + math.radians(45.0) * self.obstacle_turn_dir
+                )
+                self.get_logger().info(
+                    f"Waypoint obstacle avoidance: obstacle still ahead at {self.front_min:.2f}m; extending bypass."
+                )
+                return Twist()
+
+            self.obstacle_avoidance_phase = "clear"
+            self.obstacle_turn_target_yaw = None
+            self.obstacle_rejoin_ignore_until = now + OBSTACLE_REJOIN_COOLDOWN
+            self.get_logger().info("Waypoint obstacle avoidance: bypass clear. Rejoining route.")
+            return Twist()
 
         return None
 

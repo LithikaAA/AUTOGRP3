@@ -44,6 +44,9 @@ def generate_launch_description():
     enable_waypoint_obstacle_avoidance = LaunchConfiguration('enable_waypoint_obstacle_avoidance')
     waypoint_obstacle_linear_speed = LaunchConfiguration('waypoint_obstacle_linear_speed')
     waypoint_obstacle_turn_speed = LaunchConfiguration('waypoint_obstacle_turn_speed')
+    front_obstacle_dist_m = LaunchConfiguration('front_obstacle_dist_m')
+    critical_obstacle_dist_m = LaunchConfiguration('critical_obstacle_dist_m')
+    front_obstacle_fov_deg = LaunchConfiguration('front_obstacle_fov_deg')
     slam_start_delay = LaunchConfiguration('slam_start_delay')
     odom_tf_stamp_with_current_time = LaunchConfiguration('odom_tf_stamp_with_current_time')
 
@@ -102,6 +105,9 @@ def generate_launch_description():
         DeclareLaunchArgument('enable_waypoint_obstacle_avoidance', default_value='true'),
         DeclareLaunchArgument('waypoint_obstacle_linear_speed', default_value='0.04'),
         DeclareLaunchArgument('waypoint_obstacle_turn_speed', default_value='0.45'),
+        DeclareLaunchArgument('front_obstacle_dist_m', default_value='1.35'),
+        DeclareLaunchArgument('critical_obstacle_dist_m', default_value='0.75'),
+        DeclareLaunchArgument('front_obstacle_fov_deg', default_value='130.0'),
         DeclareLaunchArgument('slam_start_delay', default_value='8.0'),
         DeclareLaunchArgument('odom_tf_stamp_with_current_time', default_value='true'),
 
@@ -231,6 +237,9 @@ def generate_launch_description():
                         {'enable_waypoint_obstacle_avoidance': ParameterValue(enable_waypoint_obstacle_avoidance, value_type=bool)},
                         {'waypoint_obstacle_linear_speed': ParameterValue(waypoint_obstacle_linear_speed, value_type=float)},
                         {'waypoint_obstacle_turn_speed': ParameterValue(waypoint_obstacle_turn_speed, value_type=float)},
+                        {'front_obstacle_dist_m': ParameterValue(front_obstacle_dist_m, value_type=float)},
+                        {'critical_obstacle_dist_m': ParameterValue(critical_obstacle_dist_m, value_type=float)},
+                        {'front_obstacle_fov_deg': ParameterValue(front_obstacle_fov_deg, value_type=float)},
                     ],
                 ),
                 Node(
