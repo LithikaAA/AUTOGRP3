@@ -728,16 +728,6 @@ class ControlNode(Node):
         with self.mutex:
             self.publish_robot_state()
 
-            # ---- NAV2 Coverage in progress: yield control ----
-            if self.coverage_active and self.auto_state == AUTO_STATE.COVERAGE_EXECUTING:
-                # NAV2 is driving. Control_node just monitors e-stop.
-                if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
-                    self.get_logger().error('EMERGENCY STOP during coverage! Obstacle detected.')
-                    self.emergency_stop = True
-                    self.coverage_active = False
-                    self.publish_twist(0.0, 0.0)
-                return
-
             if self.emergency_stop:
                 self.publish_twist(0.0, 0.0)
                 return
@@ -751,6 +741,15 @@ class ControlNode(Node):
 
             if self.external_estop_status == ESTOP_WARNING:
                 self.publish_twist(0.0, 0.0)
+                return
+
+            # ---- NAV2 Coverage in progress: yield control only after safety gates ----
+            if self.coverage_active and self.auto_state == AUTO_STATE.COVERAGE_EXECUTING:
+                if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
+                    self.get_logger().error('EMERGENCY STOP during coverage! Obstacle detected.')
+                    self.emergency_stop = True
+                    self.coverage_active = False
+                    self.publish_twist(0.0, 0.0)
                 return
 
             if self.drive_mode != DRIVE_MODE.AUTO:

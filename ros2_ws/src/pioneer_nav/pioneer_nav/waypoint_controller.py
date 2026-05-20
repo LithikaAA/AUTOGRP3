@@ -30,7 +30,7 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry, Path as PathMsg
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
-from std_msgs.msg import String
+from std_msgs.msg import Int8, String
 from tf2_msgs.msg import TFMessage
 
 
@@ -54,6 +54,15 @@ def yaw_from_quaternion(q) -> float:
     siny = 2.0 * (q.w * q.z + q.x * q.y)
     cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
     return math.atan2(siny, cosy)
+
+
+ESTOP_CLEAR = 0
+ESTOP_WARNING = 1
+ESTOP_ACTIVE = 2
+OBSTACLE_REVERSE_DURATION = 0.7
+OBSTACLE_TURN_TIMEOUT = 4.0
+OBSTACLE_TURN_ANGLE = math.radians(90.0)
+OBSTACLE_TURN_TOLERANCE = math.radians(7.0)
 
 
 class WaypointController(Node):
@@ -92,6 +101,7 @@ class WaypointController(Node):
         self.declare_parameter("planned_path_topic", "/planned_path")
         self.declare_parameter("mission_command_topic", "/mission_command")
         self.declare_parameter("robot_state_topic", "/robot_state")
+        self.declare_parameter("estop_status_topic", "/estop_status")
         self.declare_parameter("use_gazebo_tf_pose", False)
         self.declare_parameter("gazebo_tf_topic", "/world/pioneer_world/dynamic_pose/info")
         self.declare_parameter("gazebo_tf_frame_match", "pioneer")
@@ -106,13 +116,13 @@ class WaypointController(Node):
         self.declare_parameter("waypoint_linear_speed", 0.0)
         self.declare_parameter("slow_linear_speed", 0.05)
         self.declare_parameter("waypoint_slow_linear_speed", 0.0)
-        self.declare_parameter("enable_waypoint_obstacle_avoidance", False)
+        self.declare_parameter("enable_waypoint_obstacle_avoidance", True)
         self.declare_parameter("waypoint_obstacle_linear_speed", 0.0)
         self.declare_parameter("waypoint_obstacle_turn_speed", 0.0)
         self.declare_parameter("front_obstacle_dist_m", 0.6)
         self.declare_parameter("critical_obstacle_dist_m", 0.3)
         self.declare_parameter("waypoint_critical_turn_speed", 0.55)
-        self.declare_parameter("waypoint_critical_reverse_speed", -0.06)
+        self.declare_parameter("waypoint_critical_reverse_speed", -0.25)
         self.declare_parameter("front_obstacle_fov_deg", 90.0)
         self.declare_parameter("side_obstacle_fov_deg", 90.0)
         self.declare_parameter("angular_gain", 1.4)
@@ -187,6 +197,7 @@ class WaypointController(Node):
         self.planned_path_topic = str(self.get_parameter("planned_path_topic").value)
         self.mission_command_topic = str(self.get_parameter("mission_command_topic").value)
         self.robot_state_topic = str(self.get_parameter("robot_state_topic").value)
+        self.estop_status_topic = str(self.get_parameter("estop_status_topic").value)
         self.use_gazebo_tf_pose = bool(self.get_parameter("use_gazebo_tf_pose").value)
         self.gazebo_tf_topic = str(self.get_parameter("gazebo_tf_topic").value)
         self.gazebo_tf_frame_match = str(self.get_parameter("gazebo_tf_frame_match").value)
@@ -239,6 +250,7 @@ class WaypointController(Node):
         self.create_subscription(Odometry, self.pose_topic, self.odom_callback, 10)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, 10)
         self.create_subscription(String, self.mission_command_topic, self.command_callback, 10)
+        self.create_subscription(Int8, self.estop_status_topic, self.estop_status_callback, 10)
         if self.use_gazebo_tf_pose:
             self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_callback, 10)
         self.create_timer(1.0 / control_rate_hz, self.control_loop)
@@ -255,6 +267,10 @@ class WaypointController(Node):
         self.left_min = float("inf")
         self.right_min = float("inf")
         self.obstacle_avoidance_active = False
+        self.obstacle_avoidance_phase = "clear"
+        self.obstacle_avoidance_started = 0.0
+        self.obstacle_turn_target_yaw = None
+        self.external_estop_status = ESTOP_CLEAR
 
         self.active = False
         self.goal_achieved = False
@@ -277,7 +293,8 @@ class WaypointController(Node):
         self.get_logger().info(
             f"Waypoint controller ready. pose={self.pose_topic}, scan={self.scan_topic}, cmd_vel={self.cmd_vel_topic}, "
             f"source={self.waypoint_source}, detections={self.detection_log_file or self.default_detection_log_file()}, "
-            f"fallback_file={self.waypoint_file or self.default_waypoint_file()}, astar={self.use_astar}"
+            f"fallback_file={self.waypoint_file or self.default_waypoint_file()}, astar={self.use_astar}, "
+            f"estop={self.estop_status_topic}, obstacle_avoidance={self.enable_waypoint_obstacle_avoidance}"
         )
         if self.use_gazebo_tf_pose:
             self.get_logger().info(
@@ -402,6 +419,22 @@ class WaypointController(Node):
         self.left_min = min(left) if left else float("inf")
         self.right_min = min(right) if right else float("inf")
         self.record_coverage_occlusions(msg)
+
+    def estop_status_callback(self, msg: Int8):
+        previous = self.external_estop_status
+        self.external_estop_status = int(msg.data)
+        if self.external_estop_status == ESTOP_ACTIVE:
+            self.stop_robot()
+            self.publish_robot_state("ESTOP")
+            if previous != ESTOP_ACTIVE:
+                self.get_logger().error("Waypoint controller halted by external LiDAR E-STOP.")
+        elif self.external_estop_status == ESTOP_WARNING:
+            self.stop_robot()
+            self.publish_robot_state("STOPPED")
+            if previous != ESTOP_WARNING:
+                self.get_logger().warn("Waypoint controller paused by external LiDAR warning.")
+        elif previous != ESTOP_CLEAR:
+            self.get_logger().info("External LiDAR e-stop clear. Waypoint controller may resume.")
 
     def record_coverage_occlusions(self, msg: LaserScan):
         if (
@@ -1117,6 +1150,8 @@ class WaypointController(Node):
         self.goal_achieved = False
         self.returning_home_reported = False
         self.obstacle_avoidance_active = False
+        self.obstacle_avoidance_phase = "clear"
+        self.obstacle_turn_target_yaw = None
         self.coverage_scan_until = 0.0
         self.coverage_scan_active_idx = -1
         self.coverage_arc_scan_until = 0.0
@@ -1153,12 +1188,26 @@ class WaypointController(Node):
     def control_loop(self):
         if not self.active:
             return
+        if self.external_estop_status == ESTOP_ACTIVE:
+            self.stop_robot()
+            self.publish_robot_state("ESTOP")
+            return
+        if self.external_estop_status == ESTOP_WARNING:
+            self.stop_robot()
+            self.publish_robot_state("STOPPED")
+            return
         if not self.have_pose:
             self.stop_robot()
             self.get_logger().warn("Waypoint controller waiting for pose.", throttle_duration_sec=2.0)
             return
 
         now = self.get_clock().now().nanoseconds / 1e9
+        if self.enable_waypoint_obstacle_avoidance:
+            obstacle_cmd = self.obstacle_avoidance_cmd(now)
+            if obstacle_cmd is not None:
+                self.cmd_pub.publish(obstacle_cmd)
+                return
+
         if self.coverage_arc_scan_active:
             if now < self.coverage_arc_scan_until:
                 cmd = Twist()
@@ -1276,14 +1325,10 @@ class WaypointController(Node):
         else:
             linear = min(self.linear_speed, distance * 0.5)
 
-        if self.enable_waypoint_obstacle_avoidance:
-            obstacle_cmd = self.obstacle_avoidance_cmd()
-            if obstacle_cmd is not None:
-                self.cmd_pub.publish(obstacle_cmd)
-                return
-
         if self.enable_waypoint_obstacle_avoidance and self.obstacle_avoidance_active:
             self.obstacle_avoidance_active = False
+            self.obstacle_avoidance_phase = "clear"
+            self.obstacle_turn_target_yaw = None
             if self.current_idx >= self.home_start_idx:
                 state = "RETURNING_HOME"
             else:
@@ -1296,37 +1341,59 @@ class WaypointController(Node):
         cmd.angular.z = angular
         self.cmd_pub.publish(cmd)
 
-    def obstacle_avoidance_cmd(self) -> Optional[Twist]:
+    def obstacle_avoidance_cmd(self, now: float) -> Optional[Twist]:
         if not self.have_scan:
             return None
-        if self.front_min >= self.front_obstacle_dist_m:
+
+        if self.obstacle_avoidance_phase == "clear" and self.front_min >= self.front_obstacle_dist_m:
             return None
 
         turn_dir = -1.0 if self.left_min < self.right_min else 1.0
         clearer_side = "left" if turn_dir > 0 else "right"
 
-        cmd = Twist()
-        if self.front_min < self.critical_obstacle_dist_m:
-            cmd.linear.x = self.waypoint_critical_reverse_speed
-            cmd.angular.z = self.waypoint_critical_turn_speed * turn_dir
+        if self.obstacle_avoidance_phase == "clear":
+            self.obstacle_avoidance_phase = "reverse"
+            self.obstacle_avoidance_started = now
+            self.obstacle_turn_target_yaw = None
+            self.obstacle_avoidance_active = True
+            self.publish_robot_state("OBSTACLE_AVOIDANCE")
             self.get_logger().warn(
-                f"Waypoint obstacle avoidance: critical obstacle {self.front_min:.2f}m ahead; "
-                f"reversing and turning {clearer_side}.",
-                throttle_duration_sec=1.0,
-            )
-        else:
-            cmd.linear.x = self.waypoint_obstacle_linear_speed
-            cmd.angular.z = self.waypoint_obstacle_turn_speed * turn_dir
-            self.get_logger().info(
                 f"Waypoint obstacle avoidance: obstacle {self.front_min:.2f}m ahead; "
-                f"creeping and turning {clearer_side}.",
+                f"reversing before turning {clearer_side}.",
                 throttle_duration_sec=1.0,
             )
 
-        if not self.obstacle_avoidance_active:
-            self.obstacle_avoidance_active = True
-            self.publish_robot_state("OBSTACLE_AVOIDANCE")
-        return cmd
+        cmd = Twist()
+        if self.obstacle_avoidance_phase == "reverse":
+            if now - self.obstacle_avoidance_started < OBSTACLE_REVERSE_DURATION:
+                cmd.linear.x = min(self.waypoint_critical_reverse_speed, -0.05)
+                cmd.angular.z = 0.0
+                return cmd
+
+            self.obstacle_avoidance_phase = "turn"
+            self.obstacle_avoidance_started = now
+            self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * turn_dir)
+            self.stop_robot()
+            self.get_logger().info(
+                f"Waypoint obstacle avoidance: reverse complete; turning {clearer_side} before resuming route."
+            )
+            return Twist()
+
+        if self.obstacle_avoidance_phase == "turn":
+            if self.obstacle_turn_target_yaw is None:
+                self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * turn_dir)
+            angle_error = wrap_to_pi(self.obstacle_turn_target_yaw - self.current_yaw)
+            if abs(angle_error) <= OBSTACLE_TURN_TOLERANCE or now - self.obstacle_avoidance_started >= OBSTACLE_TURN_TIMEOUT:
+                self.obstacle_avoidance_phase = "clear"
+                self.obstacle_turn_target_yaw = None
+                self.stop_robot()
+                return Twist()
+
+            cmd.linear.x = 0.0
+            cmd.angular.z = math.copysign(max(abs(self.waypoint_obstacle_turn_speed), 0.35), angle_error)
+            return cmd
+
+        return None
 
     def finish_waypoints(self):
         if self.goal_achieved:

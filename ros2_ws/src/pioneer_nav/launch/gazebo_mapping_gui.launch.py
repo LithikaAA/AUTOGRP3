@@ -133,13 +133,13 @@ def generate_launch_description():
         DeclareLaunchArgument('waypoint_goal_tolerance', default_value='0.8'),
         DeclareLaunchArgument('waypoint_linear_speed', default_value='0.18'),
         DeclareLaunchArgument('waypoint_slow_linear_speed', default_value='0.04'),
-        DeclareLaunchArgument('enable_waypoint_obstacle_avoidance', default_value='false'),
+        DeclareLaunchArgument('enable_waypoint_obstacle_avoidance', default_value='true'),
         DeclareLaunchArgument('waypoint_obstacle_linear_speed', default_value='0.04'),
         DeclareLaunchArgument('waypoint_obstacle_turn_speed', default_value='0.45'),
         DeclareLaunchArgument('front_obstacle_dist_m', default_value='0.6'),
         DeclareLaunchArgument('critical_obstacle_dist_m', default_value='0.3'),
         DeclareLaunchArgument('waypoint_critical_turn_speed', default_value='0.55'),
-        DeclareLaunchArgument('waypoint_critical_reverse_speed', default_value='-0.06'),
+        DeclareLaunchArgument('waypoint_critical_reverse_speed', default_value='-0.25'),
         DeclareLaunchArgument('front_obstacle_fov_deg', default_value='90.0'),
         DeclareLaunchArgument('side_obstacle_fov_deg', default_value='90.0'),
         DeclareLaunchArgument(
@@ -162,8 +162,8 @@ def generate_launch_description():
                 ),
                 Node(
                     package='pioneer_nav',
-                    executable='estopconnect',
-                    name='estopconnect',
+                    executable='estoplidar',
+                    name='estoplidar',
                     output='screen',
                     condition=IfCondition(estop),
                     parameters=[
