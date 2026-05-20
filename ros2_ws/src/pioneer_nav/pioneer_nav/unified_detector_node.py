@@ -343,8 +343,17 @@ class UnifiedDetectorNode(Node):
         self.letter_tracker.seen(now)
 
         if self.letter_frame_count >= self.confirms_req:
+            bearing_rad = self._bearing_from_x(self.letter_cx, img_width)
+            dist = self._get_depth(self.letter_cx, self.letter_cy)
             out      = String()
-            out.data = name
+            out.data = json.dumps({
+                "name":        name,
+                "confidence":  round(confidence, 3),
+                "distance_m":  round(dist, 3) if dist else None,
+                "bearing_deg": round(math.degrees(bearing_rad), 2),
+                "robot_x":     self.robot_x,
+                "robot_y":     self.robot_y,
+            })
             self.letter_pub.publish(out)
             cv2.rectangle(bgr, (x, y), (x + cw, y + ch), (0, 255, 0), 2)
             depth_str = self._depth_label(self.letter_cx, self.letter_cy)
@@ -398,6 +407,7 @@ class UnifiedDetectorNode(Node):
                 "label":         label,
                 "center_x":      cx_px,
                 "center_y":      cy_px,
+                "distance_m":    round(self._get_depth(cx_px, cy_px) or 0.0, 3),
                 "bearing_deg":   round(math.degrees(bearing_rad), 2),
                 "robot_x":       self.robot_x,
                 "robot_y":       self.robot_y,

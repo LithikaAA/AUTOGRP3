@@ -590,8 +590,9 @@ class MapWidget(QWidget):
         # Draw detection markers as coloured dots
         for (wx, wy, label, col) in self._detections:
             px, py = self._world_to_px(wx, wy)
-            colour = QColor(RED) if "red" in col else \
-                     QColor(YELLOW) if "yellow" in col else QColor(GREEN)
+            colour = QColor(RED)    if "red"    in col else \
+                    QColor(YELLOW) if "yellow" in col else \
+                    QColor(ACCENT) if col == "letter"  else QColor(GREEN)
             painter.setBrush(QBrush(colour))
             painter.setPen(QPen(QColor(TEXT), 1))
             painter.drawEllipse(px-6, py-6, 12, 12)
@@ -1026,10 +1027,22 @@ class RobotGUI(QMainWindow):
         self._status_labels["Pos Y"].setText(f"{y:.2f} m")
         self._map_widget.update_pose(x, y, yaw)
 
-    def _on_letter(self, name: str):
-        """Log a detected greek letter."""
+    def _on_letter(self, raw: str):
+        try:
+            data = json.loads(raw)
+            name = data.get("name", raw)
+            dist = data.get("distance_m")
+            bearing = math.radians(data.get("bearing_deg", 0.0))
+            rx = data.get("robot_x", 0.0)
+            ry = data.get("robot_y", 0.0)
+            if dist:
+                wx = rx + dist * math.cos(bearing)
+                wy = ry + dist * math.sin(bearing)
+                self._map_widget.add_detection(wx, wy, name, "letter")
+        except (json.JSONDecodeError, TypeError):
+            name = raw  # fallback for plain string
         self._status_labels["Last Letter"].setText(name)
-        self._det_log.add_entry(f"Greek letter detected: {name}", GREEN)
+        self._det_log.add_entry(f"Greek letter: {name}", GREEN)
 
     def _on_colour(self, data: dict):
         """Log a colour detection, place marker on map, show photo."""
