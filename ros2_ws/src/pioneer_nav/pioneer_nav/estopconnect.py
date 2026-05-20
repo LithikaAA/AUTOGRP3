@@ -68,7 +68,7 @@ minhits = 5 # how many flagged rays needed to actually trigger
 
 # rosbag settings
 default_bagdirect = os.path.expanduser("~/pioneer_estop/bags")
-bagsecs = 5 # rolling window, so saved bag = last ~5 seconds
+bagsecs = 10 # rolling window, so saved bag = last ~10 seconds
 bagtops = ["/scan", "/cmd_vel", "/map", "/camera/rgb/image_raw"] # what to record
 
 # where to save incident logs
