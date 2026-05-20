@@ -382,6 +382,7 @@ class UnifiedDetectorNode(Node):
         # A larger kernel merges the strokes of a single letter together
         kernel  = np.ones((25, 25), np.uint8)
         dilated = cv2.dilate(edges, kernel, iterations=2)
+        cv2.imwrite("/tmp/debug_edges.png", dilated)
 
         # Step 3 — find contours
         contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL,
