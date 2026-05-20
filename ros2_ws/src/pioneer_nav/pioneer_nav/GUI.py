@@ -297,13 +297,12 @@ class MapWidget(QWidget):
         self._map_h   = msg.info.height
 
         data = np.array(msg.data, dtype=np.int8).reshape((self._map_h, self._map_w))
-        img  = np.zeros((self._map_h, self._map_w, 3), dtype=np.uint8)
-        img[data == -1] = [18,  24,  31]
-        img[data == 0]  = [220, 238, 225]
-        img[data > 50]  = [248,  81,  73]
+        img = np.full((self._map_h, self._map_w, 3), 205, dtype=np.uint8)
+        img[data == 0] = [254, 254, 254]
+        img[data > 50] = [0, 0, 0]
         img = np.flipud(img)
         h, w, _ = img.shape
-        self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888)
+        self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888).copy()
         self._last_map_time = time.time()
         self.update()
 
@@ -429,6 +428,12 @@ class MapWidget(QWidget):
         self.update()
 
     def _world_to_px(self, wx, wy):
+        if self._map_w > 0 and self._map_h > 0:
+            dx, dy, scale = self._map_view_transform()
+            gx = (wx - self._map_ox) / self._map_res
+            gy = self._map_h - (wy - self._map_oy) / self._map_res
+            return (int(dx + gx * scale), int(dy + gy * scale))
+
         if self._arena_origin_x is not None and self._arena_origin_y is not None:
             size = min(self.width(), self.height()) - 20
             size = max(10, size)
@@ -460,56 +465,72 @@ class MapWidget(QWidget):
             py = int((max_y - wy) * scale + (self.height() - used_h) / 2)
             return (px, py)
 
-        gx    = (wx - self._map_ox) / self._map_res
-        gy    = self._map_h - (wy - self._map_oy) / self._map_res
-        scale = min(self.width() / self._map_w, self.height() / self._map_h)
-        px = int(gx * scale + (self.width()  - self._map_w * scale) / 2)
-        py = int(gy * scale + (self.height() - self._map_h * scale) / 2)
-        return (px, py)
+        return (self.width() // 2, self.height() // 2)
 
-    def _draw_coverage_grid(self, painter):
+    def _map_view_transform(self):
+        if self._map_w <= 0 or self._map_h <= 0:
+            size = max(10, min(self.width(), self.height()) - 20)
+            return (self.width() - size) // 2, (self.height() - size) // 2, 1.0
+        scale = min(
+            max(1, self.width() - 20) / self._map_w,
+            max(1, self.height() - 20) / self._map_h,
+        )
+        used_w = self._map_w * scale
+        used_h = self._map_h * scale
+        return (self.width() - used_w) / 2, (self.height() - used_h) / 2, scale
+
+    def _draw_empty_arena(self, painter):
         size = min(self.width(), self.height()) - 20
         size = max(10, size)
         dx = (self.width() - size) // 2
         dy = (self.height() - size) // 2
-        cell = size / self._coverage_n
+        painter.fillRect(dx, dy, size, size, QColor(205, 205, 205))
+        painter.setPen(QPen(QColor(120, 120, 120), 1, Qt.DashLine))
+        painter.drawRect(dx, dy, size, size)
 
-        painter.fillRect(dx, dy, size, size, QColor(10, 14, 20))
-
-        for row in range(self._coverage_n):
-            y = int(dy + row * cell)
-            h = max(1, int(math.ceil(cell)))
-            for col in range(self._coverage_n):
-                if not self._free_cells[row, col] and not self._obstacle_cells[row, col]:
-                    continue
-                x = int(dx + col * cell)
-                w = max(1, int(math.ceil(cell)))
-                colour = QColor(248, 81, 73) if self._obstacle_cells[row, col] \
-                         else QColor(63, 185, 80, 165)
-                painter.fillRect(x, y, w, h, colour)
-
-        painter.setPen(QPen(QColor(255, 255, 255, 28), 1))
-        for i in range(self._coverage_n + 1):
-            pos = int(dx + i * cell)
-            painter.drawLine(pos, dy, pos, dy + size)
-            painter.drawLine(dx, int(dy + i * cell), dx + size, int(dy + i * cell))
-
-        metre_step = self._coverage_n / self._arena_size
-        painter.setPen(QPen(QColor(88, 166, 255, 70), 1))
-        for metre in range(int(self._arena_size) + 1):
-            offset = int(metre * metre_step * cell)
-            painter.drawLine(dx + offset, dy, dx + offset, dy + size)
-            painter.drawLine(dx, dy + offset, dx + size, dy + offset)
-
-        painter.setPen(QPen(QColor(TEXT_DIM), 1))
+        painter.setPen(QPen(QColor(70, 70, 70), 1))
         painter.setFont(QFont(FONT_UI, 9))
-        painter.drawText(dx + 8, dy + 18, f"{self._arena_size:g} x {self._arena_size:g} m LiDAR coverage grid")
+        painter.drawText(dx + 8, dy + 18, f"{self._arena_size:g} x {self._arena_size:g} m SLAM map")
+
+    def _draw_slam_map(self, painter):
+        if self._map_img is None or self._map_w <= 0 or self._map_h <= 0:
+            self._draw_empty_arena(painter)
+            return
+
+        dx, dy, scale = self._map_view_transform()
+        painter.drawImage(
+            int(dx), int(dy),
+            self._map_img.scaled(
+                int(self._map_w * scale),
+                int(self._map_h * scale),
+                Qt.KeepAspectRatio,
+                Qt.FastTransformation,
+            )
+        )
+
+    def _draw_arena_boundary(self, painter):
+        if self._arena_origin_x is None or self._arena_origin_y is None:
+            return
+        left = self._arena_origin_x - self._arena_half
+        right = self._arena_origin_x + self._arena_half
+        bottom = self._arena_origin_y - self._arena_half
+        top = self._arena_origin_y + self._arena_half
+        corners = [
+            self._world_to_px(left, bottom),
+            self._world_to_px(right, bottom),
+            self._world_to_px(right, top),
+            self._world_to_px(left, top),
+        ]
+        painter.setPen(QPen(QColor(88, 166, 255, 180), 2, Qt.DashLine))
+        for i in range(len(corners)):
+            painter.drawLine(*corners[i], *corners[(i + 1) % len(corners)])
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor(BG))
-        self._draw_coverage_grid(painter)
+        painter.fillRect(self.rect(), QColor(205, 205, 205))
+        self._draw_slam_map(painter)
+        self._draw_arena_boundary(painter)
 
         if len(self._path) >= 2:
             painter.setPen(QPen(QColor(ACCENT), 2, Qt.DashLine))
