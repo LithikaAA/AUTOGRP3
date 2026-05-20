@@ -18,27 +18,23 @@ Subscribes
 /odom                   nav_msgs/Odometry  — robot pose + heading
 /robot_state            std_msgs/String    — optional; "MAPPING" gates detection
 
-Confidence & logging
---------------------
-Both letters and colour objects use the same rule:
-  - Must be detected continuously for `confident_duration_s` (default 2.0 s)
-  - On crossing that threshold, depth is sampled from /oak/stereo/image_raw at
-    the centre of the bounding box to get distance in metres
-  - A record is appended to ~/part3_logs/detections_log.jsonl:
-      type, name, confidence, distance_m, bearing_deg,
-      object_x, object_y  (world-frame estimate),
-      robot_x, robot_y, robot_yaw_deg, timestamp
-  - Once logged, won't log again until the object disappears and reappears
-  - Photos saved to ~/part3_logs/colour_detections/ for colour detections
+Sign region detection
+---------------------
+Uses adaptive thresholding on local contrast rather than absolute brightness,
+so white paper on a dark background (e.g. black bin) is detected reliably
+regardless of overall lighting conditions.
 
-HSV tuning notes
-----------------
-Red:   tightened saturation min to 150 and value min to 100 to reject skin tones
-       (skin is low-saturation red, typically S < 100)
-Yellow: raised saturation min to 150 and value min to 120, narrowed hue to 22-32
-       to reject gold/tan (gold has lower saturation and sits around hue 20-25
-       but with S ~80-120 — raising S floor to 150 pushes it out)
-Both:  min_colour_area raised to 3000 px to ignore small stray blobs
+Low-light tuning (all have sensible defaults, tune at launch if needed):
+  -p min_paper_brightness:=80     lower = accepts dimmer paper
+  -p min_dark_ratio:=0.01         lower = accepts fewer dark pixels (faint letters)
+  -p confident_duration_s:=2.0    seconds detection must be held before logging
+
+Full low-light example:
+  python3 unified_detector_node.py \
+    --ros-args \
+    -p min_paper_brightness:=80 \
+    -p min_dark_ratio:=0.01 \
+    -p confident_duration_s:=2.0
 """
 
 import json
@@ -56,20 +52,13 @@ from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
 # ── HSV colour ranges ────────────────────────────────────────────────────────
-# Red wraps around 0/180 in HSV.
-# Tightened: S >= 150, V >= 100  →  rejects skin (low S) and dark reds
 RED_LOWER_1  = np.array([  0, 150, 100], dtype=np.uint8)
 RED_UPPER_1  = np.array([ 10, 255, 255], dtype=np.uint8)
 RED_LOWER_2  = np.array([168, 150, 100], dtype=np.uint8)
 RED_UPPER_2  = np.array([179, 255, 255], dtype=np.uint8)
-
-# Yellow: narrowed hue to 22–32, S >= 150, V >= 150
-# Gold/tan sits at hue ~20-25 but with S 80-130 → pushed out by S floor
-# Bright safety-yellow obstacles have S > 180, V > 180 → well inside range
 YELLOW_LOWER = np.array([ 22, 150, 150], dtype=np.uint8)
 YELLOW_UPPER = np.array([ 32, 255, 255], dtype=np.uint8)
 
-# OAK-D horizontal field of view
 HFOV_RAD = math.radians(71.0)
 
 
@@ -81,11 +70,6 @@ def yaw_from_quaternion(q) -> float:
 
 def depth_at_point(depth_image: np.ndarray, cx: int, cy: int,
                    patch: int = 5) -> float | None:
-    """
-    Sample depth from a 16UC1 image (millimetres) at (cx, cy).
-    Uses the median of a small patch to avoid noisy single-pixel reads.
-    Returns metres, or None if the value is zero/invalid.
-    """
     h, w    = depth_image.shape
     x0, x1  = max(0, cx - patch), min(w, cx + patch)
     y0, y1  = max(0, cy - patch), min(h, cy + patch)
@@ -93,19 +77,16 @@ def depth_at_point(depth_image: np.ndarray, cx: int, cy: int,
     valid   = region[region > 0]
     if valid.size == 0:
         return None
-    return float(np.median(valid)) / 1000.0   # mm → m
+    return float(np.median(valid)) / 1000.0
 
 
-def world_position(robot_x: float, robot_y: float, robot_yaw: float,
-                   distance_m: float, bearing_rad: float):
+def world_position(robot_x, robot_y, robot_yaw, distance_m, bearing_rad):
     angle = robot_yaw + bearing_rad
     return (round(robot_x + distance_m * math.cos(angle), 3),
             round(robot_y + distance_m * math.sin(angle), 3))
 
 
 class DetectionTracker:
-    """Tracks how long a single label has been seen continuously."""
-
     def __init__(self):
         self.first_seen: float = 0.0
         self.logged:     bool  = False
@@ -131,7 +112,9 @@ class UnifiedDetectorNode(Node):
         # ── Parameters ───────────────────────────────────────────────────────
         self.declare_parameter("topic",                  "/oak/rgb/image_raw")
         self.declare_parameter("depth_topic",            "/oak/stereo/image_raw")
-        self.declare_parameter("brightness_threshold",   170)
+        self.declare_parameter("min_paper_brightness",   80)    # min mean brightness of paper region
+        self.declare_parameter("min_dark_ratio",         0.01)  # min dark pixel fraction (letter)
+        self.declare_parameter("max_dark_ratio",         0.6)   # max dark pixel fraction
         self.declare_parameter("confidence_threshold",   0.5)
         self.declare_parameter("process_every_n_frames", 3)
         self.declare_parameter("confirmations_required", 3)
@@ -140,16 +123,23 @@ class UnifiedDetectorNode(Node):
         self.declare_parameter("confident_duration_s",   2.0)
         self.declare_parameter("photo_cooldown_s",       5.0)
 
-        topic                = self.get_parameter("topic").value
-        depth_topic          = self.get_parameter("depth_topic").value
-        self.bright_thresh   = self.get_parameter("brightness_threshold").value
-        self.conf_thresh     = self.get_parameter("confidence_threshold").value
-        self.process_every   = int(self.get_parameter("process_every_n_frames").value)
-        self.confirms_req    = int(self.get_parameter("confirmations_required").value)
-        self.min_colour_area = float(self.get_parameter("min_colour_area").value)
-        self.require_mapping = bool(self.get_parameter("require_mapping_state").value)
-        self.confident_dur   = float(self.get_parameter("confident_duration_s").value)
-        self.photo_cooldown  = float(self.get_parameter("photo_cooldown_s").value)
+        topic                  = self.get_parameter("topic").value
+        depth_topic            = self.get_parameter("depth_topic").value
+        self.min_paper_bright  = self.get_parameter("min_paper_brightness").value
+        self.min_dark_ratio    = self.get_parameter("min_dark_ratio").value
+        self.max_dark_ratio    = self.get_parameter("max_dark_ratio").value
+        self.conf_thresh       = self.get_parameter("confidence_threshold").value
+        self.process_every     = int(self.get_parameter("process_every_n_frames").value)
+        self.confirms_req      = int(self.get_parameter("confirmations_required").value)
+        self.min_colour_area   = float(self.get_parameter("min_colour_area").value)
+        self.require_mapping   = bool(self.get_parameter("require_mapping_state").value)
+        self.confident_dur     = float(self.get_parameter("confident_duration_s").value)
+        self.photo_cooldown    = float(self.get_parameter("photo_cooldown_s").value)
+
+        self.get_logger().info(
+            f"Sign detection: min_paper_brightness={self.min_paper_bright}  "
+            f"dark_ratio={self.min_dark_ratio:.3f}–{self.max_dark_ratio:.2f}"
+        )
 
         # ── ONNX model ────────────────────────────────────────────────────────
         model_path = os.path.join(os.path.dirname(__file__), "greek_classifier.onnx")
@@ -170,19 +160,16 @@ class UnifiedDetectorNode(Node):
         self.frame_count    = 0
         self.depth_image: np.ndarray | None = None
 
-        # Odometry
         self.robot_x   = 0.0
         self.robot_y   = 0.0
         self.robot_yaw = 0.0
 
-        # Letter tracking
         self.letter_last_label  : str | None = None
         self.letter_frame_count : int        = 0
         self.letter_cx          : int        = 0
         self.letter_cy          : int        = 0
         self.letter_tracker = DetectionTracker()
 
-        # Colour tracking
         self.colour_trackers: dict[str, DetectionTracker] = {
             "red_obstacle":    DetectionTracker(),
             "yellow_obstacle": DetectionTracker(),
@@ -247,15 +234,13 @@ class UnifiedDetectorNode(Node):
         self._publish_image(bgr, msg)
         cv2.imwrite("/tmp/unified_detection.png", bgr)
 
-    # ── Shared depth sample ───────────────────────────────────────────────────
+    # ── Shared helpers ────────────────────────────────────────────────────────
 
     def _get_depth(self, cx: int, cy: int) -> float | None:
         if self.depth_image is None:
             return None
         d = depth_at_point(self.depth_image, cx, cy)
         return d if (d is not None and d > 0.05) else None
-
-    # ── Shared log helper ─────────────────────────────────────────────────────
 
     def _log_detection(self, kind: str, name: str, confidence: float,
                        cx: int, cy: int, img_width: int):
@@ -294,8 +279,6 @@ class UnifiedDetectorNode(Node):
             f"obj=({obj_x},{obj_y})"
         )
 
-    # ── Overlay helper — shows depth if available, else '?' ──────────────────
-
     def _depth_label(self, cx: int, cy: int) -> str:
         d = self._get_depth(cx, cy)
         return f"{d:.2f}m" if d is not None else "?m"
@@ -304,7 +287,7 @@ class UnifiedDetectorNode(Node):
 
     def _process_letter(self, gray: np.ndarray, bgr: np.ndarray,
                         img_width: int, now: float):
-        region_rect = self.find_sign_region(gray)
+        region_rect = self.find_sign_region(gray, bgr)
 
         if region_rect is None:
             self.letter_last_label  = None
@@ -355,6 +338,147 @@ class UnifiedDetectorNode(Node):
             self._log_detection("letter", name, confidence,
                                  self.letter_cx, self.letter_cy, img_width)
             self.letter_tracker.logged = True
+
+    # ── Sign region detection (rewritten) ─────────────────────────────────────
+
+    def find_sign_region(self, gray: np.ndarray, bgr: np.ndarray):
+        """
+        Locate a white A4 paper sign in the frame.
+
+        Uses adaptive thresholding on local contrast so white paper on any
+        background (including dark bins) is found reliably regardless of
+        overall scene brightness.
+
+        Pipeline:
+          1. Adaptive threshold — finds locally bright regions (paper is
+             brighter than whatever is directly next to it)
+          2. Morphological close — fills gaps within the paper region
+          3. Contour extraction — finds candidate white blobs
+          4. Filter by:
+               - absolute size (1%–50% of image)
+               - aspect ratio (0.3–2.5, covers portrait and landscape A4)
+               - solidity (contour area / bounding box area >= 0.5,
+                           rejects irregular shapes like foliage)
+               - mean brightness >= min_paper_brightness (paper is white)
+               - dark pixel ratio inside region (letter pixels must be present)
+          5. Score by size and distance from image centre — prefer central,
+             appropriately sized regions.
+        """
+        h, w   = gray.shape
+        img_cx = w // 2
+        img_cy = h // 2
+
+        # Step 1 — adaptive threshold finds locally bright regions.
+        # blockSize=51 is intentionally large so the threshold adapts to the
+        # overall local illumination rather than fine texture.
+        # THRESH_BINARY gives white pixels where the region is brighter than
+        # its local neighbourhood — paper against a dark bin lights up strongly.
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        adaptive = cv2.adaptiveThreshold(
+            blurred, 255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            blockSize=51,
+            C=-10          # negative C means pixel must be 10 brighter than local mean
+        )
+
+        # Step 2 — close small holes within the paper region
+        kernel = np.ones((15, 15), np.uint8)
+        closed = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
+
+        # Step 3 — find contours
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+
+        best       = None
+        best_score = 0.0
+
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+
+            # Filter 1 — size: must be between 1% and 50% of image
+            if not (h * w * 0.01 < area < h * w * 0.50):
+                continue
+
+            x, y, cw, ch = cv2.boundingRect(cnt)
+
+            # Filter 2 — aspect ratio: A4 paper is roughly 0.5–2.0
+            aspect = cw / ch if ch > 0 else 0
+            if not (0.3 < aspect < 2.5):
+                continue
+
+            # Filter 3 — solidity: reject irregular shapes like foliage or
+            # window frames. Solid rectangular paper has solidity near 1.0.
+            bbox_area = cw * ch
+            solidity  = area / bbox_area if bbox_area > 0 else 0
+            if solidity < 0.5:
+                continue
+
+            # Filter 4 — mean brightness of the region must be paper-white
+            region = gray[y:y + ch, x:x + cw]
+            if region.mean() < self.min_paper_bright:
+                continue
+
+            # Filter 5 — dark pixel ratio: needs a letter drawn on it
+            # Use a relative threshold (below 60% of mean) so it works in
+            # varying light rather than a fixed pixel value
+            region_mean = region.mean()
+            dark_thresh = max(80, int(region_mean * 0.6))
+            dark_ratio  = np.sum(region < dark_thresh) / region.size
+            if not (self.min_dark_ratio <= dark_ratio <= self.max_dark_ratio):
+                continue
+
+            # Score: prefer regions near image centre and of good size
+            cx_r  = x + cw // 2
+            cy_r  = y + ch // 2
+            dist  = math.hypot(cx_r - img_cx, cy_r - img_cy)
+            max_d = math.hypot(img_cx, img_cy)
+            score = (area / (h * w)) * (1 - 0.5 * dist / max_d)
+
+            if score > best_score:
+                best_score = score
+                best       = (x, y, cw, ch)
+
+        return best
+
+    # ── Letter extraction and classification (unchanged) ──────────────────────
+
+    def extract_letter(self, region: np.ndarray) -> np.ndarray:
+        IMG_SIZE = 64
+        blur     = cv2.GaussianBlur(region, (5, 5), 0)
+        thresh   = cv2.adaptiveThreshold(blur, 255,
+                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                       cv2.THRESH_BINARY_INV, 11, 4)
+        conts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)
+        lx = region.shape[1]; ly = region.shape[0]; lw = lh = 0
+        for cnt in conts:
+            if cv2.contourArea(cnt) > 20:
+                bx, by, bw, bh = cv2.boundingRect(cnt)
+                lx = min(lx, bx); ly = min(ly, by)
+                lw = max(lw, bx + bw); lh = max(lh, by + bh)
+        lw -= lx; lh -= ly
+        letter  = region[ly:ly+lh, lx:lx+lw] if (lw > 0 and lh > 0) else region
+        scale   = (IMG_SIZE - 8) / max(letter.shape)
+        new_w   = int(letter.shape[1] * scale)
+        new_h   = int(letter.shape[0] * scale)
+        resized = cv2.resize(letter, (new_w, new_h))
+        result  = np.ones((IMG_SIZE, IMG_SIZE), dtype=np.uint8) * 255
+        y_off   = (IMG_SIZE - new_h) // 2
+        x_off   = (IMG_SIZE - new_w) // 2
+        result[y_off:y_off+new_h, x_off:x_off+new_w] = resized
+        return result
+
+    def classify(self, letter_region: np.ndarray):
+        inp     = letter_region.astype(np.float32) / 255.0
+        inp     = inp[np.newaxis, np.newaxis, :, :]
+        outputs = self.session.run(None, {self.input_name: inp})
+        probs   = outputs[0][0]
+        probs   = np.exp(probs - probs.max())
+        probs  /= probs.sum()
+        idx        = int(np.argmax(probs))
+        confidence = float(probs[idx])
+        return self.classes[idx], confidence
 
     # ── Colour pipeline ───────────────────────────────────────────────────────
 
@@ -427,88 +551,6 @@ class UnifiedDetectorNode(Node):
         out.step         = bgr.shape[1] * 3
         out.data         = bgr.tobytes()
         self.image_pub.publish(out)
-
-    # ── Letter helpers (identical to working version) ─────────────────────────
-
-    def find_sign_region(self, gray: np.ndarray):
-        h, w   = gray.shape
-        img_cx = w // 2
-        img_cy = h // 2
-
-        _, bright       = cv2.threshold(gray, self.bright_thresh, 255, cv2.THRESH_BINARY)
-        edges           = cv2.Canny(gray, 50, 150)
-        k1              = np.ones((20, 20), np.uint8)
-        bright_dilated  = cv2.dilate(bright, k1)
-        edges_in_bright = cv2.bitwise_and(edges, bright_dilated)
-        k2              = np.ones((15, 15), np.uint8)
-        filled          = cv2.dilate(edges_in_bright, k2)
-        filled          = cv2.morphologyEx(filled, cv2.MORPH_CLOSE, k2)
-        contours, _     = cv2.findContours(filled, cv2.RETR_EXTERNAL,
-                                           cv2.CHAIN_APPROX_SIMPLE)
-        best       = None
-        best_score = 0.0
-
-        for cnt in contours:
-            area = cv2.contourArea(cnt)
-            if not (h * w * 0.01 < area < h * w * 0.6):
-                continue
-            x, y, cw, ch = cv2.boundingRect(cnt)
-            aspect = cw / ch if ch > 0 else 0
-            if not (0.3 < aspect < 2.5):
-                continue
-            region = gray[y:y + ch, x:x + cw]
-            if region.mean() < 150:
-                continue
-            dark_ratio = np.sum(region < 100) / region.size
-            if not (0.02 <= dark_ratio <= 0.5):
-                continue
-            cx_r  = x + cw // 2
-            cy_r  = y + ch // 2
-            dist  = math.hypot(cx_r - img_cx, cy_r - img_cy)
-            max_d = math.hypot(img_cx, img_cy)
-            score = (area / (h * w)) * (1 - 0.6 * dist / max_d)
-            if score > best_score:
-                best_score = score
-                best       = (x, y, cw, ch)
-
-        return best
-
-    def extract_letter(self, region: np.ndarray) -> np.ndarray:
-        IMG_SIZE = 64
-        blur     = cv2.GaussianBlur(region, (5, 5), 0)
-        thresh   = cv2.adaptiveThreshold(blur, 255,
-                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                       cv2.THRESH_BINARY_INV, 11, 4)
-        conts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)
-        lx = region.shape[1]; ly = region.shape[0]; lw = lh = 0
-        for cnt in conts:
-            if cv2.contourArea(cnt) > 20:
-                bx, by, bw, bh = cv2.boundingRect(cnt)
-                lx = min(lx, bx); ly = min(ly, by)
-                lw = max(lw, bx + bw); lh = max(lh, by + bh)
-        lw -= lx; lh -= ly
-        letter  = region[ly:ly+lh, lx:lx+lw] if (lw > 0 and lh > 0) else region
-        scale   = (IMG_SIZE - 8) / max(letter.shape)
-        new_w   = int(letter.shape[1] * scale)
-        new_h   = int(letter.shape[0] * scale)
-        resized = cv2.resize(letter, (new_w, new_h))
-        result  = np.ones((IMG_SIZE, IMG_SIZE), dtype=np.uint8) * 255
-        y_off   = (IMG_SIZE - new_h) // 2
-        x_off   = (IMG_SIZE - new_w) // 2
-        result[y_off:y_off+new_h, x_off:x_off+new_w] = resized
-        return result
-
-    def classify(self, letter_region: np.ndarray):
-        inp     = letter_region.astype(np.float32) / 255.0
-        inp     = inp[np.newaxis, np.newaxis, :, :]
-        outputs = self.session.run(None, {self.input_name: inp})
-        probs   = outputs[0][0]
-        probs   = np.exp(probs - probs.max())
-        probs  /= probs.sum()
-        idx        = int(np.argmax(probs))
-        confidence = float(probs[idx])
-        return self.classes[idx], confidence
 
     # ── Colour helpers ────────────────────────────────────────────────────────
 
