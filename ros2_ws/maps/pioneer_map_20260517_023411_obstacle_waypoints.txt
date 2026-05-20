@@ -1,7 +1,0 @@
-# target_rel_x_m target_rel_y_m obstacle_rel_x_m obstacle_rel_y_m
-# targets are 1.0 m in front of each obstacle from the centre reference
-1.987 1.027 2.875 1.486
--2.087 2.867 -2.675 3.675
-1.456 3.310 1.858 4.225
-3.963 -1.786 4.875 -2.196
-4.941 2.570 5.828 3.031

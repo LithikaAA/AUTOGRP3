@@ -667,21 +667,21 @@ Overall, these changes make the robot behave more like a real system where senso
     <material>Gazebo/Blue</material> <!-- Blue lidar in Gazebo -->
     <sensor name="laser" type="gpu_lidar">
       <topic>scan</topic> <!-- Laser scan topic -->
-      <update_rate>8</update_rate> <!-- Reduced update rate for less ideal sensing -->
+      <update_rate>8</update_rate>
 
       <lidar>
         <scan>
           <horizontal>
-            <samples>540</samples> <!-- Slightly reduced sample count -->
+            <samples>540</samples> <!-- 0.5 deg over 270 deg, matching TiM7xx resolution range -->
             <resolution>1</resolution> <!-- One ray per sample -->
-            <min_angle>-1.5708</min_angle> <!-- Start angle -->
-            <max_angle>1.5708</max_angle> <!-- End angle -->
+            <min_angle>-2.35619</min_angle> <!-- -135 deg -->
+            <max_angle>2.35619</max_angle> <!-- +135 deg -->
           </horizontal>
         </scan>
 
         <range>
           <min>0.12</min> <!-- More realistic minimum range -->
-          <max>8.0</max> <!-- Reduced maximum range -->
+          <max>25.0</max> <!-- SICK TiM7xx working range -->
           <resolution>0.01</resolution> <!-- Range resolution -->
         </range>
 

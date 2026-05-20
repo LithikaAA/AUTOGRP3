@@ -66,6 +66,11 @@ RED_UPPER_2  = np.array([179, 255, 255], dtype=np.uint8)
 YELLOW_LOWER = np.array([ 22, 150, 150], dtype=np.uint8)
 YELLOW_UPPER = np.array([ 32, 255, 255], dtype=np.uint8)
 
+# Broad green/grass mask. These pixels are ignored by visual object detection;
+# drive-blocking obstacles still come from LiDAR / occupancy mapping.
+GREEN_GROUND_LOWER = np.array([35, 35, 35], dtype=np.uint8)
+GREEN_GROUND_UPPER = np.array([95, 255, 255], dtype=np.uint8)
+
 HFOV_RAD = math.radians(71.0)
 
 
@@ -130,27 +135,18 @@ class UnifiedDetectorNode(Node):
         self.declare_parameter("require_mapping_state",  False)
         self.declare_parameter("confident_duration_s",   2.0)
         self.declare_parameter("photo_cooldown_s",       5.0)
+        self.declare_parameter("mask_green_ground",       True)
 
-        topic                  = self.get_parameter("topic").value
-        depth_topic            = self.get_parameter("depth_topic").value
-        self.bright_thresh     = self.get_parameter("brightness_threshold").value
-        self.min_paper_bright  = self.get_parameter("min_paper_brightness").value
-        self.min_dark_ratio    = self.get_parameter("min_dark_ratio").value
-        self.max_dark_ratio    = self.get_parameter("max_dark_ratio").value
-        self.conf_thresh       = self.get_parameter("confidence_threshold").value
-        self.process_every     = int(self.get_parameter("process_every_n_frames").value)
-        self.confirms_req      = int(self.get_parameter("confirmations_required").value)
-        self.min_colour_area   = float(self.get_parameter("min_colour_area").value)
-        self.require_mapping   = bool(self.get_parameter("require_mapping_state").value)
-        self.confident_dur     = float(self.get_parameter("confident_duration_s").value)
-        self.photo_cooldown    = float(self.get_parameter("photo_cooldown_s").value)
-
-        self.get_logger().info(
-            f"Paper detection thresholds: "
-            f"brightness>={self.bright_thresh}  "
-            f"mean>={self.min_paper_bright}  "
-            f"dark_ratio={self.min_dark_ratio:.3f}–{self.max_dark_ratio:.2f}"
-        )
+        topic                = self.get_parameter("topic").value
+        depth_topic          = self.get_parameter("depth_topic").value
+        self.bright_thresh   = self.get_parameter("brightness_threshold").value
+        self.conf_thresh     = self.get_parameter("confidence_threshold").value
+        self.process_every   = int(self.get_parameter("process_every_n_frames").value)
+        self.confirms_req    = int(self.get_parameter("confirmations_required").value)
+        self.min_colour_area = float(self.get_parameter("min_colour_area").value)
+        self.require_mapping = bool(self.get_parameter("require_mapping_state").value)
+        self.confident_dur   = float(self.get_parameter("confident_duration_s").value)
+        self.photo_cooldown  = float(self.get_parameter("photo_cooldown_s").value)
 
         # ── ONNX model ────────────────────────────────────────────────────────
         model_path = os.path.join(os.path.dirname(__file__), "greek_classifier.onnx")
@@ -199,6 +195,7 @@ class UnifiedDetectorNode(Node):
         # ── Publishers ────────────────────────────────────────────────────────
         self.letter_pub = self.create_publisher(String, "/detected_letter",   10)
         self.colour_pub = self.create_publisher(String, "/detections/colour", 10)
+        self.object_pub = self.create_publisher(String, "/detections/object", 10)
         self.image_pub  = self.create_publisher(Image,  "/detections/image",  10)
 
         # ── Subscribers ───────────────────────────────────────────────────────
@@ -238,6 +235,12 @@ class UnifiedDetectorNode(Node):
         bgr  = frame.copy()
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         hsv  = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        if self.mask_green_ground:
+            ground_mask = cv2.inRange(hsv, GREEN_GROUND_LOWER, GREEN_GROUND_UPPER)
+            gray = gray.copy()
+            hsv = hsv.copy()
+            gray[ground_mask > 0] = 0
+            hsv[ground_mask > 0] = 0
         now  = time.monotonic()
 
         self._process_letter(gray, bgr, msg.width, now)
@@ -281,6 +284,10 @@ class UnifiedDetectorNode(Node):
 
         with open(self.log_file, "a") as f:
             f.write(json.dumps(record) + "\n")
+
+        marker_msg = String()
+        marker_msg.data = json.dumps(record)
+        self.object_pub.publish(marker_msg)
 
         dist_str = f"{distance_m:.2f}m" if distance_m else "depth N/A"
         self.get_logger().info(
@@ -389,6 +396,7 @@ class UnifiedDetectorNode(Node):
                 "label":         label,
                 "center_x":      cx_px,
                 "center_y":      cy_px,
+                "distance_m":    float(self._get_depth(cx_px, cy_px) or 0.0),
                 "bearing_deg":   round(math.degrees(bearing_rad), 2),
                 "robot_x":       self.robot_x,
                 "robot_y":       self.robot_y,

@@ -93,6 +93,7 @@ class Signals(QObject):
     robot_pose      = pyqtSignal(float, float, float)
     letter_detected = pyqtSignal(str)
     colour_detected = pyqtSignal(dict)
+    object_detected = pyqtSignal(dict)
     map_updated     = pyqtSignal(object)
     scan_updated    = pyqtSignal(object)
     path_updated    = pyqtSignal(object)
@@ -126,6 +127,7 @@ class GUINode(Node):
         self.create_subscription(Pose,          "/robot/pose",        self._cb_pose,         10)
         self.create_subscription(String,        "/detected_letter",   self._cb_letter,       10)
         self.create_subscription(String,        "/detections/colour", self._cb_colour,       10)
+        self.create_subscription(String,        "/detections/object", self._cb_object,       10)
         self.create_subscription(OccupancyGrid, "/map",               self._cb_map,          map_qos)
         self.create_subscription(LaserScan,     "/scan",              self._cb_scan,         10)
         self.create_subscription(Path,          "/planned_path",      self._cb_path,         10)
@@ -166,6 +168,12 @@ class GUINode(Node):
     def _cb_colour(self, msg):
         try:
             self.signals.colour_detected.emit(json.loads(msg.data))
+        except Exception:
+            pass
+
+    def _cb_object(self, msg):
+        try:
+            self.signals.object_detected.emit(json.loads(msg.data))
         except Exception:
             pass
 
@@ -329,13 +337,20 @@ class MapWidget(QWidget):
         step = max(1, len(msg.ranges) // 180)
         for i in range(0, len(msg.ranges), step):
             r = msg.ranges[i]
-            if not math.isfinite(r) or r < msg.range_min or r > msg.range_max:
+            if math.isnan(r) or r < msg.range_min:
                 continue
+            hit_obstacle = math.isfinite(r)
+            if not hit_obstacle:
+                r = msg.range_max
+            elif r > msg.range_max:
+                r = msg.range_max
+                hit_obstacle = False
             angle = self._robot_yaw + msg.angle_min + i * msg.angle_increment
             wx = self._robot_x + r * math.cos(angle)
             wy = self._robot_y + r * math.sin(angle)
-            hits.append((wx, wy, now))
-            self._paint_lidar_ray(angle, r, msg.range_max)
+            if hit_obstacle:
+                hits.append((wx, wy, now))
+            self._paint_lidar_ray(angle, r, msg.range_max, hit_obstacle)
 
         self._scan_hits.extend(hits)
         cutoff = now - self._scan_hit_lifetime
@@ -360,8 +375,23 @@ class MapWidget(QWidget):
         ax, ay = self._world_to_arena(wx, wy)
         return self._arena_to_cell(ax, ay)
 
-    def _paint_lidar_ray(self, angle, distance, sensor_max_range):
-        max_dist = min(distance, sensor_max_range, self._arena_half * 1.45)
+    def _ray_distance_to_arena_edge(self, angle):
+        ax, ay = self._world_to_arena(self._robot_x, self._robot_y)
+        dx = math.cos(angle)
+        dy = math.sin(angle)
+        distances = []
+        if abs(dx) > 1e-6:
+            distances.append((self._arena_half - ax) / dx)
+            distances.append((-self._arena_half - ax) / dx)
+        if abs(dy) > 1e-6:
+            distances.append((self._arena_half - ay) / dy)
+            distances.append((-self._arena_half - ay) / dy)
+        positive = [dist for dist in distances if dist > 0.0]
+        return min(positive) if positive else self._arena_half * 2.0
+
+    def _paint_lidar_ray(self, angle, distance, sensor_max_range, hit_obstacle=True):
+        arena_exit_dist = self._ray_distance_to_arena_edge(angle)
+        max_dist = min(distance, sensor_max_range, arena_exit_dist)
         step = max(self._coverage_res * 0.5, 0.05)
         travelled = 0.0
         while travelled < max_dist:
@@ -372,7 +402,7 @@ class MapWidget(QWidget):
                 self._free_cells[cell] = True
             travelled += step
 
-        if distance < sensor_max_range * 0.97:
+        if hit_obstacle and distance < sensor_max_range * 0.97:
             wx = self._robot_x + distance * math.cos(angle)
             wy = self._robot_y + distance * math.sin(angle)
             cell = self._world_to_cell(wx, wy)
@@ -481,7 +511,7 @@ class MapWidget(QWidget):
         # Draw detection markers — one per unique obstacle from the log file
         for (wx, wy, label, col) in self._detections:
             px, py = self._world_to_px(wx, wy)
-            colour = QColor(RED)    if "red"    in col else \
+            colour = QColor(RED) if "red" in col else \
                      QColor(YELLOW) if "yellow" in col else QColor(GREEN)
             painter.setBrush(QBrush(colour))
             painter.setPen(QPen(QColor(TEXT), 1))
@@ -639,7 +669,6 @@ class RobotGUI(QMainWindow):
         self.setMinimumSize(1400, 800)
         self.setStyleSheet(f"background: {BG}; color: {TEXT};")
         self._latest_map_msg = None
-        self._last_log_mtime = None   # track file modification time to avoid redundant reads
 
         self._build_ui()
         self._connect_signals()
@@ -718,7 +747,7 @@ class RobotGUI(QMainWindow):
         map_layout.addWidget(self._map_widget)
 
         map_controls = QHBoxLayout()
-        self._start_wandering_btn = QPushButton("Start Wandering")
+        self._start_wandering_btn = QPushButton("Start Mapping")
         self._start_wandering_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._start_wandering_btn.setCursor(Qt.PointingHandCursor)
         self._start_wandering_btn.setStyleSheet(f"""
@@ -810,12 +839,13 @@ class RobotGUI(QMainWindow):
         self.signals.robot_pose.connect(self._on_pose)
         self.signals.letter_detected.connect(self._on_letter)
         self.signals.colour_detected.connect(self._on_colour)
+        self.signals.object_detected.connect(self._on_object_detection)
         self.signals.map_updated.connect(self._on_map)
         self.signals.scan_updated.connect(self._on_scan)
         self.signals.path_updated.connect(self._on_path)
         self.signals.arena_updated.connect(self._on_arena)
         self.signals.save_status.connect(self._on_save_status)
-        self._start_wandering_btn.clicked.connect(lambda: self._send_mission_command("start_wandering"))
+        self._start_wandering_btn.clicked.connect(lambda: self._send_mission_command("drive_coverage"))
         self._go_home_btn.clicked.connect(lambda: self._send_mission_command("go_home"))
         self._drive_waypoints_btn.clicked.connect(lambda: self._send_mission_command("drive_waypoints"))
         self._save_map_btn.clicked.connect(self._save_map)
@@ -904,6 +934,8 @@ class RobotGUI(QMainWindow):
         colour_map = {
             "MAPPING":          GREEN,
             "WAYPOINT":         ACCENT,
+            "RETURNING_HOME":   YELLOW,
+            "OBSTACLE_AVOIDANCE": YELLOW,
             "GOAL_ACHIEVED":    GREEN,
             "REACHED_HOME":     GREEN,
             "IDLE":             YELLOW,
@@ -914,37 +946,61 @@ class RobotGUI(QMainWindow):
         colour = colour_map.get(state, TEXT_DIM)
         self._state_badge.setStyleSheet(self._badge_style(colour))
         action_map = {
-            "MAPPING":           "Exploring area and building map...",
-            "WAYPOINT":          "Driving to waypoints at maximum speed...",
-            "GOAL_ACHIEVED":     "Goal achieved. Press Go Home to return to centre.",
-            "REACHED_HOME":      "Reached home. Waiting for next command.",
-            "IDLE":              "Standing by.",
-            "STOPPED":           "EMERGENCY STOP — all motion halted!",
-            "ESTOP":             "EMERGENCY STOP — obstacle detected!",
-            "RETURN_TO_CENTER":  "Returning to arena centre...",
+            "MAPPING":  "Exploring area and building map...",
+            "WAYPOINT": "Driving to waypoints at maximum speed...",
+            "GOAL_ACHIEVED": "Goal achieved. Press Go Home to return to centre.",
+            "REACHED_HOME": "Reached home. Waiting for next command.",
+            "IDLE":     "Standing by.",
+            "STOPPED":  "EMERGENCY STOP — all motion halted!",
+            "ESTOP":    "EMERGENCY STOP — obstacle detected!",
+            "RETURN_TO_CENTER": "Returning to arena centre...",
         }
         action = action_map.get(state, state)
         self._status_labels["Action"].setText(action)
         self._action_label.setText(action)
-        self._det_log.add_entry(f"State → {state}", colour)
+        detection_log_states = {
+            "OBSTACLE_AVOIDANCE": "Obstacle avoidance active",
+            "ESTOP": "E-stop active: obstacle detected",
+            "STOPPED": "Motion stopped",
+        }
+        if state in detection_log_states and state != self._last_detection_log_state:
+            self._det_log.add_entry(detection_log_states[state], colour)
+            self._last_detection_log_state = state
+        elif state not in detection_log_states:
+            self._last_detection_log_state = None
 
     def _on_pose(self, x: float, y: float, yaw: float):
         self._status_labels["Pos X"].setText(f"{x:.2f} m")
         self._status_labels["Pos Y"].setText(f"{y:.2f} m")
         self._map_widget.update_pose(x, y, yaw)
 
+    def _should_log_detection_event(self, key: str, cooldown_s: float = 1.5) -> bool:
+        now = time.monotonic()
+        last = self._last_detection_event_times.get(key, 0.0)
+        if now - last < cooldown_s:
+            return False
+        self._last_detection_event_times[key] = now
+        return True
+
     def _on_letter(self, name: str):
         self._status_labels["Last Letter"].setText(name)
-        self._det_log.add_entry(f"Greek letter detected: {name}", GREEN)
+        if self._should_log_detection_event(f"letter:{name}"):
+            self._det_log.add_entry(f"Greek letter detected: {name}", GREEN)
 
     def _on_colour(self, data: dict):
         """Log entry only — map markers come from the log file poller."""
         label   = data.get("label", "unknown")
         bearing = data.get("bearing_deg", 0.0)
-        elapsed = data.get("elapsed_s", 0.0)
-        colour  = RED if "red" in label else YELLOW
+        rx      = data.get("robot_x", 0.0)
+        ry      = data.get("robot_y", 0.0)
+
+        colour = RED if "red" in label else YELLOW
         self._det_log.add_entry(
-            f"{label}  bearing={bearing:.1f}°  seen={elapsed:.1f}s", colour)
+            f"{label}  dist={dist:.2f}m  bearing={bearing:.1f}°", colour)
+
+        wx = rx + dist * math.cos(math.radians(bearing))
+        wy = ry + dist * math.sin(math.radians(bearing))
+        self._map_widget.add_detection(wx, wy, label, label)
 
     def _on_map(self, msg):
         self._latest_map_msg = msg
@@ -955,14 +1011,12 @@ class RobotGUI(QMainWindow):
 
     def _on_path(self, msg):
         self._map_widget.update_path(msg.poses)
-        self._det_log.add_entry(
-            f"Path updated — {len(msg.poses)} waypoints", ACCENT)
 
     def _on_arena(self, data: dict):
         self._arena_panel.update(data)
 
     def _send_mission_command(self, command: str):
-        if command == "start_wandering":
+        if command in {"start_wandering", "drive_coverage"}:
             self._map_widget.reset_centre_reference()
             self._on_state("MAPPING")
         elif command == "drive_waypoints":
@@ -970,8 +1024,7 @@ class RobotGUI(QMainWindow):
         elif command == "go_home":
             self._on_state("RETURN_TO_CENTER")
         self.signals.mission_command.emit(command)
-        self._det_log.add_entry(f"Command -> {command}", ACCENT)
-        if command not in {"start_wandering", "drive_waypoints", "go_home"}:
+        if command not in {"start_wandering", "drive_coverage", "drive_waypoints", "go_home"}:
             self._action_label.setText(f"Command sent: {command}")
 
     def _save_map(self):
@@ -1116,7 +1169,6 @@ class RobotGUI(QMainWindow):
         colour = GREEN if ok else RED
         self._save_map_label.setText(message)
         self._save_map_label.setStyleSheet(f"color: {colour}; border: none; background: transparent;")
-        self._det_log.add_entry(message, colour)
 
     def _tick_clock(self):
         self._clock_label.setText(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))

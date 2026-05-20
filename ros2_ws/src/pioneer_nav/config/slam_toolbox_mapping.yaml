@@ -9,17 +9,17 @@ slam_toolbox:
     scan_topic: /scan
     mode: mapping
 
-    # Mapping behavior. These are conservative defaults for slow wandering.
+    # Mapping behavior. Laser range matches the TiM7xx-style simulated lidar.
     resolution: 0.05
-    max_laser_range: 8.0
+    max_laser_range: 25.0
     minimum_time_interval: 0.3
     transform_timeout: 2.0
     tf_buffer_duration: 30.0
     map_update_interval: 1.0
 
     # Motion thresholds before adding new scans to the map.
-    minimum_travel_distance: 0.2
-    minimum_travel_heading: 0.2
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.05
 
     # Keep loop closure enabled; useful when the robot revisits areas.
     do_loop_closing: true

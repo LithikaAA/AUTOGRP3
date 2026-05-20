@@ -8,11 +8,10 @@ from enum import Enum
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Pose
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, Pose
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Joy, LaserScan
-from std_msgs.msg import Int8, String
+from std_msgs.msg import String, Int8
 from tf2_msgs.msg import TFMessage
 
 # Configuration defaults
@@ -23,16 +22,16 @@ MAP_SIZE = 15.0
 MAP_HALF_SIZE = MAP_SIZE / 2
 MAP_CENTER = (0.0, 0.0)
 
-OBSTACLE_BUFFER = 0.6
+OBSTACLE_BUFFER = 1.5
 EMERGENCY_STOP_DISTANCE = 0.3
 LIDAR_FRONT_ANGLE_FOV = math.radians(60)
 LIDAR_SIDE_ANGLE_FOV = math.radians(30)
-OBSTACLE_REVERSE_DURATION = 0.7
+OBSTACLE_REVERSE_DURATION = 1
 OBSTACLE_TURN_DURATION = 1.5
 PREDICTIVE_BUFFER = 4.0
 
 TURN_SPEED_DEG = 35.0
-FORWARD_SPEED = 0.3
+FORWARD_SPEED = 0.5
 REVERSE_SPEED = -0.25
 ANGLE_TOLERANCE = 7.0
 TURN_TIMEOUT_MARGIN = 2.0
@@ -51,6 +50,7 @@ MAX_CENTER_ANGLE = 45
 RETURN_TO_CENTER_SPEED = 0.25
 RETURN_TO_CENTER_TURN_SPEED_DEG = 30.0
 RETURN_TO_CENTER_MIN_DISTANCE = 0.5
+
 ESTOP_CLEAR = 0
 ESTOP_WARNING = 1
 ESTOP_ACTIVE = 2
@@ -101,9 +101,9 @@ class ControlNode(Node):
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('joy_deadman_axis', 5)
-        self.declare_parameter('joy_manual_button', 0)  # X: external joystick/manual control
-        self.declare_parameter('joy_auto_button', 1)    # O: autonomous control
-        self.declare_parameter('joy_stop_button', 2)    # Square: emergency stop
+        self.declare_parameter('joy_manual_button', 0)
+        self.declare_parameter('joy_auto_button', 1)
+        self.declare_parameter('joy_stop_button', 2)
         self.declare_parameter('external_manual_control', True)
         self.declare_parameter('forward_speed', FORWARD_SPEED)
         self.declare_parameter('reverse_speed', REVERSE_SPEED)
@@ -153,11 +153,13 @@ class ControlNode(Node):
         self.gazebo_tf_allow_unmatched = bool(self.get_parameter('gazebo_tf_allow_unmatched').value)
         self.publish_gui_topics = bool(self.get_parameter('publish_gui_topics').value)
 
+        # ---- publishers ----
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.pose_pub = self.create_publisher(Pose, robot_pose_topic, 10)
         self.arena_status_pub = self.create_publisher(String, arena_status_topic, 10)
         self.robot_state_pub = self.create_publisher(String, robot_state_topic, 10)
 
+        # ---- subscribers ----
         self.create_subscription(Joy, joy_topic, self.joy_cb, 10)
         self.create_subscription(Odometry, odom_topic, self.odom_cb, 10)
         self.create_subscription(LaserScan, scan_topic, self.lidar_cb, 10)
@@ -171,6 +173,7 @@ class ControlNode(Node):
         self.current_yaw = 0.0
         self.current_x = 0.0
         self.current_y = 0.0
+        self.current_orientation = None
         self.map_origin_x = None if self.center_arena_on_start else self.configured_arena_origin_x
         self.map_origin_y = None if self.center_arena_on_start else self.configured_arena_origin_y
         self.have_odom = False
@@ -199,6 +202,7 @@ class ControlNode(Node):
         self._last_auto_button = False
         self._last_manual_button = False
         self._last_stop_button = False
+        self._last_published_state = None
 
         self.front_min_distance = float('inf')
         self.left_min_distance = float('inf')
@@ -209,10 +213,6 @@ class ControlNode(Node):
 
         self.get_logger().info('Pioneer control node started')
         self.get_logger().info(f'Joy: {joy_topic}, scan: {scan_topic}, odom: {odom_topic}, cmd_vel: {cmd_vel_topic}')
-        self.get_logger().info(
-            f'E-stop: {estop_status_topic}; GUI topics: pose={robot_pose_topic}, '
-            f'arena={arena_status_topic}, state={robot_state_topic}'
-        )
         self.get_logger().info(
             f'Speeds: forward={self.forward_speed:.2f} m/s, reverse={self.reverse_speed:.2f} m/s, '
             f'turn={self.turn_speed_deg:.1f} deg/s'
@@ -227,7 +227,12 @@ class ControlNode(Node):
                 f'(match="{self.gazebo_tf_frame_match}"), otherwise falling back to {odom_topic}.'
             )
 
+    # ------------------------------------------------------------------ #
+    #  MISSION COMMAND & ESTOP CALLBACKS                                  #
+    # ------------------------------------------------------------------ #
+
     def mission_command_cb(self, msg: String):
+        """Handle GUI mission commands: start_wandering, go_home, drive_waypoints"""
         command = msg.data.strip().lower()
         with self.mutex:
             if command == 'start_wandering':
@@ -244,10 +249,8 @@ class ControlNode(Node):
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
-                self.get_logger().info(
-                    'GUI command: Start Wandering accepted by control_node. '
-                    'control_node is now AUTO/WANDERING_TURN and owns /cmd_vel.'
-                )
+                self.get_logger().info('GUI command: Start Wandering accepted. Resuming autonomous mapping.')
+
             elif command == 'go_home':
                 self.external_waypoint_active = False
                 self.reached_home = False
@@ -261,34 +264,112 @@ class ControlNode(Node):
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
-                self.get_logger().info('GUI command: Go Home accepted by control_node. Returning to map/start center.')
+                self.get_logger().info('GUI command: Go Home accepted. Returning to map center with obstacle avoidance.')
+
             elif command == 'drive_waypoints':
                 self.external_waypoint_active = True
                 self.reached_home = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
-                self.get_logger().info('GUI command: paused control_node for distbug waypoint driving.')
+                self.get_logger().info('GUI command: Paused for waypoint driving.')
 
     def estop_status_cb(self, msg: Int8):
+        """Handle external LiDAR e-stop status"""
         with self.mutex:
             previous = self.external_estop_status
             self.external_estop_status = int(msg.data)
-
             if self.external_estop_status == ESTOP_ACTIVE:
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
                 if previous != ESTOP_ACTIVE:
                     self.get_logger().error('External LiDAR E-STOP active. Motion halted.')
-
             elif self.external_estop_status == ESTOP_WARNING:
                 self.publish_twist(0.0, 0.0)
                 if previous != ESTOP_WARNING:
                     self.get_logger().warn('External LiDAR warning active. Pausing motion.')
-
             elif previous != ESTOP_CLEAR:
                 self.get_logger().info('External LiDAR e-stop clear.')
+
+    # ------------------------------------------------------------------ #
+    #  GUI HELPERS                                                         #
+    # ------------------------------------------------------------------ #
+
+    def publish_robot_state(self):
+        """Publish robot state to /robot_state — feeds GUI state badge."""
+        if not self.publish_gui_topics:
+            return
+
+        if self.emergency_stop or self.external_estop_status == ESTOP_ACTIVE:
+            state = 'ESTOP'
+        elif self.external_estop_status == ESTOP_WARNING:
+            state = 'STOPPED'
+        elif self.external_waypoint_active:
+            state = 'WAYPOINT'
+        elif self.reached_home:
+            state = 'REACHED_HOME'
+        elif self.drive_mode == DRIVE_MODE.AUTO:
+            state = 'MAPPING'
+        else:
+            state = 'IDLE'
+
+        if state == self._last_published_state:
+            return
+
+        self._last_published_state = state
+        msg = String()
+        msg.data = state
+        self.robot_state_pub.publish(msg)
+        self.get_logger().info(f'State → {state}')
+
+    def publish_robot_pose(self):
+        """Publish current pose to /robot/pose — feeds GUI map arrow."""
+        if not self.publish_gui_topics or self.current_orientation is None:
+            return
+        msg = Pose()
+        msg.position.x = self.current_x
+        msg.position.y = self.current_y
+        msg.position.z = 0.0
+        msg.orientation = self.current_orientation
+        self.pose_pub.publish(msg)
+
+    def publish_arena_status(self, rel_x, rel_y):
+        """Publish arena debug data to /arena_status — feeds GUI arena panel."""
+        distance_from_center = math.hypot(rel_x, rel_y)
+        outside_x = max(0.0, abs(rel_x) - MAP_HALF_SIZE)
+        outside_y = max(0.0, abs(rel_y) - MAP_HALF_SIZE)
+        outside_distance = math.hypot(outside_x, outside_y)
+        clearance_to_edge = min(MAP_HALF_SIZE - abs(rel_x), MAP_HALF_SIZE - abs(rel_y))
+
+        self.get_logger().info(
+            f'Arena status: state={self.auto_state.name} '
+            f'rel=({rel_x:.2f}, {rel_y:.2f})m '
+            f'center_dist={distance_from_center:.2f}m '
+            f'edge_clearance={clearance_to_edge:.2f}m '
+            f'outside={outside_distance:.2f}m '
+            f'yaw={self.current_yaw:.1f}deg '
+            f'pose_source={self.pose_source}',
+            throttle_duration_sec=1.0
+        )
+
+        if self.publish_gui_topics:
+            msg = String()
+            msg.data = json.dumps({
+                'state': self.auto_state.name,
+                'rel_x': round(rel_x, 2),
+                'rel_y': round(rel_y, 2),
+                'center_dist': round(distance_from_center, 2),
+                'edge_clearance': round(clearance_to_edge, 2),
+                'outside': round(outside_distance, 2),
+                'yaw': round(self.current_yaw, 1),
+                'pose_source': self.pose_source,
+            })
+            self.arena_status_pub.publish(msg)
+
+    # ------------------------------------------------------------------ #
+    #  CALLBACKS                                                           #
+    # ------------------------------------------------------------------ #
 
     def joy_cb(self, msg: Joy):
         with self.mutex:
@@ -308,12 +389,14 @@ class ControlNode(Node):
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
+                self.publish_robot_state()
                 self.get_logger().warn('PS4 Square pressed: emergency stop latched')
 
             if manual_pressed and not self._last_manual_button:
                 self.emergency_stop = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
+                self.publish_robot_state()
                 self.get_logger().info('PS4 X pressed: control node paused for joystick/manual control')
 
             if auto_pressed and not self._last_auto_button:
@@ -327,6 +410,7 @@ class ControlNode(Node):
                 self.turn_start_time = None
                 self.turn_start_yaw = None
                 self.publish_twist(0.0, 0.0)
+                self.publish_robot_state()
                 self.get_logger().info('PS4 O pressed: autonomous mode activated')
 
             self._last_manual_button = manual_pressed
@@ -381,17 +465,20 @@ class ControlNode(Node):
             half_front_idx = int((LIDAR_FRONT_ANGLE_FOV / 2) / angle_inc)
 
             front_indices = [i % n for i in range(center_idx - half_front_idx, center_idx + half_front_idx + 1)]
-            self.front_min_distance = min([ranges[i] for i in front_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            self.front_min_distance = min(
+                [ranges[i] for i in front_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
 
             left_start_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
             left_end_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2 + LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
             left_indices = [i % n for i in range(left_start_idx, left_end_idx + 1)]
-            self.left_min_distance = min([ranges[i] for i in left_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            self.left_min_distance = min(
+                [ranges[i] for i in left_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
 
             right_start_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
             right_end_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2 - LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
             right_indices = [i % n for i in range(right_start_idx, right_end_idx + 1)]
-            self.right_min_distance = min([ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+            self.right_min_distance = min(
+                [ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
 
     def odom_cb(self, msg: Odometry):
         with self.mutex:
@@ -401,6 +488,7 @@ class ControlNode(Node):
             self.current_x = msg.pose.pose.position.x
             self.current_y = msg.pose.pose.position.y
             self.current_yaw = quaternion_to_yaw(msg.pose.pose.orientation)
+            self.current_orientation = msg.pose.pose.orientation
             self.pose_source = 'odom'
             if self.center_arena_on_start and (self.map_origin_x is None or self.map_origin_y is None):
                 self.map_origin_x = self.current_x
@@ -410,7 +498,7 @@ class ControlNode(Node):
                 )
             self.have_odom = True
             self.last_odom_time = time.time()
-            self.publish_robot_pose(msg.pose.pose)
+            self.publish_robot_pose()
 
     def gazebo_tf_cb(self, msg: TFMessage):
         with self.mutex:
@@ -447,6 +535,7 @@ class ControlNode(Node):
             self.current_x = selected.transform.translation.x
             self.current_y = selected.transform.translation.y
             self.current_yaw = quaternion_to_yaw(selected.transform.rotation)
+            self.current_orientation = selected.transform.rotation
             self.pose_source = 'gazebo_tf'
             if self.center_arena_on_start and (self.map_origin_x is None or self.map_origin_y is None):
                 self.map_origin_x = self.current_x
@@ -459,56 +548,21 @@ class ControlNode(Node):
             self.have_odom = True
             self.last_gazebo_tf_time = time.time()
             self.last_odom_time = self.last_gazebo_tf_time
+            self.publish_robot_pose()
+
             if not self._reported_gazebo_tf_pose:
                 self._reported_gazebo_tf_pose = True
                 frame = selected.child_frame_id or selected.header.frame_id or '<blank>'
                 self.get_logger().info(f'Using Gazebo world pose from {self.gazebo_tf_topic}, frame "{frame}".')
-            pose = Pose()
-            pose.position.x = self.current_x
-            pose.position.y = self.current_y
-            pose.position.z = selected.transform.translation.z
-            pose.orientation = selected.transform.rotation
-            self.publish_robot_pose(pose)
+
+    # ------------------------------------------------------------------ #
+    #  CONTROL LOOP                                                        #
+    # ------------------------------------------------------------------ #
 
     def relative_position(self):
         if self.map_origin_x is None or self.map_origin_y is None:
             return 0.0, 0.0
         return self.current_x - self.map_origin_x, self.current_y - self.map_origin_y
-
-    def log_arena_status(self, rel_x, rel_y):
-        distance_from_center = math.hypot(rel_x, rel_y)
-        outside_x = max(0.0, abs(rel_x) - MAP_HALF_SIZE)
-        outside_y = max(0.0, abs(rel_y) - MAP_HALF_SIZE)
-        outside_distance = math.hypot(outside_x, outside_y)
-        clearance_to_edge = min(MAP_HALF_SIZE - abs(rel_x), MAP_HALF_SIZE - abs(rel_y))
-        if self.publish_gui_topics:
-            msg = String()
-            msg.data = json.dumps({
-                'state': self.auto_state.name,
-                'drive_mode': self.drive_mode.name,
-                'rel_x': rel_x,
-                'rel_y': rel_y,
-                'center_dist': distance_from_center,
-                'edge_clearance': clearance_to_edge,
-                'outside': outside_distance,
-                'yaw': self.current_yaw,
-                'pose_source': self.pose_source,
-                'front_min_distance': self.front_min_distance,
-                'left_min_distance': self.left_min_distance,
-                'right_min_distance': self.right_min_distance,
-                'estop_status': self.external_estop_status,
-            })
-            self.arena_status_pub.publish(msg)
-        self.get_logger().info(
-            f'Arena status: state={self.auto_state.name} '
-            f'rel=({rel_x:.2f}, {rel_y:.2f})m '
-            f'center_dist={distance_from_center:.2f}m '
-            f'edge_clearance={clearance_to_edge:.2f}m '
-            f'outside={outside_distance:.2f}m '
-            f'yaw={self.current_yaw:.1f}deg '
-            f'pose_source={self.pose_source}',
-            throttle_duration_sec=1.0
-        )
 
     def control_loop(self):
         with self.mutex:
@@ -543,10 +597,10 @@ class ControlNode(Node):
 
             if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
                 self.get_logger().warn(f'EMERGENCY STOP! Obstacle at {self.front_min_distance:.2f}m.')
+                self.publish_twist(0.0, 0.0)
                 if self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
                     self.handle_return_obstacle_avoidance(emergency=True)
                     return
-                self.publish_twist(0.0, 0.0)
                 if self.auto_state not in [AUTO_STATE.OBSTACLE_REVERSE, AUTO_STATE.OBSTACLE_TURN,
                                            AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN,
                                            AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
@@ -566,7 +620,8 @@ class ControlNode(Node):
                 return
 
             rel_x, rel_y = self.relative_position()
-            self.log_arena_status(rel_x, rel_y)
+            self.publish_arena_status(rel_x, rel_y)
+
             if not (-MAP_HALF_SIZE <= rel_x <= MAP_HALF_SIZE and -MAP_HALF_SIZE <= rel_y <= MAP_HALF_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
                 self.get_logger().warn(f'Robot outside 15x15 arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
                 self.auto_state = AUTO_STATE.RETURN_TO_CENTER
@@ -607,6 +662,10 @@ class ControlNode(Node):
             elif self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
                 self.handle_return_to_center()
 
+    # ------------------------------------------------------------------ #
+    #  STATE HANDLERS                                                      #
+    # ------------------------------------------------------------------ #
+
     def handle_obstacle_reverse(self):
         if time.time() - self.obstacle_maneuver_start_time < OBSTACLE_REVERSE_DURATION:
             self.publish_twist(self.reverse_speed, 0.0)
@@ -615,10 +674,7 @@ class ControlNode(Node):
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.auto_state = AUTO_STATE.OBSTACLE_TURN
             self.obstacle_maneuver_start_time = time.time()
-            if self.left_min_distance > self.right_min_distance:
-                turn_angle = 90
-            else:
-                turn_angle = -90
+            turn_angle = 90 if self.left_min_distance > self.right_min_distance else -90
             self.target_yaw = (self.current_yaw + turn_angle) % 360
             self._start_turn_timer()
             self.get_logger().info(f'Finished obstacle reverse. Initiating obstacle turn to {self.target_yaw:.1f}°.')
@@ -678,8 +734,7 @@ class ControlNode(Node):
     def handle_wandering_drive(self):
         if self.predictive_boundary_check():
             self.get_logger().info('Predictive avoidance: Adjusting course')
-            avoidance_angle = self._calculate_predictive_avoidance_yaw()
-            self.wandering_target_yaw = avoidance_angle
+            self.wandering_target_yaw = self._calculate_predictive_avoidance_yaw()
             self.auto_state = AUTO_STATE.WANDERING_TURN
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.publish_twist(0.0, 0.0)
@@ -710,14 +765,11 @@ class ControlNode(Node):
     def _turn_timed_out(self):
         if self.turn_start_time is None or self.turn_start_yaw is None or self.target_yaw is None:
             return False
-
         requested_angle = abs(signed_angle_diff(self.target_yaw, self.turn_start_yaw))
         expected_duration = requested_angle / max(self.turn_speed_deg, 1.0)
         timeout = max(OBSTACLE_TURN_DURATION, expected_duration + TURN_TIMEOUT_MARGIN)
-
         if time.time() - self.turn_start_time <= timeout:
             return False
-
         remaining = abs(signed_angle_diff(self.target_yaw, self.current_yaw))
         self.get_logger().warn(
             f'Turn timed out with {remaining:.1f} deg remaining. Continuing to avoid spinning forever.',
@@ -752,14 +804,7 @@ class ControlNode(Node):
                 'south': rel_y + MAP_HALF_SIZE,
             }
             closest_boundary = min(boundaries, key=boundaries.get)
-            if closest_boundary == 'east':
-                base_angle = 180
-            elif closest_boundary == 'west':
-                base_angle = 0
-            elif closest_boundary == 'north':
-                base_angle = 270
-            else:
-                base_angle = 90
+            base_angle = {'east': 180, 'west': 0, 'north': 270, 'south': 90}[closest_boundary]
             center_yaw = self._calculate_general_inward_direction()
             angle_offset = random.uniform(MIN_CENTER_ANGLE, MAX_CENTER_ANGLE)
             self.target_yaw = (base_angle * (1 - CENTER_BIAS_STRENGTH) + center_yaw * CENTER_BIAS_STRENGTH + angle_offset) % 360
@@ -781,8 +826,11 @@ class ControlNode(Node):
             self.publish_twist(self.forward_speed, 0.0)
 
     def handle_return_to_center(self):
+        """Return to map center with obstacle avoidance. Called by 'go_home' command."""
         rel_x, rel_y = self.relative_position()
         distance_to_center = math.hypot(rel_x - MAP_CENTER[0], rel_y - MAP_CENTER[1])
+
+        # Check if we've reached home
         if distance_to_center < RETURN_TO_CENTER_MIN_DISTANCE:
             self.get_logger().info(
                 f'REACHED_HOME - returned to map center. '
@@ -798,32 +846,41 @@ class ControlNode(Node):
             self.publish_robot_state()
             return
 
+        # Check for obstacles while returning home
         if self.front_min_distance < OBSTACLE_BUFFER:
             self.handle_return_obstacle_avoidance()
             return
 
+        # Calculate target heading to center
         vec_x = MAP_CENTER[0] - rel_x
         vec_y = MAP_CENTER[1] - rel_y
         target_yaw_to_center_rad = math.atan2(vec_y, vec_x)
         target_yaw_to_center_deg = math.degrees(target_yaw_to_center_rad)
         target_yaw_to_center_norm = (target_yaw_to_center_deg + 360) % 360
+
+        # Update target heading if needed
         if self.target_yaw is None or abs((self.target_yaw - target_yaw_to_center_norm + 360) % 360) > ANGLE_TOLERANCE / 2:
             self.target_yaw = target_yaw_to_center_norm
             self.get_logger().info(f'Returning to center. Recalculating target yaw to {self.target_yaw:.1f}°.')
             if self.transition_stop_end_time <= time.time():
                 self.publish_twist(0.0, 0.0)
                 self.transition_stop_end_time = time.time() + 0.1
+
+        # Execute turn + drive toward center
         angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
         abs_angle_diff = abs(angle_diff)
+
         if abs_angle_diff > ANGLE_TOLERANCE:
             angular_speed = math.copysign(math.radians(self.return_to_center_turn_speed_deg), angle_diff)
             linear_speed = self.return_to_center_speed * 0.1
         else:
             angular_speed = 0.0
             linear_speed = self.return_to_center_speed
+
         self.publish_twist(linear_speed, angular_speed)
 
     def handle_return_obstacle_avoidance(self, emergency=False):
+        """Obstacle avoidance while returning to center."""
         if self.left_min_distance > self.right_min_distance:
             turn_direction = 1.0
             side_name = 'left'
@@ -832,6 +889,7 @@ class ControlNode(Node):
             side_name = 'right'
 
         angular_speed = turn_direction * math.radians(self.return_to_center_turn_speed_deg)
+
         if emergency:
             linear_speed = self.reverse_speed * 0.6
             self.get_logger().warn(
@@ -931,38 +989,9 @@ class ControlNode(Node):
         cmd = Twist()
         MIN_LINEAR_CMD = 0.05
         MIN_ANGULAR_CMD = math.radians(5.0)
-        if abs(linear) > 0 and abs(linear) < MIN_LINEAR_CMD:
-            cmd.linear.x = math.copysign(MIN_LINEAR_CMD, linear)
-        else:
-            cmd.linear.x = float(linear)
-        if abs(angular) > 0 and abs(angular) < MIN_ANGULAR_CMD:
-            cmd.angular.z = math.copysign(MIN_ANGULAR_CMD, angular)
-        else:
-            cmd.angular.z = float(angular)
+        cmd.linear.x = float(math.copysign(MIN_LINEAR_CMD, linear) if 0 < abs(linear) < MIN_LINEAR_CMD else linear)
+        cmd.angular.z = float(math.copysign(MIN_ANGULAR_CMD, angular) if 0 < abs(angular) < MIN_ANGULAR_CMD else angular)
         self.cmd_pub.publish(cmd)
-
-    def publish_robot_pose(self, pose: Pose):
-        if self.publish_gui_topics:
-            self.pose_pub.publish(pose)
-
-    def publish_robot_state(self):
-        if not self.publish_gui_topics:
-            return
-
-        if self.emergency_stop or self.external_estop_status == ESTOP_ACTIVE:
-            state = 'ESTOP'
-        elif self.external_estop_status == ESTOP_WARNING:
-            state = 'STOPPED'
-        elif self.external_waypoint_active:
-            state = 'WAYPOINT'
-        elif self.reached_home:
-            state = 'REACHED_HOME'
-        elif self.drive_mode == DRIVE_MODE.AUTO:
-            state = 'MAPPING'
-        else:
-            state = 'IDLE'
-
-        self.robot_state_pub.publish(String(data=state))
 
 
 def main(args=None):
