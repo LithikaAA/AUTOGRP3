@@ -28,23 +28,24 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-slam-toolbox \
     ros-jazzy-nav2-map-server \
     ros-jazzy-nav2-lifecycle-manager \
+    ros-jazzy-nav2-bringup \
+    ros-jazzy-nav2-planners \
+    ros-jazzy-nav2-controllers \
+    ros-jazzy-nav2-bt-navigator \
+    ros-jazzy-nav2-behaviors \
+    ros-jazzy-nav2-costmap-2d \
     ros-jazzy-joy \
     ros-jazzy-teleop-twist-joy \
     ros-jazzy-nmea-navsat-driver \
     ros-jazzy-teleop-twist-keyboard \
     ros-jazzy-cv-bridge \
-    # lidar
     ros-jazzy-sick-scan-xd \
     ros-jazzy-depthai-ros \
     ros-jazzy-diagnostic-updater \
-    ros-jazzy-depthai-ros \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python packages
-RUN pip install depthai --break-system-packages
-# Install Python packages
+# Install Python packages (with --break-system-packages flag)
 RUN pip install depthai onnxruntime --break-system-packages
-
 
 # Locale
 RUN locale-gen en_US en_US.UTF-8 && \
@@ -56,20 +57,6 @@ RUN git clone https://github.com/reedhedges/AriaCoda.git /opt/AriaCoda && \
     cd /opt/AriaCoda && \
     make -j2 && \
     make install
-
-RUN apt-get update && apt-get install -y \
-    # ... existing packages ...
-    ros-jazzy-nav2-bringup \
-    ros-jazzy-nav2-map-server \
-    ros-jazzy-nav2-lifecycle-manager \
-    ros-jazzy-nav2-planner \
-    ros-jazzy-nav2-controller \
-    ros-jazzy-nav2-bt-navigator \
-    ros-jazzy-nav2-behaviors \
-    ros-jazzy-nav2-costmap-2d \
-    ros-jazzy-nav2-util \
-    ros-jazzy-nav2-recoveries \
-    && rm -rf /var/lib/apt/lists/*
 
 ENV LD_LIBRARY_PATH=/usr/local/lib
 
