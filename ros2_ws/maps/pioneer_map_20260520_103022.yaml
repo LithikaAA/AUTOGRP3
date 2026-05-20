@@ -1,0 +1,7 @@
+image: pioneer_map_20260520_103022.png
+mode: trinary
+resolution: 0.05000000
+origin: [-9.50179596, -17.62975563, 0.00000000]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25
