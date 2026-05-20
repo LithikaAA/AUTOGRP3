@@ -81,6 +81,7 @@ FONT_BODY = "DejaVu Sans"
 
 # Path to the detection log written by unified_detector_node
 DETECTION_LOG_PATH = os.path.expanduser("~/part3_logs/detections_log.jsonl")
+LIDAR_SELF_MASK_MIN_RANGE = float(os.environ.get("PIONEER_GUI_LIDAR_SELF_MASK_MIN_RANGE", "0.18"))
 
 
 # ──────────────────────────────────────────────
@@ -341,10 +342,11 @@ class MapWidget(QWidget):
 
         hits = []
         now = time.time()
+        min_usable_range = max(msg.range_min, LIDAR_SELF_MASK_MIN_RANGE)
         step = max(1, len(msg.ranges) // 180)
         for i in range(0, len(msg.ranges), step):
             r = msg.ranges[i]
-            if math.isnan(r) or r < msg.range_min:
+            if math.isnan(r) or r <= min_usable_range:
                 continue
             hit_obstacle = math.isfinite(r)
             if not hit_obstacle:

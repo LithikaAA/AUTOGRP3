@@ -129,6 +129,7 @@ class WaypointController(Node):
         self.declare_parameter("waypoint_critical_reverse_speed", -0.25)
         self.declare_parameter("front_obstacle_fov_deg", 130.0)
         self.declare_parameter("side_obstacle_fov_deg", 90.0)
+        self.declare_parameter("lidar_self_filter_min_range", 0.18)
         self.declare_parameter("angular_gain", 1.4)
         self.declare_parameter("max_angular_speed", 0.55)
         self.declare_parameter("control_rate_hz", 10.0)
@@ -244,6 +245,9 @@ class WaypointController(Node):
         )
         self.front_obstacle_fov = math.radians(float(self.get_parameter("front_obstacle_fov_deg").value))
         self.side_obstacle_fov = math.radians(float(self.get_parameter("side_obstacle_fov_deg").value))
+        self.lidar_self_filter_min_range = max(
+            0.0, float(self.get_parameter("lidar_self_filter_min_range").value)
+        )
         self.angular_gain = float(self.get_parameter("angular_gain").value)
         self.max_angular_speed = float(self.get_parameter("max_angular_speed").value)
         control_rate_hz = max(1.0, float(self.get_parameter("control_rate_hz").value))
@@ -405,8 +409,9 @@ class WaypointController(Node):
         right = []
         left_centre = math.pi / 2.0
         right_centre = -math.pi / 2.0
+        min_usable_range = max(msg.range_min, self.lidar_self_filter_min_range)
         for idx, raw_range in enumerate(msg.ranges):
-            if not math.isfinite(raw_range) or raw_range <= 0.01:
+            if not math.isfinite(raw_range) or raw_range <= min_usable_range:
                 continue
             if msg.range_min > 0.0 and raw_range < msg.range_min:
                 continue
@@ -461,7 +466,7 @@ class WaypointController(Node):
 
         range_max = msg.range_max if msg.range_max > 0.0 else 25.0
         for idx, raw_range in enumerate(msg.ranges):
-            if not math.isfinite(raw_range) or raw_range <= max(msg.range_min, 0.2):
+            if not math.isfinite(raw_range) or raw_range <= max(msg.range_min, self.lidar_self_filter_min_range):
                 continue
             if raw_range >= range_max * 0.96:
                 continue

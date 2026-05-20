@@ -24,8 +24,8 @@ MAP_SIZE = 15.0
 MAP_HALF_SIZE = MAP_SIZE / 2
 MAP_CENTER = (0.0, 0.0)
 
-OBSTACLE_BUFFER = 0.6
-EMERGENCY_STOP_DISTANCE = 0.3
+OBSTACLE_BUFFER = 0.45
+EMERGENCY_STOP_DISTANCE = 0.22
 LIDAR_FRONT_ANGLE_FOV = math.radians(35)
 LIDAR_SIDE_ANGLE_FOV = math.radians(30)
 LIDAR_SELF_FILTER_MIN_RANGE = 0.25
@@ -115,6 +115,8 @@ class ControlNode(Node):
         self.declare_parameter('turn_speed_deg', TURN_SPEED_DEG)
         self.declare_parameter('return_to_center_speed', RETURN_TO_CENTER_SPEED)
         self.declare_parameter('return_to_center_turn_speed_deg', RETURN_TO_CENTER_TURN_SPEED_DEG)
+        self.declare_parameter('obstacle_buffer', OBSTACLE_BUFFER)
+        self.declare_parameter('emergency_stop_distance', EMERGENCY_STOP_DISTANCE)
         self.declare_parameter('lidar_front_angle_deg', math.degrees(LIDAR_FRONT_ANGLE_FOV))
         self.declare_parameter('lidar_side_angle_deg', math.degrees(LIDAR_SIDE_ANGLE_FOV))
         self.declare_parameter('lidar_self_filter_min_range', LIDAR_SELF_FILTER_MIN_RANGE)
@@ -153,6 +155,8 @@ class ControlNode(Node):
         self.turn_speed_deg = float(self.get_parameter('turn_speed_deg').value)
         self.return_to_center_speed = float(self.get_parameter('return_to_center_speed').value)
         self.return_to_center_turn_speed_deg = float(self.get_parameter('return_to_center_turn_speed_deg').value)
+        self.obstacle_buffer = float(self.get_parameter('obstacle_buffer').value)
+        self.emergency_stop_distance = float(self.get_parameter('emergency_stop_distance').value)
         self.lidar_front_angle_fov = math.radians(float(self.get_parameter('lidar_front_angle_deg').value))
         self.lidar_side_angle_fov = math.radians(float(self.get_parameter('lidar_side_angle_deg').value))
         self.lidar_self_filter_min_range = float(self.get_parameter('lidar_self_filter_min_range').value)
@@ -772,7 +776,7 @@ class ControlNode(Node):
                 self.get_logger().warn('Odometry is stale; stopping autonomous movement.', throttle_duration_sec=2.0)
                 return
 
-            if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
+            if self.front_min_distance < self.emergency_stop_distance:
                 self.get_logger().warn(f'EMERGENCY STOP! Obstacle at {self.front_min_distance:.2f}m.')
                 self.publish_twist(0.0, 0.0)
                 if self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
@@ -814,7 +818,7 @@ class ControlNode(Node):
                 self.reverse_start_time = time.time()
                 return
 
-            if self.front_min_distance < OBSTACLE_BUFFER and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
+            if self.front_min_distance < self.obstacle_buffer and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
                 self.get_logger().info(f'Obstacle detected in front (LIDAR) at {self.front_min_distance:.2f}m. Initiating avoidance.')
                 self.auto_state = AUTO_STATE.OBSTACLE_REVERSE
                 self.obstacle_maneuver_start_time = time.time()
@@ -1031,7 +1035,7 @@ class ControlNode(Node):
             return
 
         # Check for obstacles while returning home
-        if self.front_min_distance < OBSTACLE_BUFFER:
+        if self.front_min_distance < self.obstacle_buffer:
             self.handle_return_obstacle_avoidance()
             return
 
