@@ -80,7 +80,7 @@ class WaypointController(Node):
         self.declare_parameter("detection_goal_standoff_m", 0.6)
         self.declare_parameter("detection_min_distance_m", 0.05)
         self.declare_parameter("detection_max_age_s", 0.0)
-        self.declare_parameter("use_astar", True)
+        self.declare_parameter("use_astar", False)  # enable only when binary map CSV exists
         self.declare_parameter("map_yaml", "")
         self.declare_parameter("binary_map_csv", "")
         self.declare_parameter("astar_obstacle_inflation_m", 0.25)
@@ -115,12 +115,12 @@ class WaypointController(Node):
         self.declare_parameter("relative_to_start", True)
         self.declare_parameter("auto_start", False)
         self.declare_parameter("use_test_waypoint", False)
-        self.declare_parameter("goal_tolerance", 0.35)
+        self.declare_parameter("goal_tolerance", 0.5)
         self.declare_parameter("waypoint_goal_tolerance", 0.0)
         self.declare_parameter("heading_tolerance_deg", 10.0)
-        self.declare_parameter("linear_speed", 0.16)
+        self.declare_parameter("linear_speed", 0.22)
         self.declare_parameter("waypoint_linear_speed", 0.0)
-        self.declare_parameter("slow_linear_speed", 0.05)
+        self.declare_parameter("slow_linear_speed", 0.08)
         self.declare_parameter("waypoint_slow_linear_speed", 0.0)
         self.declare_parameter("enable_waypoint_obstacle_avoidance", True)
         self.declare_parameter("waypoint_obstacle_linear_speed", 0.0)
@@ -577,6 +577,14 @@ class WaypointController(Node):
                 self.get_logger().info("Ignoring duplicate drive_coverage command; coverage is already active.")
                 return
             self.start_waypoints(coverage_mode=True)
+        elif command.startswith("drive_to:"):
+            raw_names = command[len("drive_to:"):].split(",")
+            names = [n.strip() for n in raw_names if n.strip()]
+            self.start_named_waypoints(names, optimise_order=True)
+        elif command.startswith("drive_to_ordered:"):
+            raw_names = command[len("drive_to_ordered:"):].split(",")
+            names = [n.strip() for n in raw_names if n.strip()]
+            self.start_named_waypoints(names, optimise_order=False)
         elif command in {"go_home", "start_wandering", "stop_waypoints"}:
             if self.active:
                 self.get_logger().info(f"Stopping waypoint controller because command '{command}' was received.")
@@ -689,7 +697,8 @@ class WaypointController(Node):
         except (TypeError, ValueError):
             return None
 
-        angle = robot_yaw + bearing_rad
+        # Negative bearing: right in camera image = clockwise = negative yaw in ROS
+        angle = robot_yaw - bearing_rad
         return base_x + distance_m * math.cos(angle), base_y + distance_m * math.sin(angle)
 
     def load_detection_waypoints(self) -> List[Tuple[float, float]]:
@@ -1509,6 +1518,101 @@ class WaypointController(Node):
             return Twist()
 
         return None
+
+
+    def _tsp_nearest_neighbor(self, waypoints):
+        """Nearest-neighbour TSP — short visit order from current position."""
+        if len(waypoints) <= 1:
+            return waypoints
+        remaining = list(waypoints)
+        ordered = []
+        cx, cy = self.current_x, self.current_y
+        while remaining:
+            nearest = min(remaining, key=lambda p: math.hypot(p[0] - cx, p[1] - cy))
+            ordered.append(nearest)
+            remaining.remove(nearest)
+            cx, cy = nearest
+        return ordered
+
+    def load_named_detection_waypoints(self, names):
+        """Load world positions for specific named objects from detections_log.jsonl."""
+        records = self.load_detection_records()
+        name_lower = [n.strip().lower() for n in names]
+        best = {}
+        for record in records:
+            rec_name = str(record.get("name") or record.get("label") or "").lower()
+            if rec_name not in name_lower:
+                continue
+            world_pos = self.detection_world_position(record)
+            if world_pos is None:
+                continue
+            obj_x, obj_y = world_pos
+            dist = math.hypot(obj_x - self.start_x, obj_y - self.start_y)
+            if rec_name not in best or dist < math.hypot(
+                best[rec_name][0] - self.start_x, best[rec_name][1] - self.start_y
+            ):
+                best[rec_name] = (obj_x, obj_y)
+        for n in name_lower:
+            if n not in best:
+                self.get_logger().warn(f"Named waypoint '{n}' not found in detections log.")
+        ordered = []
+        seen = set()
+        for n in name_lower:
+            if n in best and n not in seen:
+                obj_x, obj_y = best[n]
+                rel_x = obj_x - self.start_x
+                rel_y = obj_y - self.start_y
+                dist = math.hypot(rel_x, rel_y)
+                standoff = min(self.detection_goal_standoff_m, max(0.0, dist - self.goal_tolerance))
+                if standoff > 0.0 and dist > 0:
+                    scale = (dist - standoff) / dist
+                    rel_x *= scale
+                    rel_y *= scale
+                ordered.append((rel_x, rel_y))
+                seen.add(n)
+                self.get_logger().info(
+                    f"Named waypoint '{n}': world=({obj_x:.2f},{obj_y:.2f}) goal_rel=({rel_x:.2f},{rel_y:.2f})")
+        return ordered
+
+    def start_named_waypoints(self, names, optimise_order=True):
+        """Drive to specific named detected objects then return home."""
+        if not self.have_pose:
+            self.get_logger().warn("drive_to requested but no pose yet.")
+            return
+        self.start_x = self.current_x
+        self.start_y = self.current_y
+        self.coverage_mode = False
+        waypoints = self.load_named_detection_waypoints(names)
+        if not waypoints:
+            self.get_logger().warn("No named waypoints found — aborting.")
+            return
+        if optimise_order:
+            world_wps = [(self.start_x + rx, self.start_y + ry) for rx, ry in waypoints]
+            waypoints = [(wx - self.start_x, wy - self.start_y)
+                         for wx, wy in self._tsp_nearest_neighbor(world_wps)]
+        self.relative_waypoints = waypoints
+        self.world_waypoints = [
+            (self.start_x + rx, self.start_y + ry) for rx, ry in self.relative_waypoints
+        ]
+        self.home_start_idx = len(self.world_waypoints)
+        self.world_waypoints.append((self.start_x, self.start_y))
+        self.current_idx = 0
+        self.goal_achieved = False
+        self.returning_home_reported = False
+        self.obstacle_avoidance_active = False
+        self.obstacle_avoidance_phase = "clear"
+        self.obstacle_turn_target_yaw = None
+        self.obstacle_turn_dir = 1.0
+        self.obstacle_rejoin_ignore_until = 0.0
+        self.coverage_scan_until = 0.0
+        self.coverage_scan_active_idx = -1
+        self.active = True
+        self._last_status_log = 0.0
+        self.publish_robot_state("WAYPOINT")
+        self.stop_robot()
+        self.publish_planned_path()
+        self.get_logger().info(
+            f"Named waypoint drive: {names} -> {len(self.world_waypoints)} route points")
 
     def finish_waypoints(self):
         if self.goal_achieved:
