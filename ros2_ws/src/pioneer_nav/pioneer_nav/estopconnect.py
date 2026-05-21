@@ -1,39 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-LiDAR E-STOP -> moving obstacle detection
-
-- checks the front cone only (30 deg either way) for moving obstacles
-- two zones:
-    -> within 5m: warning, stop and wait until clear
-    -> within 1m: EMERGENCY STOP, immediate halt, log incident + save rosbag
-        > this is PERMANENT, robot does not resume, human must reset
-
-- publishes /estop_status so other nodes know what state we're in:
-    0 = all clear
-    1 = warning (moving obstacle 1-5m), will resume when clear
-    2 = emergency stop (moving obstacle within 1m), PERMANENT
-
-How moving detection works:
-- we compare each lidar scan to the previous one
-- stationary objects while the robot moves usually change at a consistent rate
-  (example: walls slowly getting closer as the robot drives forward)
-- sudden larger changes are treated as moving obstacles
-- needs 5 rays to agree before triggering (reduces false positives)
-- only checks the front 30 deg cone since side objects are less important
-
-How rosbag rolling buffer works (lowkey might replace this):
-- a rosbag is ALWAYS recording in the background
-- restarts every 5 seconds so when estop triggers, bag has last ~5 seconds
-- when estop triggers, we stop (save) the current bag then start a fresh one
-- bag records /scan and /cmd_vel so you can see exactly what lidar saw
-  and what commands were being sent right before the estop
-
-Topics:
-- subscribes to: /scan
-- publishes to:  /cmd_vel, /estop_status
-"""
-
 import math
 import subprocess
 import os
@@ -119,14 +85,12 @@ class LidarEstop(Node):
 
         # rolling bag restart every bagsecs seconds
         self.create_timer(float(bagsecs), self.restartbag)
-
+        
         self.startbag()
-
         self.get_logger().info("LiDAR E-STOP node started. Watching for moving obstacles...")
 
 
     # rosbag helpers
-
     def startbag(self):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         bagpath = os.path.join(self.bagdirect, f"rolling_{timestamp}")
@@ -149,7 +113,7 @@ class LidarEstop(Node):
         self.startbag()
 
     def savethebag(self):
-        # stops current bag (saves last ~5 seconds of /scan + /cmd_vel)
+        # stops current bag
         # then kicks off a fresh one so recording continues
         self.get_logger().info("Saving incident rosbag...")
         self.stopbag()
@@ -212,7 +176,7 @@ class LidarEstop(Node):
             # how much did this ray spike above its normal drift?
             deviation = instantchange - avgdrift
 
-            # only flag if the spike is significant (sudden change, not steady drift)
+            # only flag if the spike is significant (sudden change)
             if deviation >= drifttol:
                 if rangenow <= self.stopdist:
                     estopmoovehits += 1
@@ -255,7 +219,6 @@ class LidarEstop(Node):
 
 
     # write incident to log file
-
     def logincident(self, closest: float, hits: int):
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] ESTOP triggered! - Moving obstacle at {closest:.2f}m ({hits} ray hits)\n"
@@ -269,7 +232,6 @@ class LidarEstop(Node):
 
     # control loop, runs on the timer
     # steady state only, immediate stops happen in lidarcb
-
     def controloop(self):
         if self.estopON:
             self.sendvelo(0.0)
