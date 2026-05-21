@@ -28,6 +28,10 @@ LIDAR_FRONT_ANGLE_FOV = math.radians(60)
 LIDAR_SIDE_ANGLE_FOV = math.radians(30)
 OBSTACLE_REVERSE_DURATION = 0.7
 OBSTACLE_TURN_DURATION = 1.5
+OBSTACLE_FOLLOW_SPEED = 0.18
+OBSTACLE_RIGHT_CLEAR_DISTANCE = 0.45
+OBSTACLE_RIGHT_CLEAR_HOLD_S = 0.8
+OBSTACLE_MAX_FOLLOW_DURATION = 8.0
 PREDICTIVE_BUFFER = 4.0
 
 TURN_SPEED_DEG = 35.0
@@ -59,6 +63,39 @@ COVERAGE_SCAN_SPIN_S = 6.0
 COVERAGE_SCAN_TURN_SPEED = 0.65
 COVERAGE_ROW_MIDPOINT_SCANS = True
 
+DISTBUG_RANGE_INFLATION_M = 0.20
+DISTBUG_FRONT_DETECT_M = 0.45
+DISTBUG_FRONT_CAUTION_M = 0.36
+DISTBUG_FRONT_HARD_STOP_M = 0.16
+DISTBUG_FRONT_EMERGENCY_TURN_M = 0.23
+DISTBUG_SIDE_DETECT_M = 0.38
+DISTBUG_SIDE_BUFFER_M = 0.24
+DISTBUG_SIDE_HARD_STOP_M = 0.12
+DISTBUG_SIDE_EMERGENCY_TURN_M = 0.23
+DISTBUG_HARD_KEEP_OUT_M = 0.32
+DISTBUG_SIDE_ADVANTAGE_MARGIN_M = 0.06
+DISTBUG_MAX_GOAL_STEER_DEG = 30.0
+DISTBUG_MAX_AVOID_STEER_DEG = 32.0
+DISTBUG_MAX_TOTAL_STEER_DEG = 55.0
+DISTBUG_HEADING_LIMIT_DEG = 20.0
+DISTBUG_MEMORY_HOLD_STEPS = 14
+DISTBUG_MEMORY_BIAS_DEG = 16.0
+DISTBUG_AVOID_BYPASS_STEPS = 16
+DISTBUG_AVOID_CLEAR_STEPS = 5
+DISTBUG_ARC_SPEED = 0.17
+DISTBUG_ARC_SLOW_SPEED = 0.11
+DISTBUG_ARC_TURN_SCALE = 0.75
+DISTBUG_GOAL_REACQUIRE_ANGLE_DEG = 12.0
+DISTBUG_GOAL_REACQUIRE_DONE_DEG = 4.0
+DISTBUG_GOAL_REACQUIRE_SPEED = 0.19
+DISTBUG_FINAL_APPROACH_M = 1.0
+DISTBUG_FINAL_ALIGN_STOP_DEG = 8.0
+DISTBUG_FINAL_ALIGN_SLOW_DEG = 3.0
+DISTBUG_BLOCKED_WAYPOINT_M = 1.2
+DISTBUG_WAYPOINT_PROGRESS_EPS_M = 0.06
+DISTBUG_STUCK_TIMEOUT_S = 4.0
+DISTBUG_TURN_SPEED_DEG = 80.0
+
 ESTOP_CLEAR = 0
 ESTOP_WARNING = 1
 ESTOP_ACTIVE = 2
@@ -83,6 +120,8 @@ class AUTO_STATE(Enum):
     COVERAGE_TURN = 10
     COVERAGE_DRIVE = 11
     COVERAGE_SCAN = 12
+    OBSTACLE_FOLLOW = 13
+    OBSTACLE_RETURN_TURN = 14
 
 
 def quaternion_to_yaw(orientation):
@@ -235,6 +274,9 @@ class ControlNode(Node):
         self.turn_start_yaw = None
         self.reverse_start_time = 0.0
         self.obstacle_maneuver_start_time = 0.0
+        self.obstacle_original_yaw = None
+        self.obstacle_follow_start_time = 0.0
+        self.obstacle_right_clear_since = None
         self.transition_stop_end_time = 0.0
         self.last_linear = 0.0
         self.last_angular = 0.0
@@ -258,6 +300,22 @@ class ControlNode(Node):
         self.front_min_distance = float('inf')
         self.left_min_distance = float('inf')
         self.right_min_distance = float('inf')
+        self.front_left_clearance = float('inf')
+        self.front_clearance = float('inf')
+        self.front_right_clearance = float('inf')
+        self.wide_front_clearance = float('inf')
+        self.wide_left_clearance = float('inf')
+        self.wide_right_clearance = float('inf')
+        self.avoid_memory_sign = 0
+        self.avoid_memory_hold_steps = 0
+        self.avoidance_active = False
+        self.avoidance_turn_sign = 0
+        self.avoidance_bypass_steps = 0
+        self.avoidance_clear_steps = 0
+        self.goal_realign_active = False
+        self.previous_heading_deg = 0.0
+        self.best_goal_distance = float('inf')
+        self.last_goal_progress_time = time.time()
 
         self.mutex = threading.Lock()
         self.create_timer(0.1, self.control_loop)
@@ -389,6 +447,7 @@ class ControlNode(Node):
         self.coverage_idx = 0
         self.coverage_scan_until = 0.0
         self.coverage_scan_then_advance = False
+        self.reset_coverage_avoidance()
         self.reached_home = False
         self.emergency_stop = False
         self.drive_mode = DRIVE_MODE.AUTO
@@ -646,6 +705,12 @@ class ControlNode(Node):
                 self.front_min_distance = float('inf')
                 self.left_min_distance = float('inf')
                 self.right_min_distance = float('inf')
+                self.front_left_clearance = float('inf')
+                self.front_clearance = float('inf')
+                self.front_right_clearance = float('inf')
+                self.wide_front_clearance = float('inf')
+                self.wide_left_clearance = float('inf')
+                self.wide_right_clearance = float('inf')
                 return
 
             n = len(ranges)
@@ -669,6 +734,34 @@ class ControlNode(Node):
             right_indices = [i % n for i in range(right_start_idx, right_end_idx + 1)]
             self.right_min_distance = min(
                 [ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > self.lidar_self_filter_min_range] or [float('inf')])
+
+            self.front_left_clearance = self.scan_sector_clearance(msg, 30.0, 12.0)
+            self.front_clearance = self.scan_sector_clearance(msg, 0.0, 16.0)
+            self.front_right_clearance = self.scan_sector_clearance(msg, -30.0, 12.0)
+            self.wide_front_clearance = self.scan_sector_clearance(msg, 0.0, 75.0)
+            self.wide_left_clearance = self.scan_sector_clearance(msg, 55.0, 35.0)
+            self.wide_right_clearance = self.scan_sector_clearance(msg, -55.0, 35.0)
+
+    def scan_sector_clearance(self, msg: LaserScan, center_deg, half_width_deg):
+        if not msg.ranges or msg.angle_increment == 0.0:
+            return float('inf')
+
+        start_angle = math.radians(center_deg - half_width_deg)
+        end_angle = math.radians(center_deg + half_width_deg)
+        start_idx = int(round((start_angle - msg.angle_min) / msg.angle_increment))
+        end_idx = int(round((end_angle - msg.angle_min) / msg.angle_increment))
+        start_idx = max(0, min(len(msg.ranges) - 1, start_idx))
+        end_idx = max(0, min(len(msg.ranges) - 1, end_idx))
+        if start_idx > end_idx:
+            start_idx, end_idx = end_idx, start_idx
+
+        clearance = float('inf')
+        for idx in range(start_idx, end_idx + 1):
+            value = msg.ranges[idx]
+            if math.isnan(value) or math.isinf(value) or value <= self.lidar_self_filter_min_range:
+                continue
+            clearance = min(clearance, max(0.0, value - DISTBUG_RANGE_INFLATION_M))
+        return clearance
 
     def odom_cb(self, msg: Odometry):
         with self.mutex:
@@ -793,6 +886,7 @@ class ControlNode(Node):
                     self.handle_return_obstacle_avoidance(emergency=True)
                     return
                 if self.auto_state not in [AUTO_STATE.OBSTACLE_REVERSE, AUTO_STATE.OBSTACLE_TURN,
+                                           AUTO_STATE.OBSTACLE_FOLLOW, AUTO_STATE.OBSTACLE_RETURN_TURN,
                                            AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN,
                                            AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
                     self.auto_state = AUTO_STATE.OBSTACLE_REVERSE
@@ -804,6 +898,12 @@ class ControlNode(Node):
                 return
             if self.auto_state == AUTO_STATE.OBSTACLE_TURN:
                 self.handle_obstacle_turn()
+                return
+            if self.auto_state == AUTO_STATE.OBSTACLE_FOLLOW:
+                self.handle_obstacle_follow()
+                return
+            if self.auto_state == AUTO_STATE.OBSTACLE_RETURN_TURN:
+                self.handle_obstacle_return_turn()
                 return
 
             if time.time() < self.transition_stop_end_time:
@@ -835,7 +935,7 @@ class ControlNode(Node):
                 self.reverse_start_time = time.time()
                 return
 
-            if self.front_min_distance < self.obstacle_buffer and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
+            if self.front_min_distance < self.obstacle_buffer and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER, AUTO_STATE.OBSTACLE_FOLLOW, AUTO_STATE.OBSTACLE_RETURN_TURN]:
                 self.get_logger().info(f'Obstacle detected in front (LIDAR) at {self.front_min_distance:.2f}m. Initiating avoidance.')
                 self.coverage_scan_until = 0.0
                 self.coverage_scan_then_advance = False
@@ -880,10 +980,13 @@ class ControlNode(Node):
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.auto_state = AUTO_STATE.OBSTACLE_TURN
             self.obstacle_maneuver_start_time = time.time()
-            turn_angle = 90 if self.left_min_distance > self.right_min_distance else -90
-            self.target_yaw = (self.current_yaw + turn_angle) % 360
+            self.obstacle_original_yaw = self.current_yaw
+            self.obstacle_right_clear_since = None
+            self.target_yaw = (self.current_yaw + 90) % 360
             self._start_turn_timer()
-            self.get_logger().info(f'Finished obstacle reverse. Initiating obstacle turn to {self.target_yaw:.1f}°.')
+            self.get_logger().info(
+                f'Finished obstacle reverse. Turning left to {self.target_yaw:.1f}° so the obstacle stays on the right.'
+            )
 
     def handle_obstacle_turn(self):
         angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
@@ -891,12 +994,72 @@ class ControlNode(Node):
         if abs_angle_diff < ANGLE_TOLERANCE or self._turn_timed_out():
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+            self.auto_state = AUTO_STATE.OBSTACLE_FOLLOW
+            self.obstacle_follow_start_time = time.time()
+            self.obstacle_right_clear_since = None
+            self.target_yaw = None
+            self.turn_start_time = None
+            self.turn_start_yaw = None
+            self.get_logger().info('Finished obstacle turn. Driving straight until right side is clear.')
+        else:
+            angular_speed = math.copysign(math.radians(self.turn_speed_deg), angle_diff)
+            self.publish_twist(0.0, angular_speed)
+
+    def handle_obstacle_follow(self):
+        now = time.time()
+        if now < self.transition_stop_end_time:
+            self.publish_twist(0.0, 0.0)
+            return
+
+        right_clear = self.right_min_distance > OBSTACLE_RIGHT_CLEAR_DISTANCE
+        front_clear = self.front_min_distance > self.obstacle_buffer
+
+        if right_clear and front_clear:
+            if self.obstacle_right_clear_since is None:
+                self.obstacle_right_clear_since = now
+        else:
+            self.obstacle_right_clear_since = None
+
+        clear_long_enough = (
+            self.obstacle_right_clear_since is not None and
+            now - self.obstacle_right_clear_since >= OBSTACLE_RIGHT_CLEAR_HOLD_S
+        )
+        timed_out = now - self.obstacle_follow_start_time >= OBSTACLE_MAX_FOLLOW_DURATION
+
+        if clear_long_enough or timed_out:
+            self.publish_twist(0.0, 0.0)
+            self.transition_stop_end_time = now + TRANSITION_STOP_DURATION
+            self.auto_state = AUTO_STATE.OBSTACLE_RETURN_TURN
+            self.target_yaw = self.obstacle_original_yaw if self.obstacle_original_yaw is not None else self.current_yaw
+            self._start_turn_timer()
+            reason = 'right side clear' if clear_long_enough else 'follow timeout'
+            self.get_logger().info(f'Obstacle follow complete ({reason}). Turning right back to {self.target_yaw:.1f}°.')
+            return
+
+        angular_speed = 0.0
+        if self.obstacle_original_yaw is not None:
+            follow_yaw = (self.obstacle_original_yaw + 90) % 360
+            angle_diff = signed_angle_diff(follow_yaw, self.current_yaw)
+            angular_speed = math.radians(self._limit(angle_diff * 0.4, self.turn_speed_deg * 0.5))
+        self.publish_twist(min(OBSTACLE_FOLLOW_SPEED, self.forward_speed), angular_speed)
+
+    def handle_obstacle_return_turn(self):
+        if time.time() < self.transition_stop_end_time:
+            self.publish_twist(0.0, 0.0)
+            return
+
+        angle_diff = signed_angle_diff(self.target_yaw, self.current_yaw)
+        if abs(angle_diff) < ANGLE_TOLERANCE or self._turn_timed_out():
+            self.publish_twist(0.0, 0.0)
+            self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.auto_state = AUTO_STATE.COVERAGE_TURN if self.coverage_active else AUTO_STATE.WANDERING_DRIVE
             self.target_yaw = None
             self.turn_start_time = None
             self.turn_start_yaw = None
+            self.obstacle_original_yaw = None
+            self.obstacle_right_clear_since = None
             resumed = 'coverage route' if self.coverage_active else 'wandering drive'
-            self.get_logger().info(f'Finished obstacle turn. Resuming {resumed}.')
+            self.get_logger().info(f'Finished obstacle return turn. Resuming {resumed}.')
         else:
             angular_speed = math.copysign(math.radians(self.turn_speed_deg), angle_diff)
             self.publish_twist(0.0, angular_speed)
@@ -906,9 +1069,22 @@ class ControlNode(Node):
             return None
         return self.coverage_waypoints[self.coverage_idx]
 
+    def reset_coverage_avoidance(self):
+        self.avoid_memory_sign = 0
+        self.avoid_memory_hold_steps = 0
+        self.avoidance_active = False
+        self.avoidance_turn_sign = 0
+        self.avoidance_bypass_steps = 0
+        self.avoidance_clear_steps = 0
+        self.goal_realign_active = False
+        self.previous_heading_deg = 0.0
+        self.best_goal_distance = float('inf')
+        self.last_goal_progress_time = time.time()
+
     def finish_coverage(self):
         self.coverage_active = False
         self.coverage_idx = len(self.coverage_waypoints)
+        self.reset_coverage_avoidance()
         self.reached_home = True
         self.drive_mode = DRIVE_MODE.MANUAL
         self.target_yaw = None
@@ -939,6 +1115,7 @@ class ControlNode(Node):
 
     def _advance_coverage_waypoint_after_scan(self):
         self.coverage_idx += 1
+        self.reset_coverage_avoidance()
         self.target_yaw = None
         self.turn_start_time = None
         self.turn_start_yaw = None
@@ -954,6 +1131,232 @@ class ControlNode(Node):
             f'Coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)}: '
             f'goal=({goal[0]:.2f}, {goal[1]:.2f}).'
         )
+
+    def _limit(self, value, limit):
+        return max(-limit, min(limit, value))
+
+    def _closeness(self, distance, threshold):
+        if math.isinf(distance) or distance >= threshold:
+            return 0.0
+        return threshold - distance
+
+    def _choose_avoid_side(self, left_clearance, right_clearance, obstacle_present):
+        if not obstacle_present:
+            return 0
+        if self.avoid_memory_sign != 0:
+            return self.avoid_memory_sign
+        if right_clearance > left_clearance + DISTBUG_SIDE_ADVANTAGE_MARGIN_M:
+            return -1
+        if left_clearance > right_clearance + DISTBUG_SIDE_ADVANTAGE_MARGIN_M:
+            return 1
+        return -1 if right_clearance >= left_clearance else 1
+
+    def _update_avoid_memory(self, committed_sign, obstacle_present):
+        if obstacle_present and committed_sign != 0:
+            self.avoid_memory_sign = committed_sign
+            self.avoid_memory_hold_steps = DISTBUG_MEMORY_HOLD_STEPS
+        elif self.avoid_memory_hold_steps > 0:
+            self.avoid_memory_hold_steps -= 1
+        else:
+            self.avoid_memory_sign = 0
+
+    def _compute_avoid_steer(self):
+        left_pressure = self._closeness(self.front_left_clearance, DISTBUG_SIDE_DETECT_M)
+        right_pressure = self._closeness(self.front_right_clearance, DISTBUG_SIDE_DETECT_M)
+        front_pressure = self._closeness(self.front_clearance, DISTBUG_FRONT_DETECT_M)
+        heading = 0.0
+
+        if left_pressure > 0.0:
+            heading -= (left_pressure / DISTBUG_SIDE_DETECT_M) * 24.0
+        if right_pressure > 0.0:
+            heading += (right_pressure / DISTBUG_SIDE_DETECT_M) * 24.0
+        if self.front_left_clearance < DISTBUG_SIDE_BUFFER_M:
+            heading -= 6.0
+        if self.front_right_clearance < DISTBUG_SIDE_BUFFER_M:
+            heading += 6.0
+
+        if front_pressure > 0.0:
+            front_open_bias = (self.front_left_clearance - self.front_right_clearance) * 140.0
+            if abs(front_open_bias) < 5.0:
+                front_open_bias = -8.0 if self.front_right_clearance > self.front_left_clearance else 8.0
+            heading += front_open_bias
+            if front_pressure > 0.12:
+                heading += 8.0 if front_open_bias >= 0 else -8.0
+
+        if self.avoid_memory_sign != 0:
+            heading += self.avoid_memory_sign * DISTBUG_MEMORY_BIAS_DEG
+
+        return self._limit(heading, DISTBUG_MAX_AVOID_STEER_DEG)
+
+    def _smooth_heading(self, desired_heading):
+        delta = desired_heading - self.previous_heading_deg
+        if delta > DISTBUG_HEADING_LIMIT_DEG:
+            desired_heading = self.previous_heading_deg + DISTBUG_HEADING_LIMIT_DEG
+        elif delta < -DISTBUG_HEADING_LIMIT_DEG:
+            desired_heading = self.previous_heading_deg - DISTBUG_HEADING_LIMIT_DEG
+        return self._limit(desired_heading, DISTBUG_MAX_TOTAL_STEER_DEG)
+
+    def _choose_distbug_heading(self, goal_angle):
+        goal_heading = self._limit(goal_angle, DISTBUG_MAX_GOAL_STEER_DEG)
+        avoid_heading = self._compute_avoid_steer()
+        left_pressure = self._closeness(self.front_left_clearance, DISTBUG_SIDE_DETECT_M)
+        right_pressure = self._closeness(self.front_right_clearance, DISTBUG_SIDE_DETECT_M)
+        front_pressure = self._closeness(self.front_clearance, DISTBUG_FRONT_DETECT_M)
+        strongest_pressure = max(front_pressure, left_pressure, right_pressure)
+        emergency_obstacle = (
+            self.front_clearance < DISTBUG_FRONT_EMERGENCY_TURN_M or
+            self.front_left_clearance < DISTBUG_SIDE_EMERGENCY_TURN_M or
+            self.front_right_clearance < DISTBUG_SIDE_EMERGENCY_TURN_M
+        )
+        obstacle_priority = (
+            self.front_clearance < DISTBUG_FRONT_CAUTION_M or
+            self.front_left_clearance < DISTBUG_SIDE_BUFFER_M or
+            self.front_right_clearance < DISTBUG_SIDE_BUFFER_M
+        )
+
+        if emergency_obstacle:
+            turn_sign = self.avoid_memory_sign or self._choose_avoid_side(
+                self.front_left_clearance, self.front_right_clearance, True
+            ) or -1
+            return self._limit(turn_sign * DISTBUG_MAX_TOTAL_STEER_DEG, DISTBUG_MAX_TOTAL_STEER_DEG)
+
+        if obstacle_priority:
+            turn_sign = self.avoid_memory_sign or self._choose_avoid_side(
+                self.front_left_clearance, self.front_right_clearance, True
+            ) or -1
+            return self._limit(turn_sign * DISTBUG_MAX_AVOID_STEER_DEG, DISTBUG_MAX_AVOID_STEER_DEG)
+
+        mix = min(1.0, strongest_pressure / max(DISTBUG_SIDE_DETECT_M, 0.01))
+        if self.avoid_memory_sign != 0 and mix < 0.55:
+            mix = 0.55
+        desired_heading = goal_heading * (1.0 - mix) + avoid_heading * mix
+        if self.avoid_memory_sign != 0 and abs(desired_heading) < 10.0:
+            desired_heading = self.avoid_memory_sign * 10.0
+        return self._smooth_heading(desired_heading)
+
+    def _coverage_dead_end(self):
+        return (
+            self.front_clearance <= DISTBUG_FRONT_HARD_STOP_M and
+            self.front_left_clearance <= DISTBUG_SIDE_HARD_STOP_M and
+            self.front_right_clearance <= DISTBUG_SIDE_HARD_STOP_M
+        )
+
+    def _drive_coverage_distbug(self, goal, distance, goal_angle):
+        wide_obstacle = (
+            self.wide_front_clearance < DISTBUG_FRONT_DETECT_M or
+            self.wide_left_clearance < DISTBUG_SIDE_DETECT_M or
+            self.wide_right_clearance < DISTBUG_SIDE_DETECT_M
+        )
+        committed_turn = self._choose_avoid_side(self.wide_left_clearance, self.wide_right_clearance, wide_obstacle)
+        self._update_avoid_memory(committed_turn, wide_obstacle)
+
+        if distance + DISTBUG_WAYPOINT_PROGRESS_EPS_M < self.best_goal_distance:
+            self.best_goal_distance = distance
+            self.last_goal_progress_time = time.time()
+
+        if self._coverage_dead_end():
+            hard_turn = self._compute_avoid_steer()
+            if abs(hard_turn) < 1.0:
+                hard_turn = -DISTBUG_MAX_AVOID_STEER_DEG if self.front_right_clearance > self.front_left_clearance else DISTBUG_MAX_AVOID_STEER_DEG
+            self.previous_heading_deg = hard_turn
+            self.publish_twist(0.0, math.radians(self._limit(hard_turn * 2.0, DISTBUG_TURN_SPEED_DEG)))
+            return
+
+        obstacle_priority = (
+            self.wide_front_clearance < DISTBUG_FRONT_CAUTION_M or
+            self.wide_left_clearance < DISTBUG_SIDE_BUFFER_M or
+            self.wide_right_clearance < DISTBUG_SIDE_BUFFER_M
+        )
+        if obstacle_priority and not self.avoidance_active:
+            self.avoidance_active = True
+            self.avoidance_turn_sign = committed_turn or -1
+            self.avoidance_bypass_steps = 0
+            self.avoidance_clear_steps = 0
+
+        blocked_waypoint = (
+            distance < DISTBUG_BLOCKED_WAYPOINT_M and
+            (self.avoidance_active or obstacle_priority or self.avoid_memory_sign != 0) and
+            time.time() - self.last_goal_progress_time > DISTBUG_STUCK_TIMEOUT_S
+        )
+        if blocked_waypoint:
+            self.get_logger().warn(
+                f'Coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)} appears blocked; advancing.',
+                throttle_duration_sec=1.0
+            )
+            self.advance_coverage_waypoint()
+            return
+
+        if self.avoidance_active:
+            self.avoidance_bypass_steps += 1
+            turn_side_clearance = self.wide_right_clearance if self.avoidance_turn_sign < 0 else self.wide_left_clearance
+            front_corner_clearance = self.front_right_clearance if self.avoidance_turn_sign < 0 else self.front_left_clearance
+            emergency_close = (
+                self.wide_front_clearance < DISTBUG_HARD_KEEP_OUT_M or
+                front_corner_clearance < DISTBUG_HARD_KEEP_OUT_M or
+                turn_side_clearance < DISTBUG_HARD_KEEP_OUT_M
+            )
+            arc_clear = (
+                self.wide_front_clearance > DISTBUG_FRONT_CAUTION_M + 0.08 and
+                self.wide_left_clearance > DISTBUG_SIDE_BUFFER_M + 0.04 and
+                self.wide_right_clearance > DISTBUG_SIDE_BUFFER_M + 0.04
+            )
+
+            if arc_clear:
+                self.avoidance_clear_steps += 1
+            else:
+                self.avoidance_clear_steps = 0
+
+            if (self.avoidance_bypass_steps >= DISTBUG_AVOID_BYPASS_STEPS and
+                    self.avoidance_clear_steps >= DISTBUG_AVOID_CLEAR_STEPS):
+                self.avoidance_active = False
+                self.avoidance_turn_sign = 0
+                self.avoidance_bypass_steps = 0
+                self.avoidance_clear_steps = 0
+                self.goal_realign_active = True
+            else:
+                turn_deg = self.avoidance_turn_sign * DISTBUG_TURN_SPEED_DEG * DISTBUG_ARC_TURN_SCALE
+                linear_speed = DISTBUG_ARC_SPEED
+                if emergency_close:
+                    linear_speed = 0.0
+                    turn_deg = self.avoidance_turn_sign * DISTBUG_TURN_SPEED_DEG
+                elif (self.wide_front_clearance < DISTBUG_FRONT_CAUTION_M or
+                      front_corner_clearance < DISTBUG_SIDE_BUFFER_M or
+                      turn_side_clearance < DISTBUG_SIDE_BUFFER_M):
+                    linear_speed = DISTBUG_ARC_SLOW_SPEED
+                self.previous_heading_deg = turn_deg
+                self.publish_twist(linear_speed, math.radians(turn_deg))
+                return
+
+        if self.goal_realign_active and abs(goal_angle) <= DISTBUG_GOAL_REACQUIRE_DONE_DEG:
+            self.goal_realign_active = False
+
+        heading = self._choose_distbug_heading(goal_angle)
+        final_approach = distance < DISTBUG_FINAL_APPROACH_M
+        linear_speed = min(self.coverage_linear_speed, self.forward_speed)
+        if final_approach:
+            linear_speed = min(linear_speed, 0.095)
+            heading = self._smooth_heading(self._limit(goal_angle, DISTBUG_MAX_TOTAL_STEER_DEG))
+
+        angular_speed = math.radians(self._limit(heading * 2.0, DISTBUG_TURN_SPEED_DEG))
+        if self.goal_realign_active and abs(goal_angle) >= DISTBUG_GOAL_REACQUIRE_ANGLE_DEG:
+            linear_speed = min(linear_speed, DISTBUG_GOAL_REACQUIRE_SPEED)
+            angular_speed = math.radians(self._limit(goal_angle * 0.9, DISTBUG_TURN_SPEED_DEG))
+        elif final_approach and abs(goal_angle) >= DISTBUG_FINAL_ALIGN_STOP_DEG:
+            linear_speed = 0.0
+        elif final_approach and abs(goal_angle) >= DISTBUG_FINAL_ALIGN_SLOW_DEG:
+            linear_speed *= 0.3
+        elif abs(heading) >= 18.0 or (wide_obstacle and abs(heading) >= 2.0):
+            linear_speed = 0.0
+        elif abs(heading) >= 10.0:
+            linear_speed *= 0.35
+        elif abs(heading) >= 5.0:
+            linear_speed *= 0.65
+
+        if wide_obstacle and linear_speed > 0.0:
+            linear_speed = min(linear_speed, 0.065)
+
+        self.previous_heading_deg = heading
+        self.publish_twist(linear_speed, angular_speed)
 
     def handle_coverage_scan(self):
         if not self.coverage_active:
@@ -993,12 +1396,17 @@ class ControlNode(Node):
             self._start_turn_timer()
 
         angle_diff = signed_angle_diff(desired_yaw, self.current_yaw)
-        if abs(angle_diff) <= ANGLE_TOLERANCE:
+        if abs(angle_diff) <= max(ANGLE_TOLERANCE, 12.0):
             self.auto_state = AUTO_STATE.COVERAGE_DRIVE
             self.turn_start_time = None
             self.turn_start_yaw = None
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.publish_twist(0.0, 0.0)
+            return
+
+        if self.wide_front_clearance < DISTBUG_FRONT_CAUTION_M or self.front_clearance < DISTBUG_FRONT_EMERGENCY_TURN_M:
+            self.auto_state = AUTO_STATE.COVERAGE_DRIVE
+            self._drive_coverage_distbug(goal, distance, angle_diff)
             return
 
         angular_speed = math.copysign(math.radians(self.coverage_turn_speed_deg), angle_diff)
@@ -1019,7 +1427,7 @@ class ControlNode(Node):
 
         desired_yaw = (math.degrees(math.atan2(dy, dx)) + 360) % 360
         angle_diff = signed_angle_diff(desired_yaw, self.current_yaw)
-        if abs(angle_diff) > max(ANGLE_TOLERANCE * 2.0, 15.0):
+        if abs(angle_diff) > max(ANGLE_TOLERANCE * 2.0, 18.0) and not self.avoidance_active:
             self.auto_state = AUTO_STATE.COVERAGE_TURN
             self.target_yaw = desired_yaw
             self._start_turn_timer()
@@ -1027,9 +1435,7 @@ class ControlNode(Node):
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             return
 
-        angular_speed = math.radians(max(-self.coverage_turn_speed_deg, min(self.coverage_turn_speed_deg, angle_diff * 0.6)))
-        linear_speed = min(self.coverage_linear_speed, self.forward_speed)
-        self.publish_twist(linear_speed, angular_speed)
+        self._drive_coverage_distbug(goal, distance, angle_diff)
 
     def handle_initial_turn(self):
         if self.target_yaw is None:
