@@ -52,8 +52,8 @@ warnstate = 1
 estopstate = 2
 
 # settings
-stopdist = 1.0 # metres -> emergency stop zone
-warndist = 5.0 # metres -> warning zone (stop and wait)
+stopdist = 0.18 # metres -> emergency stop zone
+warndist = 0.35 # metres -> warning zone (stop and wait)
 fwdspeed = 0.2 # m/s
 
 # motion detection threshold
@@ -76,11 +76,15 @@ class LidarEstop(Node):
         self.declare_parameter("publish_forward_when_clear", False)
         self.declare_parameter("bag_directory", default_bagdirect)
         self.declare_parameter("incident_log", default_incidentlog)
+        self.declare_parameter("stop_distance_m", stopdist)
+        self.declare_parameter("warning_distance_m", warndist)
         self.publish_forward_when_clear = bool(
             self.get_parameter("publish_forward_when_clear").value
         )
         self.bagdirect = self.get_parameter("bag_directory").value
         self.incidentlog = self.get_parameter("incident_log").value
+        self.stopdist = max(0.01, float(self.get_parameter("stop_distance_m").value))
+        self.warndist = max(self.stopdist, float(self.get_parameter("warning_distance_m").value))
 
         # two separate states now:
         # estopON -> full emergency stop (1m), latches for estophold seconds
@@ -203,12 +207,12 @@ class LidarEstop(Node):
             # count hits per zone
             if change >= movethres:
 
-                if rangenow <= stopdist:
+                if rangenow <= self.stopdist:
                     # emergency zone
                     estopMOOVEhits += 1
                     hitclosest = min(hitclosest, rangenow)
 
-                elif rangenow <= warndist:
+                elif rangenow <= self.warndist:
                     # warning zone
                     warnMOOVEhits += 1
                     hitclosest = min(hitclosest, rangenow)

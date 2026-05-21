@@ -54,8 +54,8 @@ warnstate  = 1
 estopstate = 2
 
 # settings
-stopdist = 1.0  # metres -> emergency stop zone
-warndist = 5.0  # metres -> warning zone (stop and wait)
+stopdist = 0.18  # metres -> emergency stop zone
+warndist = 0.35  # metres -> warning zone (stop and wait)
 
 # front cone
 conehalfdeg = 30.0  # check 30 deg either side of dead ahead
@@ -80,8 +80,12 @@ class LidarEstop(Node):
         super().__init__("estoplidar")
         self.declare_parameter("bag_directory", default_bagdirect)
         self.declare_parameter("incident_log", default_incidentlog)
+        self.declare_parameter("stop_distance_m", stopdist)
+        self.declare_parameter("warning_distance_m", warndist)
         self.bagdirect = self.get_parameter("bag_directory").value
         self.incidentlog = self.get_parameter("incident_log").value
+        self.stopdist = max(0.01, float(self.get_parameter("stop_distance_m").value))
+        self.warndist = max(self.stopdist, float(self.get_parameter("warning_distance_m").value))
 
         # two states:
         # estopON -> full emergency stop (1m), PERMANENT, never clears automatically
@@ -210,10 +214,10 @@ class LidarEstop(Node):
 
             # only flag if the spike is significant (sudden change, not steady drift)
             if deviation >= drifttol:
-                if rangenow <= stopdist:
+                if rangenow <= self.stopdist:
                     estopmoovehits += 1
                     hitclosest = min(hitclosest, rangenow)
-                elif rangenow <= warndist:
+                elif rangenow <= self.warndist:
                     warnmoovehits += 1
                     hitclosest = min(hitclosest, rangenow)
 
