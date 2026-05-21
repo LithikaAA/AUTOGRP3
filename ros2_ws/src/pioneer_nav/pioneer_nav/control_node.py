@@ -292,21 +292,14 @@ class ControlNode(Node):
         command = msg.data.strip().lower()
         with self.mutex:
             if command == 'start_wandering':
-                self.external_waypoint_active = False
-                self.coverage_active = False
-                self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring start_wandering command while external e-stop is active.')
                     return
-                self.emergency_stop = False
-                self.drive_mode = DRIVE_MODE.AUTO
-                self.auto_state = AUTO_STATE.WANDERING_TURN
-                self.target_yaw = None
-                self.start_position = (self.current_x, self.current_y)
-                self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
-                self.publish_twist(0.0, 0.0)
-                self.publish_robot_state()
-                self.get_logger().info('GUI command: Start Wandering accepted. Resuming autonomous mapping.')
+                if self.coverage_active:
+                    self.get_logger().info('Ignoring duplicate start_wandering command; lawnmower coverage is already active.')
+                    return
+                self.get_logger().info('GUI command: Start Wandering accepted as lawnmower coverage.')
+                self.start_coverage()
 
             elif command == 'go_home':
                 self.external_waypoint_active = False

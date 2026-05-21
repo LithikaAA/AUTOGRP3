@@ -982,7 +982,7 @@ class RobotGUI(QMainWindow):
         map_layout.addWidget(self._map_widget)
 
         map_controls = QHBoxLayout()
-        self._start_wandering_btn = QPushButton("Start Mapping")
+        self._start_wandering_btn = QPushButton("Lawnmower Map")
         self._start_wandering_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._start_wandering_btn.setCursor(Qt.PointingHandCursor)
         self._start_wandering_btn.setAutoDefault(False)
