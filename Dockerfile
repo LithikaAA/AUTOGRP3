@@ -14,6 +14,7 @@ RUN apt-get update && apt-get install -y \
     net-tools \
     python3-pip \
     python3-opencv \
+    python3-pyqt5 \
     doxygen \
     python3-colcon-common-extensions \
     ros-jazzy-ros-base \
