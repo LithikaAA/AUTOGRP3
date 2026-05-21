@@ -223,7 +223,7 @@ class ControlNode(Node):
         )
         if not self.center_arena_on_start:
             self.get_logger().info(
-                f'15x15 arena fixed at odom/world ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+                f'{MAP_SIZE:g}x{MAP_SIZE:g} arena fixed at odom/world ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
             )
         if self.use_gazebo_tf_pose:
             self.get_logger().info(
@@ -508,7 +508,7 @@ class ControlNode(Node):
                 self.map_origin_x = self.current_x
                 self.map_origin_y = self.current_y
                 self.get_logger().info(
-                    f'15x15 arena centered at odom ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+                    f'{MAP_SIZE:g}x{MAP_SIZE:g} arena centered at odom ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
                 )
             self.have_odom = True
             self.last_odom_time = time.time()
@@ -555,7 +555,7 @@ class ControlNode(Node):
                 self.map_origin_x = self.current_x
                 self.map_origin_y = self.current_y
                 self.get_logger().info(
-                    f'15x15 arena centered at Gazebo world pose ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+                    f'{MAP_SIZE:g}x{MAP_SIZE:g} arena centered at Gazebo world pose ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
                 )
 
             self.have_gazebo_tf_pose = True
@@ -637,7 +637,7 @@ class ControlNode(Node):
             self.publish_arena_status(rel_x, rel_y)
 
             if not (-MAP_HALF_SIZE <= rel_x <= MAP_HALF_SIZE and -MAP_HALF_SIZE <= rel_y <= MAP_HALF_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
-                self.get_logger().warn(f'Robot outside 15x15 arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
+                self.get_logger().warn(f'Robot outside {MAP_SIZE:g}x{MAP_SIZE:g} arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
                 self.auto_state = AUTO_STATE.RETURN_TO_CENTER
                 self.target_yaw = None
                 self.publish_twist(0.0, 0.0)

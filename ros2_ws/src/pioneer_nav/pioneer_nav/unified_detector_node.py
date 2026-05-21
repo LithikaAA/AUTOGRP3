@@ -200,7 +200,8 @@ class UnifiedDetectorNode(Node):
     # ── ROS callbacks ────────────────────────────────────────────────────────
 
     def state_callback(self, msg: String):
-        self.active = (msg.data == "MAPPING")
+        if self.require_mapping:
+            self.active = (msg.data == "MAPPING")
 
     def odom_callback(self, msg: Odometry):
         self.robot_x   = msg.pose.pose.position.x
