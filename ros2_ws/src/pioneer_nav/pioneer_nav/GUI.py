@@ -85,7 +85,7 @@ DETECTION_LOG_PATH = os.path.expanduser("~/part3_logs/detections_log.jsonl")
 ESTOP_LOG_DIR = os.path.expanduser("~/part3_logs/estop_events")
 BAG_DIR = os.path.expanduser("~/part3_logs/bags")
 LIDAR_SELF_MASK_MIN_RANGE = float(os.environ.get("PIONEER_GUI_LIDAR_SELF_MASK_MIN_RANGE", "0.18"))
-ARENA_SIZE_M = float(os.environ.get("PIONEER_GUI_ARENA_SIZE_M", "15.0"))
+ARENA_SIZE_M = float(os.environ.get("PIONEER_GUI_ARENA_SIZE_M", "8.0"))
 
 
 # ──────────────────────────────────────────────
@@ -264,7 +264,10 @@ class MapWidget(QWidget):
         self._map_oy    = 0.0
         self._map_w     = 0
         self._map_h     = 0
+        self._map_data  = None
         self._last_map_time = None
+        self._slam_overlay_img = None
+        self._slam_overlay_key = None
 
         self._robot_x   = 0.0
         self._robot_y   = 0.0
@@ -300,6 +303,7 @@ class MapWidget(QWidget):
         self._map_h   = msg.info.height
 
         data = np.array(msg.data, dtype=np.int8).reshape((self._map_h, self._map_w))
+        self._map_data = data.copy()
         img = np.full((self._map_h, self._map_w, 3), 205, dtype=np.uint8)
         img[data == 0] = [254, 254, 254]
         img[data > 50] = [0, 0, 0]
@@ -307,6 +311,8 @@ class MapWidget(QWidget):
         h, w, _ = img.shape
         self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888).copy()
         self._last_map_time = time.time()
+        self._slam_overlay_img = None
+        self._slam_overlay_key = None
         self.update()
 
     def update_pose(self, x, y, yaw):
@@ -317,6 +323,8 @@ class MapWidget(QWidget):
         if self._arena_origin_x is None or self._arena_origin_y is None:
             self._arena_origin_x = x
             self._arena_origin_y = y
+            self._slam_overlay_img = None
+            self._slam_overlay_key = None
         if not self._path_trace or math.hypot(
             x - self._path_trace[-1][0],
             y - self._path_trace[-1][1],
@@ -333,6 +341,8 @@ class MapWidget(QWidget):
         else:
             self._arena_origin_x = None
             self._arena_origin_y = None
+        self._slam_overlay_img = None
+        self._slam_overlay_key = None
         self._free_cells.fill(False)
         self._obstacle_cells.fill(False)
         self._path_trace.clear()
@@ -439,14 +449,19 @@ class MapWidget(QWidget):
                 # Coverage paths append the start/home pose last; use it to
                 # center the GUI before the first /robot/pose callback arrives.
                 self._arena_origin_x, self._arena_origin_y = self._path[-1]
+            self._slam_overlay_img = None
+            self._slam_overlay_key = None
         self.update()
+
+    def _arena_view_rect(self):
+        size = max(10, min(self.width(), self.height()) - 20)
+        dx = (self.width() - size) // 2
+        dy = (self.height() - size) // 2
+        return dx, dy, size
 
     def _world_to_px(self, wx, wy):
         if self._arena_origin_x is not None and self._arena_origin_y is not None:
-            size = min(self.width(), self.height()) - 20
-            size = max(10, size)
-            dx = (self.width() - size) // 2
-            dy = (self.height() - size) // 2
+            dx, dy, size = self._arena_view_rect()
             ax, ay = self._world_to_arena(wx, wy)
             px = int(dx + (ax + self._arena_half) / self._arena_size * size)
             py = int(dy + (self._arena_half - ay) / self._arena_size * size)
@@ -492,6 +507,101 @@ class MapWidget(QWidget):
         used_w = self._map_w * scale
         used_h = self._map_h * scale
         return (self.width() - used_w) / 2, (self.height() - used_h) / 2, scale
+
+    def _draw_coverage_grid(self, painter):
+        dx, dy, size = self._arena_view_rect()
+        cell = size / self._coverage_n
+
+        painter.fillRect(dx, dy, size, size, QColor(205, 205, 205))
+
+        for row in range(self._coverage_n):
+            y = int(dy + row * cell)
+            h = max(1, int(math.ceil(cell)))
+            for col in range(self._coverage_n):
+                if not self._free_cells[row, col] and not self._obstacle_cells[row, col]:
+                    continue
+                x = int(dx + col * cell)
+                w = max(1, int(math.ceil(cell)))
+                colour = QColor(20, 20, 20) if self._obstacle_cells[row, col] else QColor(255, 255, 255)
+                painter.fillRect(x, y, w, h, colour)
+
+        painter.setPen(QPen(QColor(120, 120, 120, 90), 1))
+        for i in range(self._coverage_n + 1):
+            pos = int(dx + i * cell)
+            painter.drawLine(pos, dy, pos, dy + size)
+            painter.drawLine(dx, pos, dx + size, pos)
+
+        metre_step = self._coverage_n / self._arena_size
+        painter.setPen(QPen(QColor(88, 166, 255, 100), 1))
+        for metre in range(int(self._arena_size) + 1):
+            offset = int(metre * metre_step * cell)
+            painter.drawLine(dx + offset, dy, dx + offset, dy + size)
+            painter.drawLine(dx, dy + offset, dx + size, dy + offset)
+
+        painter.setPen(QPen(QColor(88, 166, 255, 210), 2, Qt.DashLine))
+        painter.drawRect(dx, dy, size, size)
+
+        painter.setPen(QPen(QColor(70, 70, 70), 1))
+        painter.setFont(QFont(FONT_UI, 9))
+        painter.drawText(dx + 8, dy + 18, f"{self._arena_size:g} x {self._arena_size:g} m LiDAR scan")
+
+    def _slam_overlay_image(self):
+        if (
+            self._map_data is None
+            or self._map_w <= 0
+            or self._map_h <= 0
+            or self._arena_origin_x is None
+            or self._arena_origin_y is None
+        ):
+            return None
+
+        _dx, _dy, size = self._arena_view_rect()
+        key = (
+            size,
+            self._map_w,
+            self._map_h,
+            self._map_res,
+            self._map_ox,
+            self._map_oy,
+            self._arena_origin_x,
+            self._arena_origin_y,
+            self._last_map_time,
+        )
+        if self._slam_overlay_img is not None and self._slam_overlay_key == key:
+            return self._slam_overlay_img
+
+        rows, cols = np.indices((size, size), dtype=np.float32)
+        arena_x = (cols + 0.5) / size * self._arena_size - self._arena_half
+        arena_y = self._arena_half - (rows + 0.5) / size * self._arena_size
+        world_x = self._arena_origin_x + arena_x
+        world_y = self._arena_origin_y + arena_y
+
+        gx = np.floor((world_x - self._map_ox) / self._map_res).astype(np.int32)
+        gy = np.floor((world_y - self._map_oy) / self._map_res).astype(np.int32)
+        valid = (gx >= 0) & (gx < self._map_w) & (gy >= 0) & (gy < self._map_h)
+
+        img = np.full((size, size, 3), 205, dtype=np.uint8)
+        sampled = np.full((size, size), -1, dtype=np.int16)
+        sampled[valid] = self._map_data[gy[valid], gx[valid]]
+        img[sampled == 0] = [254, 254, 254]
+        img[sampled > 50] = [0, 0, 0]
+
+        self._slam_overlay_img = QImage(
+            img.tobytes(),
+            size,
+            size,
+            3 * size,
+            QImage.Format_RGB888,
+        ).copy()
+        self._slam_overlay_key = key
+        return self._slam_overlay_img
+
+    def _draw_slam_overlay(self, painter):
+        overlay = self._slam_overlay_image()
+        if overlay is None:
+            return
+        dx, dy, size = self._arena_view_rect()
+        painter.drawImage(dx, dy, overlay)
 
     def _draw_empty_arena(self, painter):
         size = min(self.width(), self.height()) - 20
@@ -562,8 +672,12 @@ class MapWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(205, 205, 205))
-        self._draw_slam_map(painter)
-        self._draw_arena_boundary(painter)
+        if self._arena_origin_x is not None and self._arena_origin_y is not None:
+            self._draw_coverage_grid(painter)
+            self._draw_slam_overlay(painter)
+        else:
+            self._draw_slam_map(painter)
+            self._draw_arena_boundary(painter)
 
         if len(self._path) >= 2:
             painter.setPen(QPen(QColor(ACCENT), 2, Qt.DashLine))
@@ -695,12 +809,20 @@ class ArenaPanel(QWidget):
         state_colours = {
             'WANDERING_DRIVE':       GREEN,
             'WANDERING_TURN':        ACCENT,
+            'MAPPING':               GREEN,
+            'WAYPOINT':              ACCENT,
+            'COVERAGE_INITIAL_SCAN': ACCENT,
+            'COVERAGE_SCAN':         ACCENT,
             'OBSTACLE_REVERSE':      YELLOW,
             'OBSTACLE_TURN':         YELLOW,
+            'OBSTACLE_AVOIDANCE':    YELLOW,
             'BOUNDARY_REVERSE':      RED,
             'BOUNDARY_ESCAPE_TURN':  RED,
             'BOUNDARY_ESCAPE_DRIVE': RED,
             'RETURN_TO_CENTER':      YELLOW,
+            'RETURNING_HOME':        YELLOW,
+            'ESTOP':                 RED,
+            'STOPPED':               RED,
             'INITIAL_TURN':          TEXT_DIM,
             'INITIAL_DRIVE':         TEXT_DIM,
         }

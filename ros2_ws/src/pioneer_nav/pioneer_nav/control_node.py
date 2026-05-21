@@ -18,7 +18,7 @@ from tf2_msgs.msg import TFMessage
 INITIAL_TURN_ANGLE = 45
 INITIAL_DRIVE_DISTANCE = 5.0
 BOUNDARY_BUFFER = 1.0
-MAP_SIZE = 15.0
+MAP_SIZE = 8.0
 MAP_HALF_SIZE = MAP_SIZE / 2
 MAP_CENTER = (0.0, 0.0)
 
@@ -94,6 +94,7 @@ def signed_angle_diff(target_yaw, current_yaw):
 
 class ControlNode(Node):
     def __init__(self):
+        global MAP_SIZE, MAP_HALF_SIZE
         super().__init__('pioneer_control_node')
 
         self.declare_parameter('joy_topic', '/joy')
@@ -110,6 +111,7 @@ class ControlNode(Node):
         self.declare_parameter('turn_speed_deg', TURN_SPEED_DEG)
         self.declare_parameter('return_to_center_speed', RETURN_TO_CENTER_SPEED)
         self.declare_parameter('return_to_center_turn_speed_deg', RETURN_TO_CENTER_TURN_SPEED_DEG)
+        self.declare_parameter('arena_size_m', MAP_SIZE)
         self.declare_parameter('center_arena_on_start', True)
         self.declare_parameter('arena_origin_x', 0.0)
         self.declare_parameter('arena_origin_y', 0.0)
@@ -144,6 +146,8 @@ class ControlNode(Node):
         self.turn_speed_deg = float(self.get_parameter('turn_speed_deg').value)
         self.return_to_center_speed = float(self.get_parameter('return_to_center_speed').value)
         self.return_to_center_turn_speed_deg = float(self.get_parameter('return_to_center_turn_speed_deg').value)
+        MAP_SIZE = max(1.0, float(self.get_parameter('arena_size_m').value))
+        MAP_HALF_SIZE = MAP_SIZE / 2.0
         self.center_arena_on_start = bool(self.get_parameter('center_arena_on_start').value)
         self.configured_arena_origin_x = float(self.get_parameter('arena_origin_x').value)
         self.configured_arena_origin_y = float(self.get_parameter('arena_origin_y').value)

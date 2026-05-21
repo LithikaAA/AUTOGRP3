@@ -59,7 +59,7 @@ def generate_launch_description():
     )
 
     arena_size_arg = DeclareLaunchArgument(
-        'arena_size_m', default_value='15.0',
+        'arena_size_m', default_value='8.0',
         description='Square arena side length in metres.'
     )
 

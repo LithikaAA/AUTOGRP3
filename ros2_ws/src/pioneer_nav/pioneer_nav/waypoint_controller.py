@@ -64,8 +64,8 @@ OBSTACLE_TURN_TIMEOUT = 4.0
 OBSTACLE_TURN_ANGLE = math.radians(90.0)
 OBSTACLE_TURN_TOLERANCE = math.radians(7.0)
 OBSTACLE_BYPASS_DURATION = 3.0
+OBSTACLE_BYPASS_TIMEOUT = 10.0
 OBSTACLE_BYPASS_SPEED = 0.14
-OBSTACLE_BYPASS_TURN_SPEED = 0.18
 OBSTACLE_REJOIN_COOLDOWN = 1.2
 
 
@@ -85,9 +85,9 @@ class WaypointController(Node):
         self.declare_parameter("binary_map_csv", "")
         self.declare_parameter("astar_obstacle_inflation_m", 0.25)
         self.declare_parameter("astar_waypoint_spacing_m", 0.35)
-        self.declare_parameter("coverage_area_size_m", 15.0)
-        self.declare_parameter("coverage_boundary_margin_m", 0.75)
-        self.declare_parameter("coverage_sweep_spacing_m", 1.5)
+        self.declare_parameter("coverage_area_size_m", 8.0)
+        self.declare_parameter("coverage_boundary_margin_m", 0.5)
+        self.declare_parameter("coverage_sweep_spacing_m", 1.4)
         self.declare_parameter("coverage_pattern", "serpentine")
         self.declare_parameter("coverage_probe_radius_ratio", 0.45)
         self.declare_parameter("coverage_scan_spin_s", 3.0)
@@ -105,6 +105,7 @@ class WaypointController(Node):
         self.declare_parameter("planned_path_topic", "/planned_path")
         self.declare_parameter("mission_command_topic", "/mission_command")
         self.declare_parameter("robot_state_topic", "/robot_state")
+        self.declare_parameter("arena_status_topic", "/arena_status")
         self.declare_parameter("estop_status_topic", "/estop_status")
         self.declare_parameter("use_gazebo_tf_pose", False)
         self.declare_parameter("gazebo_tf_topic", "/world/pioneer_world/dynamic_pose/info")
@@ -202,6 +203,7 @@ class WaypointController(Node):
         self.planned_path_topic = str(self.get_parameter("planned_path_topic").value)
         self.mission_command_topic = str(self.get_parameter("mission_command_topic").value)
         self.robot_state_topic = str(self.get_parameter("robot_state_topic").value)
+        self.arena_status_topic = str(self.get_parameter("arena_status_topic").value)
         self.estop_status_topic = str(self.get_parameter("estop_status_topic").value)
         self.use_gazebo_tf_pose = bool(self.get_parameter("use_gazebo_tf_pose").value)
         self.gazebo_tf_topic = str(self.get_parameter("gazebo_tf_topic").value)
@@ -254,6 +256,7 @@ class WaypointController(Node):
 
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.robot_state_pub = self.create_publisher(String, self.robot_state_topic, 10)
+        self.arena_status_pub = self.create_publisher(String, self.arena_status_topic, 10)
         self.path_pub = self.create_publisher(PathMsg, self.planned_path_topic, 10)
         self.create_subscription(Odometry, self.pose_topic, self.odom_callback, 10)
         self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, 10)
@@ -1215,6 +1218,7 @@ class WaypointController(Node):
             return
 
         now = self.get_clock().now().nanoseconds / 1e9
+        self.publish_arena_status()
         if self.enable_waypoint_obstacle_avoidance:
             obstacle_cmd = self.obstacle_avoidance_cmd(now)
             if obstacle_cmd is not None:
@@ -1389,16 +1393,16 @@ class WaypointController(Node):
                 cmd.angular.z = 0.0
                 return cmd
 
-            self.obstacle_avoidance_phase = "turn"
+            self.obstacle_avoidance_phase = "turn_away"
             self.obstacle_avoidance_started = now
             self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir)
             self.stop_robot()
             self.get_logger().info(
-                f"Waypoint obstacle avoidance: reverse complete; turning {clearer_side} before resuming route."
+                f"Waypoint obstacle avoidance: reverse complete; turning 90 deg {clearer_side}."
             )
             return Twist()
 
-        if self.obstacle_avoidance_phase == "turn":
+        if self.obstacle_avoidance_phase == "turn_away":
             if self.obstacle_turn_target_yaw is None:
                 self.obstacle_turn_target_yaw = wrap_to_pi(self.current_yaw + OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir)
             angle_error = wrap_to_pi(self.obstacle_turn_target_yaw - self.current_yaw)
@@ -1407,7 +1411,9 @@ class WaypointController(Node):
                 self.obstacle_avoidance_started = now
                 self.obstacle_turn_target_yaw = None
                 self.stop_robot()
-                self.get_logger().info("Waypoint obstacle avoidance: turn complete; driving bypass leg.")
+                self.get_logger().info(
+                    "Waypoint obstacle avoidance: side turn complete; driving straight until right side is clear."
+                )
                 return Twist()
 
             cmd.linear.x = 0.0
@@ -1417,29 +1423,74 @@ class WaypointController(Node):
         if self.obstacle_avoidance_phase == "bypass":
             if self.front_min < self.critical_obstacle_dist_m:
                 cmd.linear.x = min(self.waypoint_critical_reverse_speed, -0.05)
-                cmd.angular.z = max(abs(self.waypoint_obstacle_turn_speed), 0.35) * self.obstacle_turn_dir
+                cmd.angular.z = 0.0
                 self.get_logger().warn(
                     f"Waypoint obstacle avoidance: obstacle still critical at {self.front_min:.2f}m; backing out.",
                     throttle_duration_sec=1.0,
                 )
                 return cmd
 
-            if now - self.obstacle_avoidance_started < OBSTACLE_BYPASS_DURATION:
-                cmd.linear.x = min(max(OBSTACLE_BYPASS_SPEED, self.slow_linear_speed), self.linear_speed)
-                cmd.angular.z = OBSTACLE_BYPASS_TURN_SPEED * self.obstacle_turn_dir
-                return cmd
-
-            if self.front_min < self.front_obstacle_dist_m:
-                self.obstacle_avoidance_phase = "turn"
+            elapsed = now - self.obstacle_avoidance_started
+            right_clear = self.right_min >= self.front_obstacle_dist_m
+            front_clear = self.front_min >= self.critical_obstacle_dist_m
+            if elapsed >= OBSTACLE_BYPASS_DURATION and right_clear and front_clear:
+                self.obstacle_avoidance_phase = "turn_back"
                 self.obstacle_avoidance_started = now
                 self.obstacle_turn_target_yaw = wrap_to_pi(
-                    self.current_yaw + math.radians(45.0) * self.obstacle_turn_dir
+                    self.current_yaw - OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir
                 )
+                self.stop_robot()
                 self.get_logger().info(
-                    f"Waypoint obstacle avoidance: obstacle still ahead at {self.front_min:.2f}m; extending bypass."
+                    f"Waypoint obstacle avoidance: right side clear "
+                    f"(right={self.right_min:.2f}m); turning right to rejoin path."
                 )
                 return Twist()
 
+            if elapsed >= OBSTACLE_BYPASS_TIMEOUT:
+                self.obstacle_avoidance_phase = "turn_back"
+                self.obstacle_avoidance_started = now
+                self.obstacle_turn_target_yaw = wrap_to_pi(
+                    self.current_yaw - OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir
+                )
+                self.stop_robot()
+                self.get_logger().warn(
+                    "Waypoint obstacle avoidance: bypass timeout reached; turning right to attempt rejoin.",
+                    throttle_duration_sec=1.0,
+                )
+                return Twist()
+
+            if self.front_min < self.front_obstacle_dist_m:
+                cmd.linear.x = min(max(self.slow_linear_speed, 0.03), OBSTACLE_BYPASS_SPEED)
+                cmd.angular.z = max(abs(self.waypoint_obstacle_turn_speed), 0.35) * self.obstacle_turn_dir
+                self.get_logger().warn(
+                    f"Waypoint obstacle avoidance: front still blocked at {self.front_min:.2f}m; edging left.",
+                    throttle_duration_sec=1.0,
+                )
+                return cmd
+
+            cmd.linear.x = min(max(OBSTACLE_BYPASS_SPEED, self.slow_linear_speed), self.linear_speed)
+            cmd.angular.z = 0.0
+            return cmd
+
+        if self.obstacle_avoidance_phase == "turn_back":
+            if self.obstacle_turn_target_yaw is None:
+                self.obstacle_turn_target_yaw = wrap_to_pi(
+                    self.current_yaw - OBSTACLE_TURN_ANGLE * self.obstacle_turn_dir
+                )
+            angle_error = wrap_to_pi(self.obstacle_turn_target_yaw - self.current_yaw)
+            if abs(angle_error) <= OBSTACLE_TURN_TOLERANCE or now - self.obstacle_avoidance_started >= OBSTACLE_TURN_TIMEOUT:
+                self.obstacle_avoidance_phase = "clear"
+                self.obstacle_turn_target_yaw = None
+                self.obstacle_rejoin_ignore_until = now + OBSTACLE_REJOIN_COOLDOWN
+                self.stop_robot()
+                self.get_logger().info("Waypoint obstacle avoidance: right turn complete. Rejoining route.")
+                return Twist()
+
+            cmd.linear.x = 0.0
+            cmd.angular.z = math.copysign(max(abs(self.waypoint_obstacle_turn_speed), 0.35), angle_error)
+            return cmd
+
+        if self.obstacle_avoidance_phase == "clear":
             self.obstacle_avoidance_phase = "clear"
             self.obstacle_turn_target_yaw = None
             self.obstacle_rejoin_ignore_until = now + OBSTACLE_REJOIN_COOLDOWN
@@ -1463,6 +1514,45 @@ class WaypointController(Node):
 
     def publish_robot_state(self, state: str):
         self.robot_state_pub.publish(String(data=state))
+
+    def _arena_drive_state(self) -> str:
+        if self.external_estop_status == ESTOP_ACTIVE:
+            return "ESTOP"
+        if self.external_estop_status == ESTOP_WARNING:
+            return "STOPPED"
+        if self.obstacle_avoidance_active:
+            return "OBSTACLE_AVOIDANCE"
+        if self.returning_home_reported or self.current_idx >= self.home_start_idx:
+            return "RETURNING_HOME"
+        if self.coverage_arc_scan_active:
+            return "COVERAGE_INITIAL_SCAN"
+        if self.coverage_scan_active_idx >= 0:
+            return "COVERAGE_SCAN"
+        return "MAPPING" if self.coverage_mode else "WAYPOINT"
+
+    def publish_arena_status(self):
+        rel_x = self.current_x - self.start_x
+        rel_y = self.current_y - self.start_y
+        half = self.coverage_area_size_m / 2.0
+        center_dist = math.hypot(rel_x, rel_y)
+        edge_clearance = min(half - abs(rel_x), half - abs(rel_y))
+        outside_x = max(0.0, abs(rel_x) - half)
+        outside_y = max(0.0, abs(rel_y) - half)
+        outside = math.hypot(outside_x, outside_y)
+        msg = String()
+        msg.data = json.dumps({
+            "state": self._arena_drive_state(),
+            "rel_x": round(rel_x, 2),
+            "rel_y": round(rel_y, 2),
+            "center_dist": round(center_dist, 2),
+            "edge_clearance": round(edge_clearance, 2),
+            "outside": round(outside, 2),
+            "yaw": round(math.degrees(self.current_yaw), 1),
+            "pose_source": self.pose_source,
+            "waypoint_index": int(self.current_idx + 1),
+            "waypoint_count": int(len(self.world_waypoints)),
+        })
+        self.arena_status_pub.publish(msg)
 
     def publish_planned_path(self):
         path = PathMsg()
