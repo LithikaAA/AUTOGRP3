@@ -563,8 +563,14 @@ class WaypointController(Node):
     def command_callback(self, msg: String):
         command = msg.data.strip().lower()
         if command == "drive_waypoints":
+            if self.active and not self.coverage_mode:
+                self.get_logger().info("Ignoring duplicate drive_waypoints command; waypoint drive is already active.")
+                return
             self.start_waypoints(coverage_mode=False)
         elif command in {"drive_coverage", "start_exploration", "explore_world"}:
+            if self.active and self.coverage_mode:
+                self.get_logger().info("Ignoring duplicate drive_coverage command; coverage is already active.")
+                return
             self.start_waypoints(coverage_mode=True)
         elif command in {"go_home", "start_wandering", "stop_waypoints"}:
             if self.active:

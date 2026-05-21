@@ -1175,6 +1175,9 @@ class RobotGUI(QMainWindow):
     def _on_state(self, state: str):
         self._status_labels["State"].setText(state)
         self._state_badge.setText(state)
+        self._start_wandering_btn.setEnabled(
+            state in {"IDLE", "REACHED_HOME", "GOAL_ACHIEVED", "STOPPED", "ESTOP"}
+        )
         colour_map = {
             "MAPPING":          GREEN,
             "WAYPOINT":         ACCENT,
