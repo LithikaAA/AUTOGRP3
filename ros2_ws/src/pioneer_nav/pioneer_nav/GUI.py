@@ -35,6 +35,7 @@ import sys
 import json
 import math
 import os
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -56,7 +57,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QFrame, QScrollArea, QSizePolicy, QProgressBar, QPushButton
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF, QRect
 from PyQt5.QtGui import (
     QImage, QPixmap, QFont, QColor, QPainter,
     QPen, QBrush, QPolygonF
@@ -81,6 +82,8 @@ FONT_BODY = "DejaVu Sans"
 
 # Path to the detection log written by unified_detector_node
 DETECTION_LOG_PATH = os.path.expanduser("~/part3_logs/detections_log.jsonl")
+ESTOP_LOG_DIR = os.path.expanduser("~/part3_logs/estop_events")
+BAG_DIR = os.path.expanduser("~/part3_logs/bags")
 LIDAR_SELF_MASK_MIN_RANGE = float(os.environ.get("PIONEER_GUI_LIDAR_SELF_MASK_MIN_RANGE", "0.18"))
 ARENA_SIZE_M = float(os.environ.get("PIONEER_GUI_ARENA_SIZE_M", "15.0"))
 
@@ -425,15 +428,20 @@ class MapWidget(QWidget):
 
     def update_path(self, poses):
         self._path = [(p.pose.position.x, p.pose.position.y) for p in poses]
+        if (
+            self._path
+            and (self._arena_origin_x is None or self._arena_origin_y is None)
+        ):
+            if self._have_pose:
+                self._arena_origin_x = self._robot_x
+                self._arena_origin_y = self._robot_y
+            else:
+                # Coverage paths append the start/home pose last; use it to
+                # center the GUI before the first /robot/pose callback arrives.
+                self._arena_origin_x, self._arena_origin_y = self._path[-1]
         self.update()
 
     def _world_to_px(self, wx, wy):
-        if self._map_w > 0 and self._map_h > 0:
-            dx, dy, scale = self._map_view_transform()
-            gx = (wx - self._map_ox) / self._map_res
-            gy = self._map_h - (wy - self._map_oy) / self._map_res
-            return (int(dx + gx * scale), int(dy + gy * scale))
-
         if self._arena_origin_x is not None and self._arena_origin_y is not None:
             size = min(self.width(), self.height()) - 20
             size = max(10, size)
@@ -443,6 +451,12 @@ class MapWidget(QWidget):
             px = int(dx + (ax + self._arena_half) / self._arena_size * size)
             py = int(dy + (self._arena_half - ay) / self._arena_size * size)
             return (px, py)
+
+        if self._map_w > 0 and self._map_h > 0:
+            dx, dy, scale = self._map_view_transform()
+            gx = (wx - self._map_ox) / self._map_res
+            gy = self._map_h - (wy - self._map_oy) / self._map_res
+            return (int(dx + gx * scale), int(dy + gy * scale))
 
         if self._map_w == 0 or self._map_h == 0:
             scan_points = [(x, y) for x, y, _stamp in self._scan_hits]
@@ -497,6 +511,25 @@ class MapWidget(QWidget):
             self._draw_empty_arena(painter)
             return
 
+        if self._arena_origin_x is not None and self._arena_origin_y is not None:
+            top_left = self._world_to_px(
+                self._map_ox,
+                self._map_oy + self._map_h * self._map_res,
+            )
+            bottom_right = self._world_to_px(
+                self._map_ox + self._map_w * self._map_res,
+                self._map_oy,
+            )
+            x = min(top_left[0], bottom_right[0])
+            y = min(top_left[1], bottom_right[1])
+            w = max(1, abs(bottom_right[0] - top_left[0]))
+            h = max(1, abs(bottom_right[1] - top_left[1]))
+            painter.drawImage(
+                QRect(x, y, w, h),
+                self._map_img,
+            )
+            return
+
         dx, dy, scale = self._map_view_transform()
         painter.drawImage(
             int(dx), int(dy),
@@ -543,13 +576,15 @@ class MapWidget(QWidget):
         for (wx, wy, label, col) in self._detections:
             px, py = self._world_to_px(wx, wy)
             colour = QColor(RED) if "red" in col else \
-                     QColor(YELLOW) if "yellow" in col else QColor(GREEN)
+                     QColor(YELLOW) if "yellow" in col else \
+                     QColor(ACCENT) if col == "letter" else QColor(GREEN)
             painter.setBrush(QBrush(colour))
             painter.setPen(QPen(QColor(TEXT), 1))
             painter.drawEllipse(px - 8, py - 8, 16, 16)
             painter.setFont(QFont(FONT_UI, 7, QFont.Bold))
             painter.setPen(QColor(TEXT))
-            painter.drawText(px + 10, py + 4, label[:3])
+            display = label.replace("_obstacle", "").replace("_", " ")
+            painter.drawText(px + 10, py + 4, display)
 
         rx, ry = self._world_to_px(self._robot_x, self._robot_y)
         painter.setBrush(QBrush(QColor(ACCENT)))
@@ -700,6 +735,9 @@ class RobotGUI(QMainWindow):
         self.setMinimumSize(1400, 800)
         self.setStyleSheet(f"background: {BG}; color: {TEXT};")
         self._latest_map_msg = None
+        self._last_detection_event_times: dict[str, float] = {}
+        self._last_log_mtime: float = 0.0
+        self._last_display_state: str = ""
 
         self._build_ui()
         self._connect_signals()
@@ -730,6 +768,25 @@ class RobotGUI(QMainWindow):
         self._state_badge.setFixedHeight(32)
         self._state_badge.setStyleSheet(self._badge_style(YELLOW))
         header.addWidget(self._state_badge)
+
+        self._reset_estop_btn = QPushButton("X  RESET E-STOP")
+        self._reset_estop_btn.setFont(QFont(FONT_UI, 10, QFont.Bold))
+        self._reset_estop_btn.setCursor(Qt.PointingHandCursor)
+        self._reset_estop_btn.setFixedHeight(32)
+        self._reset_estop_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {RED};
+                color: white;
+                border: 2px solid {RED};
+                border-radius: 6px;
+                padding: 2px 16px;
+            }}
+            QPushButton:hover {{
+                background: #c0392b;
+                border-color: #c0392b;
+            }}
+        """)
+        header.addWidget(self._reset_estop_btn)
         root.addLayout(header)
 
         # ── Main content row ────────────────────────
@@ -808,6 +865,15 @@ class RobotGUI(QMainWindow):
             QPushButton:disabled {{ background: {BORDER}; color: {TEXT_DIM};
                 border: 1px solid {BORDER}; }}
         """)
+        self._replay_btn = QPushButton(">  Replay Journey")
+        self._replay_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
+        self._replay_btn.setCursor(Qt.PointingHandCursor)
+        self._replay_btn.setStyleSheet(f"""
+            QPushButton {{ background: {ACCENT}22; color: {ACCENT};
+                border: 1px solid {ACCENT}; border-radius: 6px; padding: 6px 12px; }}
+            QPushButton:disabled {{ background: {BORDER}; color: {TEXT_DIM};
+                border: 1px solid {BORDER}; }}
+        """)
         self._save_map_label = QLabel("Maps save to ros2_ws/maps")
         self._save_map_label.setFont(QFont(FONT_UI, 8))
         self._save_map_label.setStyleSheet(f"color: {TEXT_DIM}; border: none; background: transparent;")
@@ -815,6 +881,7 @@ class RobotGUI(QMainWindow):
         map_controls.addWidget(self._go_home_btn)
         map_controls.addWidget(self._drive_waypoints_btn)
         map_controls.addWidget(self._save_map_btn)
+        map_controls.addWidget(self._replay_btn)
         map_controls.addWidget(self._save_map_label, 1)
         map_layout.addLayout(map_controls)
         content.addWidget(map_frame, 4)
@@ -828,6 +895,12 @@ class RobotGUI(QMainWindow):
         self._det_log.setMinimumHeight(200)
         log_layout.addWidget(self._det_log)
         right.addWidget(log_frame, 3)
+
+        estop_frame, estop_layout = make_panel("Last E-Stop Event")
+        self._estop_log = DetectionLog()
+        self._estop_log.setMinimumHeight(80)
+        estop_layout.addWidget(self._estop_log)
+        right.addWidget(estop_frame, 1)
 
         photo_frame, photo_layout = make_panel("Last Detection  ( /detections/image )")
         self._photo_label = QLabel()
@@ -880,6 +953,8 @@ class RobotGUI(QMainWindow):
         self._go_home_btn.clicked.connect(lambda: self._send_mission_command("go_home"))
         self._drive_waypoints_btn.clicked.connect(lambda: self._send_mission_command("drive_waypoints"))
         self._save_map_btn.clicked.connect(self._save_map)
+        self._replay_btn.clicked.connect(self._replay_journey)
+        self._reset_estop_btn.clicked.connect(self._reset_estop)
 
     # ── Detection log poller ──────────────────────────────────────────────────
 
@@ -926,11 +1001,14 @@ class RobotGUI(QMainWindow):
             obj_y = record.get("object_y")
             name  = record.get("name", "")
             kind  = record.get("type", "")
+            shape = record.get("shape", "")
             if obj_x is None or obj_y is None:
                 continue
             colour = "red"    if "red"    in name else \
-                     "yellow" if "yellow" in name else "green"
-            detections.append((obj_x, obj_y, name, colour))
+                     "yellow" if "yellow" in name else \
+                     "letter" if kind == "letter" else "green"
+            display = f"{shape} {name}".strip() if shape else name
+            detections.append((obj_x, obj_y, display, colour))
 
         self._map_widget.set_detections(detections)
 
@@ -989,16 +1067,11 @@ class RobotGUI(QMainWindow):
         action = action_map.get(state, state)
         self._status_labels["Action"].setText(action)
         self._action_label.setText(action)
-        detection_log_states = {
-            "OBSTACLE_AVOIDANCE": "Obstacle avoidance active",
-            "ESTOP": "E-stop active: obstacle detected",
-            "STOPPED": "Motion stopped",
-        }
-        if state in detection_log_states and state != self._last_detection_log_state:
-            self._det_log.add_entry(detection_log_states[state], colour)
-            self._last_detection_log_state = state
-        elif state not in detection_log_states:
-            self._last_detection_log_state = None
+        if state != self._last_display_state:
+            self._last_display_state = state
+            self._det_log.add_entry(f"State -> {state}", colour)
+            if state in ("STOPPED", "ESTOP"):
+                self._load_latest_estop_event()
 
     def _on_pose(self, x: float, y: float, yaw: float):
         self._status_labels["Pos X"].setText(f"{x:.2f} m")
@@ -1013,25 +1086,33 @@ class RobotGUI(QMainWindow):
         self._last_detection_event_times[key] = now
         return True
 
-    def _on_letter(self, name: str):
+    def _on_letter(self, raw: str):
+        try:
+            data = json.loads(raw)
+            name = data.get("name", raw)
+            dist = data.get("distance_m")
+            dist_str = f"  dist={dist:.2f}m" if dist else ""
+        except (json.JSONDecodeError, TypeError):
+            name = raw
+            dist_str = ""
         self._status_labels["Last Letter"].setText(name)
-        if self._should_log_detection_event(f"letter:{name}"):
-            self._det_log.add_entry(f"Greek letter detected: {name}", GREEN)
+        if self._should_log_detection_event(f"letter:{name}", cooldown_s=8.0):
+            self._det_log.add_entry(f"Greek letter: {name}{dist_str}", GREEN)
 
     def _on_colour(self, data: dict):
         """Log entry only — map markers come from the log file poller."""
         label   = data.get("label", "unknown")
+        dist    = data.get("distance_m", 0.0)
         bearing = data.get("bearing_deg", 0.0)
-        rx      = data.get("robot_x", 0.0)
-        ry      = data.get("robot_y", 0.0)
+        shape   = data.get("shape", "")
 
         colour = RED if "red" in label else YELLOW
-        self._det_log.add_entry(
-            f"{label}  dist={dist:.2f}m  bearing={bearing:.1f}°", colour)
+        shape_str = f"  shape={shape}" if shape else ""
+        if self._should_log_detection_event(f"colour:{label}", cooldown_s=8.0):
+            self._det_log.add_entry(
+                f"{label}{shape_str}  dist={dist:.2f}m  bearing={bearing:.1f} deg",
+                colour)
 
-        wx = rx + dist * math.cos(math.radians(bearing))
-        wy = ry + dist * math.sin(math.radians(bearing))
-        self._map_widget.add_detection(wx, wy, label, label)
 
     def _on_map(self, msg):
         self._latest_map_msg = msg
@@ -1055,8 +1136,104 @@ class RobotGUI(QMainWindow):
         elif command == "go_home":
             self._on_state("RETURN_TO_CENTER")
         self.signals.mission_command.emit(command)
-        if command not in {"start_wandering", "drive_coverage", "drive_waypoints", "go_home"}:
-            self._action_label.setText(f"Command sent: {command}")
+        self._det_log.add_entry(f"Command -> {command}", ACCENT)
+
+    def _load_latest_estop_event(self):
+        if not os.path.isdir(ESTOP_LOG_DIR):
+            self._estop_log.add_entry("No e-stop directory yet.", TEXT_DIM)
+            return
+
+        jsonl_files = sorted(
+            [f for f in os.listdir(ESTOP_LOG_DIR)
+             if f.startswith("estop_") and f.endswith(".jsonl")],
+            reverse=True)
+
+        if jsonl_files:
+            name = jsonl_files[0]
+            path = os.path.join(ESTOP_LOG_DIR, name)
+            self._estop_log.add_entry(f"-- {name} --", RED)
+            try:
+                with open(path, encoding="utf-8") as f:
+                    entries = [json.loads(line) for line in f if line.strip()]
+                pose_entries = [e for e in entries if e.get("type") == "pose"]
+                scan_entries = [e for e in entries if e.get("type") == "scan"]
+                self._estop_log.add_entry(
+                    f"{len(entries)} records | {len(pose_entries)} pose | {len(scan_entries)} scan",
+                    TEXT_DIM)
+                if pose_entries:
+                    p0, p1 = pose_entries[0], pose_entries[-1]
+                    self._estop_log.add_entry(
+                        f"({p0['x']:.2f},{p0['y']:.2f}) -> "
+                        f"({p1['x']:.2f},{p1['y']:.2f})  yaw={p1['yaw']:.1f} deg",
+                        YELLOW)
+                if scan_entries:
+                    ranges = [r for r in scan_entries[-1].get("ranges", []) if r > 0.05]
+                    if ranges:
+                        self._estop_log.add_entry(f"Closest obstacle: {min(ranges):.2f} m", RED)
+            except Exception as exc:
+                self._estop_log.add_entry(f"Error: {exc}", RED)
+            return
+
+        incidents_paths = [
+            os.path.join(ESTOP_LOG_DIR, "incidents.txt"),
+            os.path.expanduser("~/pioneer_estop/incidents.txt"),
+        ]
+        for path in incidents_paths:
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, encoding="utf-8") as f:
+                    lines = [line.strip() for line in f if line.strip()]
+                self._estop_log.add_entry(f"-- {os.path.basename(path)} --", RED)
+                for line in lines[-3:]:
+                    self._estop_log.add_entry(line, YELLOW)
+                return
+            except Exception as exc:
+                self._estop_log.add_entry(f"Error: {exc}", RED)
+                return
+
+        self._estop_log.add_entry("No e-stop files yet.", TEXT_DIM)
+
+    def _replay_journey(self):
+        if not os.path.isdir(BAG_DIR):
+            self._det_log.add_entry("No bags directory found.", RED)
+            return
+
+        bags = sorted(
+            [os.path.join(BAG_DIR, d) for d in os.listdir(BAG_DIR)
+             if os.path.isdir(os.path.join(BAG_DIR, d))
+             and os.path.exists(os.path.join(BAG_DIR, d, "metadata.yaml"))])
+        if not bags:
+            self._det_log.add_entry("No recorded bags found.", RED)
+            return
+
+        self._det_log.add_entry(f"Replaying {len(bags)} bag(s) in order...", ACCENT)
+        self._replay_btn.setEnabled(False)
+        self._replay_btn.setText(f"Replaying 1/{len(bags)}")
+
+        def _run():
+            for i, bag_path in enumerate(bags):
+                name = os.path.basename(bag_path)
+                QTimer.singleShot(
+                    0,
+                    lambda n=name, idx=i: self._replay_btn.setText(
+                        f"Replaying {idx + 1}/{len(bags)}: {n[-12:]}"))
+                subprocess.run(["ros2", "bag", "play", bag_path, "--clock", "--rate", "1.0"],
+                               check=False)
+            QTimer.singleShot(0, self._on_replay_done)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _on_replay_done(self):
+        self._replay_btn.setEnabled(True)
+        self._replay_btn.setText(">  Replay Journey")
+        self._det_log.add_entry("Replay finished.", TEXT_DIM)
+
+    def _reset_estop(self):
+        self._last_display_state = ""
+        self.signals.mission_command.emit("reset_estop")
+        self._det_log.add_entry("E-stop reset sent.", YELLOW)
+        self._on_state("IDLE")
 
     def _save_map(self):
         if self._latest_map_msg is None:

@@ -266,13 +266,23 @@ class ControlNode(Node):
                 self.publish_robot_state()
                 self.get_logger().info('GUI command: Go Home accepted. Returning to map center with obstacle avoidance.')
 
-            elif command == 'drive_waypoints':
+            elif command in {'drive_waypoints', 'drive_coverage'}:
                 self.external_waypoint_active = True
                 self.reached_home = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
-                self.get_logger().info('GUI command: Paused for waypoint driving.')
+                self.get_logger().info(f'GUI command: Paused for external navigation: {command}.')
+
+            elif command == 'reset_estop':
+                self.emergency_stop = False
+                if self.external_estop_status == ESTOP_ACTIVE:
+                    self.external_estop_status = ESTOP_CLEAR
+                self.drive_mode = DRIVE_MODE.MANUAL
+                self.external_waypoint_active = False
+                self.publish_twist(0.0, 0.0)
+                self.publish_robot_state()
+                self.get_logger().info('GUI command: E-stop reset accepted. Robot is idle.')
 
     def estop_status_cb(self, msg: Int8):
         """Handle external LiDAR e-stop status"""
