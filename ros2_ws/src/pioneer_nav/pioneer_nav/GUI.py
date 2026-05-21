@@ -675,6 +675,7 @@ class MapWidget(QWidget):
         if self._arena_origin_x is not None and self._arena_origin_y is not None:
             self._draw_coverage_grid(painter)
             self._draw_slam_overlay(painter)
+            self._draw_arena_boundary(painter)
         else:
             self._draw_slam_map(painter)
             self._draw_arena_boundary(painter)
@@ -894,6 +895,8 @@ class RobotGUI(QMainWindow):
         self._reset_estop_btn = QPushButton("X  RESET E-STOP")
         self._reset_estop_btn.setFont(QFont(FONT_UI, 10, QFont.Bold))
         self._reset_estop_btn.setCursor(Qt.PointingHandCursor)
+        self._reset_estop_btn.setAutoDefault(False)
+        self._reset_estop_btn.setDefault(False)
         self._reset_estop_btn.setFixedHeight(32)
         self._reset_estop_btn.setStyleSheet(f"""
             QPushButton {{
@@ -960,6 +963,8 @@ class RobotGUI(QMainWindow):
         self._start_wandering_btn = QPushButton("Start Mapping")
         self._start_wandering_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._start_wandering_btn.setCursor(Qt.PointingHandCursor)
+        self._start_wandering_btn.setAutoDefault(False)
+        self._start_wandering_btn.setDefault(False)
         self._start_wandering_btn.setStyleSheet(f"""
             QPushButton {{ background: {GREEN}22; color: {GREEN};
                 border: 1px solid {GREEN}; border-radius: 6px; padding: 6px 12px; }}
@@ -967,6 +972,8 @@ class RobotGUI(QMainWindow):
         self._go_home_btn = QPushButton("Go Home")
         self._go_home_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._go_home_btn.setCursor(Qt.PointingHandCursor)
+        self._go_home_btn.setAutoDefault(False)
+        self._go_home_btn.setDefault(False)
         self._go_home_btn.setStyleSheet(f"""
             QPushButton {{ background: {ACCENT}22; color: {ACCENT};
                 border: 1px solid {ACCENT}; border-radius: 6px; padding: 6px 12px; }}
@@ -974,6 +981,8 @@ class RobotGUI(QMainWindow):
         self._drive_waypoints_btn = QPushButton("Drive Waypoints")
         self._drive_waypoints_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._drive_waypoints_btn.setCursor(Qt.PointingHandCursor)
+        self._drive_waypoints_btn.setAutoDefault(False)
+        self._drive_waypoints_btn.setDefault(False)
         self._drive_waypoints_btn.setStyleSheet(f"""
             QPushButton {{ background: {YELLOW}22; color: {YELLOW};
                 border: 1px solid {YELLOW}; border-radius: 6px; padding: 6px 12px; }}
@@ -981,6 +990,8 @@ class RobotGUI(QMainWindow):
         self._save_map_btn = QPushButton("Save Map")
         self._save_map_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._save_map_btn.setCursor(Qt.PointingHandCursor)
+        self._save_map_btn.setAutoDefault(False)
+        self._save_map_btn.setDefault(False)
         self._save_map_btn.setStyleSheet(f"""
             QPushButton {{ background: {GREEN}22; color: {GREEN};
                 border: 1px solid {GREEN}; border-radius: 6px; padding: 6px 12px; }}
@@ -990,6 +1001,8 @@ class RobotGUI(QMainWindow):
         self._replay_btn = QPushButton(">  Replay Journey")
         self._replay_btn.setFont(QFont(FONT_UI, 9, QFont.Bold))
         self._replay_btn.setCursor(Qt.PointingHandCursor)
+        self._replay_btn.setAutoDefault(False)
+        self._replay_btn.setDefault(False)
         self._replay_btn.setStyleSheet(f"""
             QPushButton {{ background: {ACCENT}22; color: {ACCENT};
                 border: 1px solid {ACCENT}; border-radius: 6px; padding: 6px 12px; }}
@@ -1388,12 +1401,10 @@ class RobotGUI(QMainWindow):
         img[data == 0]   = 254
         img[data >= 65]  = 0
         img = np.flipud(img)
+        self._draw_arena_boundary_on_saved_map(img, msg)
 
         image_path = f"{prefix}.png"
         yaml_path  = f"{prefix}.yaml"
-        obstacle_waypoints_path        = f"{prefix}_obstacle_waypoints.txt"
-        latest_obstacle_waypoints_path = os.path.join(out_dir, "latest_obstacle_waypoints.txt")
-
         if not cv2.imwrite(image_path, img):
             raise RuntimeError(f"Could not write {image_path}")
 
@@ -1410,10 +1421,37 @@ class RobotGUI(QMainWindow):
                 f"free_thresh: 0.25\n"
             )
 
-        waypoints = self._coverage_obstacle_standoff_waypoints()
-        self._write_obstacle_waypoints(obstacle_waypoints_path, waypoints)
-        self._write_obstacle_waypoints(latest_obstacle_waypoints_path, waypoints)
         return prefix
+
+    def _draw_arena_boundary_on_saved_map(self, img, msg):
+        grid = self._map_widget
+        if grid._arena_origin_x is None or grid._arena_origin_y is None:
+            return
+
+        height, width = img.shape[:2]
+        half = grid._arena_half
+        left = grid._arena_origin_x - half
+        right = grid._arena_origin_x + half
+        bottom = grid._arena_origin_y - half
+        top = grid._arena_origin_y + half
+
+        def world_to_img(wx, wy):
+            gx = int(round((wx - msg.info.origin.position.x) / msg.info.resolution))
+            gy = int(round(msg.info.height - (wy - msg.info.origin.position.y) / msg.info.resolution))
+            return gx, gy
+
+        corners = [
+            world_to_img(left, bottom),
+            world_to_img(right, bottom),
+            world_to_img(right, top),
+            world_to_img(left, top),
+        ]
+        rect = (0, 0, width - 1, height - 1)
+        for i, p1 in enumerate(corners):
+            p2 = corners[(i + 1) % len(corners)]
+            ok, cp1, cp2 = cv2.clipLine(rect, p1, p2)
+            if ok:
+                cv2.line(img, cp1, cp2, 0, 2)
 
     def _write_obstacle_waypoints(self, path, waypoints):
         with open(path, "w", encoding="utf-8") as f:
