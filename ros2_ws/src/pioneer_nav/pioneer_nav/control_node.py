@@ -8,8 +8,8 @@ from enum import Enum
 
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist, Pose
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import Twist, Pose, PoseStamped
+from nav_msgs.msg import Odometry, Path as PathMsg
 from sensor_msgs.msg import Joy, LaserScan
 from std_msgs.msg import String, Int8
 from tf2_msgs.msg import TFMessage
@@ -50,6 +50,14 @@ MAX_CENTER_ANGLE = 45
 RETURN_TO_CENTER_SPEED = 0.25
 RETURN_TO_CENTER_TURN_SPEED_DEG = 30.0
 RETURN_TO_CENTER_MIN_DISTANCE = 0.5
+COVERAGE_BOUNDARY_MARGIN = 0.5
+COVERAGE_SWEEP_SPACING = 1.4
+COVERAGE_GOAL_TOLERANCE = 0.35
+COVERAGE_LINEAR_SPEED = 0.18
+COVERAGE_TURN_SPEED_DEG = 20.0
+COVERAGE_SCAN_SPIN_S = 6.0
+COVERAGE_SCAN_TURN_SPEED = 0.65
+COVERAGE_ROW_MIDPOINT_SCANS = True
 
 ESTOP_CLEAR = 0
 ESTOP_WARNING = 1
@@ -72,6 +80,9 @@ class AUTO_STATE(Enum):
     OBSTACLE_REVERSE = 7
     OBSTACLE_TURN = 8
     RETURN_TO_CENTER = 9
+    COVERAGE_TURN = 10
+    COVERAGE_DRIVE = 11
+    COVERAGE_SCAN = 12
 
 
 def quaternion_to_yaw(orientation):
@@ -109,9 +120,22 @@ class ControlNode(Node):
         self.declare_parameter('forward_speed', FORWARD_SPEED)
         self.declare_parameter('reverse_speed', REVERSE_SPEED)
         self.declare_parameter('turn_speed_deg', TURN_SPEED_DEG)
+        self.declare_parameter('obstacle_buffer', OBSTACLE_BUFFER)
+        self.declare_parameter('emergency_stop_distance', EMERGENCY_STOP_DISTANCE)
+        self.declare_parameter('lidar_front_angle_deg', math.degrees(LIDAR_FRONT_ANGLE_FOV))
+        self.declare_parameter('lidar_side_angle_deg', math.degrees(LIDAR_SIDE_ANGLE_FOV))
+        self.declare_parameter('lidar_self_filter_min_range', 0.01)
         self.declare_parameter('return_to_center_speed', RETURN_TO_CENTER_SPEED)
         self.declare_parameter('return_to_center_turn_speed_deg', RETURN_TO_CENTER_TURN_SPEED_DEG)
         self.declare_parameter('arena_size_m', MAP_SIZE)
+        self.declare_parameter('coverage_boundary_margin_m', COVERAGE_BOUNDARY_MARGIN)
+        self.declare_parameter('coverage_sweep_spacing_m', COVERAGE_SWEEP_SPACING)
+        self.declare_parameter('coverage_goal_tolerance_m', COVERAGE_GOAL_TOLERANCE)
+        self.declare_parameter('coverage_linear_speed', COVERAGE_LINEAR_SPEED)
+        self.declare_parameter('coverage_turn_speed_deg', COVERAGE_TURN_SPEED_DEG)
+        self.declare_parameter('coverage_scan_spin_s', COVERAGE_SCAN_SPIN_S)
+        self.declare_parameter('coverage_scan_turn_speed', COVERAGE_SCAN_TURN_SPEED)
+        self.declare_parameter('coverage_row_midpoint_scans', COVERAGE_ROW_MIDPOINT_SCANS)
         self.declare_parameter('center_arena_on_start', True)
         self.declare_parameter('arena_origin_x', 0.0)
         self.declare_parameter('arena_origin_y', 0.0)
@@ -124,6 +148,7 @@ class ControlNode(Node):
         self.declare_parameter('arena_status_topic', '/arena_status')
         self.declare_parameter('robot_state_topic', '/robot_state')
         self.declare_parameter('mission_command_topic', '/mission_command')
+        self.declare_parameter('planned_path_topic', '/planned_path')
         self.declare_parameter('publish_gui_topics', True)
 
         joy_topic = self.get_parameter('joy_topic').value
@@ -135,6 +160,7 @@ class ControlNode(Node):
         arena_status_topic = self.get_parameter('arena_status_topic').value
         robot_state_topic = self.get_parameter('robot_state_topic').value
         mission_command_topic = self.get_parameter('mission_command_topic').value
+        planned_path_topic = self.get_parameter('planned_path_topic').value
 
         self.joy_deadman_axis = int(self.get_parameter('joy_deadman_axis').value)
         self.joy_auto_button = int(self.get_parameter('joy_auto_button').value)
@@ -144,10 +170,23 @@ class ControlNode(Node):
         self.forward_speed = float(self.get_parameter('forward_speed').value)
         self.reverse_speed = float(self.get_parameter('reverse_speed').value)
         self.turn_speed_deg = float(self.get_parameter('turn_speed_deg').value)
+        self.obstacle_buffer = float(self.get_parameter('obstacle_buffer').value)
+        self.emergency_stop_distance = float(self.get_parameter('emergency_stop_distance').value)
+        self.lidar_front_angle_fov = math.radians(float(self.get_parameter('lidar_front_angle_deg').value))
+        self.lidar_side_angle_fov = math.radians(float(self.get_parameter('lidar_side_angle_deg').value))
+        self.lidar_self_filter_min_range = float(self.get_parameter('lidar_self_filter_min_range').value)
         self.return_to_center_speed = float(self.get_parameter('return_to_center_speed').value)
         self.return_to_center_turn_speed_deg = float(self.get_parameter('return_to_center_turn_speed_deg').value)
         MAP_SIZE = max(1.0, float(self.get_parameter('arena_size_m').value))
         MAP_HALF_SIZE = MAP_SIZE / 2.0
+        self.coverage_boundary_margin = max(0.0, float(self.get_parameter('coverage_boundary_margin_m').value))
+        self.coverage_sweep_spacing = max(0.25, float(self.get_parameter('coverage_sweep_spacing_m').value))
+        self.coverage_goal_tolerance = max(0.1, float(self.get_parameter('coverage_goal_tolerance_m').value))
+        self.coverage_linear_speed = max(0.05, float(self.get_parameter('coverage_linear_speed').value))
+        self.coverage_turn_speed_deg = max(5.0, float(self.get_parameter('coverage_turn_speed_deg').value))
+        self.coverage_scan_spin_s = max(0.0, float(self.get_parameter('coverage_scan_spin_s').value))
+        self.coverage_scan_turn_speed = float(self.get_parameter('coverage_scan_turn_speed').value)
+        self.coverage_row_midpoint_scans = bool(self.get_parameter('coverage_row_midpoint_scans').value)
         self.center_arena_on_start = bool(self.get_parameter('center_arena_on_start').value)
         self.configured_arena_origin_x = float(self.get_parameter('arena_origin_x').value)
         self.configured_arena_origin_y = float(self.get_parameter('arena_origin_y').value)
@@ -162,6 +201,7 @@ class ControlNode(Node):
         self.pose_pub = self.create_publisher(Pose, robot_pose_topic, 10)
         self.arena_status_pub = self.create_publisher(String, arena_status_topic, 10)
         self.robot_state_pub = self.create_publisher(String, robot_state_topic, 10)
+        self.path_pub = self.create_publisher(PathMsg, planned_path_topic, 10)
 
         # ---- subscribers ----
         self.create_subscription(Joy, joy_topic, self.joy_cb, 10)
@@ -202,6 +242,13 @@ class ControlNode(Node):
         self.emergency_stop = False
         self.external_estop_status = ESTOP_CLEAR
         self.external_waypoint_active = False
+        self.coverage_active = False
+        self.coverage_waypoints = []
+        self.coverage_display_waypoints = []
+        self.coverage_idx = 0
+        self.coverage_scan_until = 0.0
+        self.coverage_scan_then_advance = False
+        self.last_path_publish_time = 0.0
         self.reached_home = False
         self._last_auto_button = False
         self._last_manual_button = False
@@ -220,6 +267,11 @@ class ControlNode(Node):
         self.get_logger().info(
             f'Speeds: forward={self.forward_speed:.2f} m/s, reverse={self.reverse_speed:.2f} m/s, '
             f'turn={self.turn_speed_deg:.1f} deg/s'
+        )
+        self.get_logger().info(
+            f'Coverage: {MAP_SIZE:g}x{MAP_SIZE:g}m, spacing={self.coverage_sweep_spacing:.2f}m, '
+            f'margin={self.coverage_boundary_margin:.2f}m, speed={self.coverage_linear_speed:.2f}m/s, '
+            f'scan_spin={self.coverage_scan_spin_s:.1f}s, row_midpoints={self.coverage_row_midpoint_scans}'
         )
         if not self.center_arena_on_start:
             self.get_logger().info(
@@ -241,6 +293,7 @@ class ControlNode(Node):
         with self.mutex:
             if command == 'start_wandering':
                 self.external_waypoint_active = False
+                self.coverage_active = False
                 self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring start_wandering command while external e-stop is active.')
@@ -257,6 +310,7 @@ class ControlNode(Node):
 
             elif command == 'go_home':
                 self.external_waypoint_active = False
+                self.coverage_active = False
                 self.reached_home = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.get_logger().warn('Ignoring go_home command while external e-stop is active.')
@@ -270,8 +324,18 @@ class ControlNode(Node):
                 self.publish_robot_state()
                 self.get_logger().info('GUI command: Go Home accepted. Returning to map center with obstacle avoidance.')
 
-            elif command in {'drive_waypoints', 'drive_coverage'}:
+            elif command == 'drive_coverage':
+                if self.coverage_active:
+                    self.get_logger().info('Ignoring duplicate drive_coverage command; coverage is already active.')
+                    return
+                if self.external_estop_status == ESTOP_ACTIVE:
+                    self.get_logger().warn('Ignoring drive_coverage command while external e-stop is active.')
+                    return
+                self.start_coverage()
+
+            elif command == 'drive_waypoints':
                 self.external_waypoint_active = True
+                self.coverage_active = False
                 self.reached_home = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.publish_twist(0.0, 0.0)
@@ -284,6 +348,7 @@ class ControlNode(Node):
                     self.external_estop_status = ESTOP_CLEAR
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.external_waypoint_active = False
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
                 self.get_logger().info('GUI command: E-stop reset accepted. Robot is idle.')
@@ -296,6 +361,7 @@ class ControlNode(Node):
             if self.external_estop_status == ESTOP_ACTIVE:
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 if previous != ESTOP_ACTIVE:
                     self.get_logger().error('External LiDAR E-STOP active. Motion halted.')
@@ -305,6 +371,119 @@ class ControlNode(Node):
                     self.get_logger().warn('External LiDAR warning active. Pausing motion.')
             elif previous != ESTOP_CLEAR:
                 self.get_logger().info('External LiDAR e-stop clear.')
+
+    def start_coverage(self):
+        """Start native 8x8 lawnmower coverage from the current arena origin."""
+        if self.map_origin_x is None or self.map_origin_y is None:
+            self.map_origin_x = self.current_x
+            self.map_origin_y = self.current_y
+            self.get_logger().info(
+                f'{MAP_SIZE:g}x{MAP_SIZE:g} coverage arena centered at current pose '
+                f'({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
+            )
+
+        self.coverage_waypoints = self.generate_coverage_waypoints()
+        if not self.coverage_waypoints:
+            self.get_logger().warn('No coverage waypoints generated; staying idle.')
+            self.coverage_active = False
+            self.drive_mode = DRIVE_MODE.MANUAL
+            self.publish_twist(0.0, 0.0)
+            self.publish_robot_state()
+            return
+
+        self.external_waypoint_active = False
+        self.coverage_active = True
+        self.coverage_idx = 0
+        self.coverage_scan_until = 0.0
+        self.coverage_scan_then_advance = False
+        self.reached_home = False
+        self.emergency_stop = False
+        self.drive_mode = DRIVE_MODE.AUTO
+        self.auto_state = AUTO_STATE.COVERAGE_SCAN if self.coverage_scan_spin_s > 0.0 else AUTO_STATE.COVERAGE_TURN
+        if self.auto_state == AUTO_STATE.COVERAGE_SCAN:
+            self.coverage_scan_until = time.time() + self.coverage_scan_spin_s
+        self.target_yaw = None
+        self.turn_start_time = None
+        self.turn_start_yaw = None
+        self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+        self.publish_twist(0.0, 0.0)
+        self.publish_planned_path()
+        self.publish_robot_state()
+        self.get_logger().info(
+            f'GUI command: Native lawnmower coverage started with {len(self.coverage_waypoints)} waypoint(s).'
+        )
+        if self.auto_state == AUTO_STATE.COVERAGE_SCAN:
+            self.get_logger().info(f'Starting initial coverage scan for {self.coverage_scan_spin_s:.1f}s.')
+
+    def generate_coverage_waypoints(self):
+        half = MAP_SIZE / 2.0
+        margin = min(self.coverage_boundary_margin, max(0.0, half - 0.25))
+        min_coord = -half + margin
+        max_coord = half - margin
+        if min_coord >= max_coord:
+            return []
+
+        rows = []
+        y = min_coord
+        while y <= max_coord + 1e-6:
+            rows.append(y)
+            y += self.coverage_sweep_spacing
+        if not rows or abs(rows[-1] - max_coord) > self.coverage_sweep_spacing * 0.35:
+            rows.append(max_coord)
+
+        relative_route = []
+        relative_display_route = []
+        left_to_right = True
+        mid_coord = (min_coord + max_coord) / 2.0
+        for y in rows:
+            display_endpoints = [(min_coord, y), (max_coord, y)]
+            endpoints = display_endpoints
+            if self.coverage_row_midpoint_scans:
+                endpoints = [(min_coord, y), (mid_coord, y), (max_coord, y)]
+            if not left_to_right:
+                endpoints.reverse()
+                display_endpoints.reverse()
+            relative_route.extend(endpoints)
+            relative_display_route.extend(display_endpoints)
+            left_to_right = not left_to_right
+
+        if relative_route and math.hypot(relative_route[-1][0], relative_route[-1][1]) < math.hypot(relative_route[0][0], relative_route[0][1]):
+            relative_route.reverse()
+            relative_display_route.reverse()
+
+        world_route = [
+            (self.map_origin_x + rel_x, self.map_origin_y + rel_y)
+            for rel_x, rel_y in relative_route
+        ]
+        world_route.append((self.map_origin_x, self.map_origin_y))
+        self.coverage_display_waypoints = [
+            (self.map_origin_x + rel_x, self.map_origin_y + rel_y)
+            for rel_x, rel_y in relative_display_route
+        ]
+        self.coverage_display_waypoints.append((self.map_origin_x, self.map_origin_y))
+
+        self.get_logger().info(
+            f'Generated {len(relative_route)} drive waypoint(s), {len(relative_display_route)} display waypoint(s), plus home for '
+            f'{MAP_SIZE:g}x{MAP_SIZE:g}m arena, spacing={self.coverage_sweep_spacing:.2f}m, margin={margin:.2f}m.'
+        )
+        return world_route
+
+    def publish_planned_path(self):
+        if not self.publish_gui_topics:
+            return
+        path = PathMsg()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = 'map'
+        display_waypoints = self.coverage_display_waypoints or self.coverage_waypoints
+        for x, y in display_waypoints:
+            pose = PoseStamped()
+            pose.header = path.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.orientation.w = 1.0
+            path.poses.append(pose)
+        self.path_pub.publish(path)
+        self.last_path_publish_time = time.time()
 
     # ------------------------------------------------------------------ #
     #  GUI HELPERS                                                         #
@@ -378,6 +557,8 @@ class ControlNode(Node):
                 'outside': round(outside_distance, 2),
                 'yaw': round(self.current_yaw, 1),
                 'pose_source': self.pose_source,
+                'waypoint_index': int(self.coverage_idx + 1) if self.coverage_active else 0,
+                'waypoint_count': int(len(self.coverage_waypoints)) if self.coverage_active else 0,
             })
             self.arena_status_pub.publish(msg)
 
@@ -409,6 +590,7 @@ class ControlNode(Node):
             if manual_pressed and not self._last_manual_button:
                 self.emergency_stop = False
                 self.drive_mode = DRIVE_MODE.MANUAL
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 self.publish_robot_state()
                 self.get_logger().info('PS4 X pressed: control node paused for joystick/manual control')
@@ -416,6 +598,7 @@ class ControlNode(Node):
             if auto_pressed and not self._last_auto_button:
                 self.emergency_stop = False
                 self.drive_mode = DRIVE_MODE.AUTO
+                self.coverage_active = False
                 self.auto_state = AUTO_STATE.INITIAL_TURN
                 if self.have_odom and self.center_arena_on_start:
                     self.map_origin_x = self.current_x
@@ -476,23 +659,23 @@ class ControlNode(Node):
             angle_min = msg.angle_min
             angle_inc = msg.angle_increment
             center_idx = n // 2
-            half_front_idx = int((LIDAR_FRONT_ANGLE_FOV / 2) / angle_inc)
+            half_front_idx = int((self.lidar_front_angle_fov / 2) / angle_inc)
 
             front_indices = [i % n for i in range(center_idx - half_front_idx, center_idx + half_front_idx + 1)]
             self.front_min_distance = min(
-                [ranges[i] for i in front_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+                [ranges[i] for i in front_indices if not math.isinf(ranges[i]) and ranges[i] > self.lidar_self_filter_min_range] or [float('inf')])
 
-            left_start_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
-            left_end_idx = int(((LIDAR_FRONT_ANGLE_FOV / 2 + LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
+            left_start_idx = int(((self.lidar_front_angle_fov / 2) - angle_min) / angle_inc)
+            left_end_idx = int(((self.lidar_front_angle_fov / 2 + self.lidar_side_angle_fov) - angle_min) / angle_inc)
             left_indices = [i % n for i in range(left_start_idx, left_end_idx + 1)]
             self.left_min_distance = min(
-                [ranges[i] for i in left_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+                [ranges[i] for i in left_indices if not math.isinf(ranges[i]) and ranges[i] > self.lidar_self_filter_min_range] or [float('inf')])
 
-            right_start_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2) - angle_min) / angle_inc)
-            right_end_idx = int(((-LIDAR_FRONT_ANGLE_FOV / 2 - LIDAR_SIDE_ANGLE_FOV) - angle_min) / angle_inc)
+            right_start_idx = int(((-self.lidar_front_angle_fov / 2) - angle_min) / angle_inc)
+            right_end_idx = int(((-self.lidar_front_angle_fov / 2 - self.lidar_side_angle_fov) - angle_min) / angle_inc)
             right_indices = [i % n for i in range(right_start_idx, right_end_idx + 1)]
             self.right_min_distance = min(
-                [ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > 0.01] or [float('inf')])
+                [ranges[i] for i in right_indices if not math.isinf(ranges[i]) and ranges[i] > self.lidar_self_filter_min_range] or [float('inf')])
 
     def odom_cb(self, msg: Odometry):
         with self.mutex:
@@ -589,6 +772,7 @@ class ControlNode(Node):
             if self.external_estop_status == ESTOP_ACTIVE:
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
+                self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 return
 
@@ -609,7 +793,7 @@ class ControlNode(Node):
                 self.get_logger().warn('Odometry is stale; stopping autonomous movement.', throttle_duration_sec=2.0)
                 return
 
-            if self.front_min_distance < EMERGENCY_STOP_DISTANCE:
+            if self.front_min_distance < self.emergency_stop_distance:
                 self.get_logger().warn(f'EMERGENCY STOP! Obstacle at {self.front_min_distance:.2f}m.')
                 self.publish_twist(0.0, 0.0)
                 if self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
@@ -635,24 +819,33 @@ class ControlNode(Node):
 
             rel_x, rel_y = self.relative_position()
             self.publish_arena_status(rel_x, rel_y)
+            if self.coverage_active and time.time() - self.last_path_publish_time > 1.0:
+                self.publish_planned_path()
 
             if not (-MAP_HALF_SIZE <= rel_x <= MAP_HALF_SIZE and -MAP_HALF_SIZE <= rel_y <= MAP_HALF_SIZE) and self.auto_state != AUTO_STATE.RETURN_TO_CENTER:
                 self.get_logger().warn(f'Robot outside {MAP_SIZE:g}x{MAP_SIZE:g} arena at relative ({rel_x:.2f}, {rel_y:.2f}). Returning to start center.')
+                self.coverage_active = False
                 self.auto_state = AUTO_STATE.RETURN_TO_CENTER
                 self.target_yaw = None
                 self.publish_twist(0.0, 0.0)
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 return
 
-            if self.auto_state not in [AUTO_STATE.INITIAL_TURN, AUTO_STATE.RETURN_TO_CENTER] and self.near_boundary(BOUNDARY_BUFFER) and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE]:
+            coverage_state = self.auto_state in [AUTO_STATE.COVERAGE_TURN, AUTO_STATE.COVERAGE_DRIVE, AUTO_STATE.COVERAGE_SCAN]
+            if (not coverage_state and
+                    self.auto_state not in [AUTO_STATE.INITIAL_TURN, AUTO_STATE.RETURN_TO_CENTER] and
+                    self.near_boundary(BOUNDARY_BUFFER) and
+                    self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE]):
                 self.get_logger().warn(f'HARD BOUNDARY hit at relative ({rel_x:.2f}, {rel_y:.2f}) with yaw {self.current_yaw:.1f} deg. Initiating boundary REVERSE.')
                 self.auto_state = AUTO_STATE.BOUNDARY_REVERSE
                 self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
                 self.reverse_start_time = time.time()
                 return
 
-            if self.front_min_distance < OBSTACLE_BUFFER and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
+            if self.front_min_distance < self.obstacle_buffer and self.auto_state not in [AUTO_STATE.BOUNDARY_REVERSE, AUTO_STATE.BOUNDARY_ESCAPE_TURN, AUTO_STATE.BOUNDARY_ESCAPE_DRIVE, AUTO_STATE.RETURN_TO_CENTER]:
                 self.get_logger().info(f'Obstacle detected in front (LIDAR) at {self.front_min_distance:.2f}m. Initiating avoidance.')
+                self.coverage_scan_until = 0.0
+                self.coverage_scan_then_advance = False
                 self.auto_state = AUTO_STATE.OBSTACLE_REVERSE
                 self.obstacle_maneuver_start_time = time.time()
                 self.publish_twist(0.0, 0.0)
@@ -675,6 +868,12 @@ class ControlNode(Node):
                 self.handle_boundary_escape_drive()
             elif self.auto_state == AUTO_STATE.RETURN_TO_CENTER:
                 self.handle_return_to_center()
+            elif self.auto_state == AUTO_STATE.COVERAGE_TURN:
+                self.handle_coverage_turn()
+            elif self.auto_state == AUTO_STATE.COVERAGE_DRIVE:
+                self.handle_coverage_drive()
+            elif self.auto_state == AUTO_STATE.COVERAGE_SCAN:
+                self.handle_coverage_scan()
 
     # ------------------------------------------------------------------ #
     #  STATE HANDLERS                                                      #
@@ -699,14 +898,145 @@ class ControlNode(Node):
         if abs_angle_diff < ANGLE_TOLERANCE or self._turn_timed_out():
             self.publish_twist(0.0, 0.0)
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
-            self.auto_state = AUTO_STATE.WANDERING_DRIVE
+            self.auto_state = AUTO_STATE.COVERAGE_TURN if self.coverage_active else AUTO_STATE.WANDERING_DRIVE
             self.target_yaw = None
             self.turn_start_time = None
             self.turn_start_yaw = None
-            self.get_logger().info('Finished obstacle turn. Resuming wandering drive.')
+            resumed = 'coverage route' if self.coverage_active else 'wandering drive'
+            self.get_logger().info(f'Finished obstacle turn. Resuming {resumed}.')
         else:
             angular_speed = math.copysign(math.radians(self.turn_speed_deg), angle_diff)
             self.publish_twist(0.0, angular_speed)
+
+    def current_coverage_goal(self):
+        if not self.coverage_active or self.coverage_idx >= len(self.coverage_waypoints):
+            return None
+        return self.coverage_waypoints[self.coverage_idx]
+
+    def finish_coverage(self):
+        self.coverage_active = False
+        self.coverage_idx = len(self.coverage_waypoints)
+        self.reached_home = True
+        self.drive_mode = DRIVE_MODE.MANUAL
+        self.target_yaw = None
+        self.turn_start_time = None
+        self.turn_start_yaw = None
+        self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+        self.publish_twist(0.0, 0.0)
+        self.publish_planned_path()
+        self.publish_robot_state()
+        self.get_logger().info('Lawnmower coverage complete. Returned to arena center and waiting idle.')
+
+    def advance_coverage_waypoint(self):
+        if self.coverage_scan_spin_s > 0.0:
+            self.auto_state = AUTO_STATE.COVERAGE_SCAN
+            self.coverage_scan_until = time.time() + self.coverage_scan_spin_s
+            self.coverage_scan_then_advance = True
+            self.target_yaw = None
+            self.turn_start_time = None
+            self.turn_start_yaw = None
+            self.publish_twist(0.0, 0.0)
+            self.get_logger().info(
+                f'Scanning at coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)} '
+                f'for {self.coverage_scan_spin_s:.1f}s.'
+            )
+            return
+
+        self._advance_coverage_waypoint_after_scan()
+
+    def _advance_coverage_waypoint_after_scan(self):
+        self.coverage_idx += 1
+        self.target_yaw = None
+        self.turn_start_time = None
+        self.turn_start_yaw = None
+        self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+        self.publish_twist(0.0, 0.0)
+        self.publish_planned_path()
+        if self.coverage_idx >= len(self.coverage_waypoints):
+            self.finish_coverage()
+            return
+        goal = self.coverage_waypoints[self.coverage_idx]
+        self.auto_state = AUTO_STATE.COVERAGE_TURN
+        self.get_logger().info(
+            f'Coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)}: '
+            f'goal=({goal[0]:.2f}, {goal[1]:.2f}).'
+        )
+
+    def handle_coverage_scan(self):
+        if not self.coverage_active:
+            self.finish_coverage()
+            return
+
+        if time.time() < self.coverage_scan_until:
+            self.publish_twist(0.0, self.coverage_scan_turn_speed)
+            return
+
+        self.publish_twist(0.0, 0.0)
+        self.coverage_scan_until = 0.0
+        if self.coverage_scan_then_advance:
+            self.coverage_scan_then_advance = False
+            self._advance_coverage_waypoint_after_scan()
+        else:
+            self.auto_state = AUTO_STATE.COVERAGE_TURN
+            self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+            self.get_logger().info('Initial coverage scan complete. Driving to first lawnmower waypoint.')
+
+    def handle_coverage_turn(self):
+        goal = self.current_coverage_goal()
+        if goal is None:
+            self.finish_coverage()
+            return
+
+        dx = goal[0] - self.current_x
+        dy = goal[1] - self.current_y
+        distance = math.hypot(dx, dy)
+        if distance <= self.coverage_goal_tolerance:
+            self.advance_coverage_waypoint()
+            return
+
+        desired_yaw = (math.degrees(math.atan2(dy, dx)) + 360) % 360
+        self.target_yaw = desired_yaw
+        if self.turn_start_time is None:
+            self._start_turn_timer()
+
+        angle_diff = signed_angle_diff(desired_yaw, self.current_yaw)
+        if abs(angle_diff) <= ANGLE_TOLERANCE:
+            self.auto_state = AUTO_STATE.COVERAGE_DRIVE
+            self.turn_start_time = None
+            self.turn_start_yaw = None
+            self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+            self.publish_twist(0.0, 0.0)
+            return
+
+        angular_speed = math.copysign(math.radians(self.coverage_turn_speed_deg), angle_diff)
+        self.publish_twist(0.0, angular_speed)
+
+    def handle_coverage_drive(self):
+        goal = self.current_coverage_goal()
+        if goal is None:
+            self.finish_coverage()
+            return
+
+        dx = goal[0] - self.current_x
+        dy = goal[1] - self.current_y
+        distance = math.hypot(dx, dy)
+        if distance <= self.coverage_goal_tolerance:
+            self.advance_coverage_waypoint()
+            return
+
+        desired_yaw = (math.degrees(math.atan2(dy, dx)) + 360) % 360
+        angle_diff = signed_angle_diff(desired_yaw, self.current_yaw)
+        if abs(angle_diff) > max(ANGLE_TOLERANCE * 2.0, 15.0):
+            self.auto_state = AUTO_STATE.COVERAGE_TURN
+            self.target_yaw = desired_yaw
+            self._start_turn_timer()
+            self.publish_twist(0.0, 0.0)
+            self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+            return
+
+        angular_speed = math.radians(max(-self.coverage_turn_speed_deg, min(self.coverage_turn_speed_deg, angle_diff * 0.6)))
+        linear_speed = min(self.coverage_linear_speed, self.forward_speed)
+        self.publish_twist(linear_speed, angular_speed)
 
     def handle_initial_turn(self):
         if self.target_yaw is None:
@@ -861,7 +1191,7 @@ class ControlNode(Node):
             return
 
         # Check for obstacles while returning home
-        if self.front_min_distance < OBSTACLE_BUFFER:
+        if self.front_min_distance < self.obstacle_buffer:
             self.handle_return_obstacle_avoidance()
             return
 

@@ -62,6 +62,26 @@ def generate_launch_description():
         'arena_size_m', default_value='8.0',
         description='Square arena side length in metres.'
     )
+    coverage_boundary_margin_arg = DeclareLaunchArgument(
+        'coverage_boundary_margin_m', default_value='0.5',
+        description='Lawnmower margin inside the square arena.'
+    )
+    coverage_sweep_spacing_arg = DeclareLaunchArgument(
+        'coverage_sweep_spacing_m', default_value='1.4',
+        description='Spacing between lawnmower rows.'
+    )
+    coverage_scan_spin_arg = DeclareLaunchArgument(
+        'coverage_scan_spin_s', default_value='6.0',
+        description='Seconds to rotate in place at each coverage waypoint.'
+    )
+    coverage_scan_turn_speed_arg = DeclareLaunchArgument(
+        'coverage_scan_turn_speed', default_value='0.65',
+        description='Angular speed in rad/s for coverage scan rotations.'
+    )
+    coverage_row_midpoint_scans_arg = DeclareLaunchArgument(
+        'coverage_row_midpoint_scans', default_value='true',
+        description='Add a scan waypoint at the middle of every lawnmower row.'
+    )
 
     # ==================== Gazebo ====================
     gazebo = IncludeLaunchDescription(
@@ -123,6 +143,11 @@ def generate_launch_description():
             {'return_to_center_speed': 0.25},
             {'return_to_center_turn_speed_deg': 30.0},
             {'arena_size_m': ParameterValue(LaunchConfiguration('arena_size_m'), value_type=float)},
+            {'coverage_boundary_margin_m': ParameterValue(LaunchConfiguration('coverage_boundary_margin_m'), value_type=float)},
+            {'coverage_sweep_spacing_m': ParameterValue(LaunchConfiguration('coverage_sweep_spacing_m'), value_type=float)},
+            {'coverage_scan_spin_s': ParameterValue(LaunchConfiguration('coverage_scan_spin_s'), value_type=float)},
+            {'coverage_scan_turn_speed': ParameterValue(LaunchConfiguration('coverage_scan_turn_speed'), value_type=float)},
+            {'coverage_row_midpoint_scans': ParameterValue(LaunchConfiguration('coverage_row_midpoint_scans'), value_type=bool)},
             {'center_arena_on_start': False},
             {'arena_origin_x': 0.0},
             {'arena_origin_y': 0.0},
@@ -168,6 +193,11 @@ def generate_launch_description():
         rviz_launch_arg,
         control_mode_arg,
         arena_size_arg,
+        coverage_boundary_margin_arg,
+        coverage_sweep_spacing_arg,
+        coverage_scan_spin_arg,
+        coverage_scan_turn_speed_arg,
+        coverage_row_midpoint_scans_arg,
         gazebo,
         robot,
         robot_state_publisher,

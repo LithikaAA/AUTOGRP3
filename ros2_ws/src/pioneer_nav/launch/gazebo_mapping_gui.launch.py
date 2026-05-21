@@ -66,6 +66,11 @@ def generate_launch_description():
         launch_arguments={
             'rviz': 'false',
             'arena_size_m': coverage_area_size_m,
+            'coverage_boundary_margin_m': coverage_boundary_margin_m,
+            'coverage_sweep_spacing_m': coverage_sweep_spacing_m,
+            'coverage_scan_spin_s': coverage_scan_spin_s,
+            'coverage_scan_turn_speed': coverage_scan_turn_speed,
+            'coverage_row_midpoint_scans': 'true',
         }.items(),
     )
 
@@ -209,6 +214,7 @@ def generate_launch_description():
                         {'cmd_vel_topic': '/cmd_vel'},
                         {'mission_command_topic': '/mission_command'},
                         {'robot_state_topic': '/robot_state'},
+                        {'ignore_coverage_commands': True},
                         {'use_gazebo_tf_pose': True},
                         {'gazebo_tf_topic': '/world/pioneer_world/dynamic_pose/info'},
                         {'gazebo_tf_frame_match': 'pioneer'},

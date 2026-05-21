@@ -438,20 +438,42 @@ class MapWidget(QWidget):
 
     def update_path(self, poses):
         self._path = [(p.pose.position.x, p.pose.position.y) for p in poses]
-        if (
-            self._path
-            and (self._arena_origin_x is None or self._arena_origin_y is None)
-        ):
-            if self._have_pose:
-                self._arena_origin_x = self._robot_x
-                self._arena_origin_y = self._robot_y
-            else:
-                # Coverage paths append the start/home pose last; use it to
-                # center the GUI before the first /robot/pose callback arrives.
-                self._arena_origin_x, self._arena_origin_y = self._path[-1]
-            self._slam_overlay_img = None
-            self._slam_overlay_key = None
+        if self._path:
+            coverage_home = self._coverage_home_from_path()
+            if coverage_home is not None:
+                # The control node appends the arena home/start pose to the end
+                # of coverage paths. Use that as the GUI centre so the live
+                # crop matches the saved-map arena box exactly, even if /pose
+                # arrived first after the robot had already moved.
+                self._arena_origin_x, self._arena_origin_y = coverage_home
+                self._slam_overlay_img = None
+                self._slam_overlay_key = None
+            elif self._arena_origin_x is None or self._arena_origin_y is None:
+                if self._have_pose:
+                    self._arena_origin_x = self._robot_x
+                    self._arena_origin_y = self._robot_y
+                else:
+                    self._arena_origin_x, self._arena_origin_y = self._path[-1]
+                self._slam_overlay_img = None
+                self._slam_overlay_key = None
         self.update()
+
+    def _coverage_home_from_path(self):
+        if len(self._path) < 4:
+            return None
+        xs = [p[0] for p in self._path]
+        ys = [p[1] for p in self._path]
+        span_x = max(xs) - min(xs)
+        span_y = max(ys) - min(ys)
+        if span_x < self._arena_size * 0.4 and span_y < self._arena_size * 0.4:
+            return None
+        home_x, home_y = self._path[-1]
+        centre_x = (min(xs) + max(xs)) / 2.0
+        centre_y = (min(ys) + max(ys)) / 2.0
+        # A coverage route's final pose is home, near the centre of its sweep.
+        if math.hypot(home_x - centre_x, home_y - centre_y) <= self._arena_size * 0.25:
+            return home_x, home_y
+        return None
 
     def _arena_view_rect(self):
         size = max(10, min(self.width(), self.height()) - 20)
@@ -614,7 +636,8 @@ class MapWidget(QWidget):
 
         painter.setPen(QPen(QColor(70, 70, 70), 1))
         painter.setFont(QFont(FONT_UI, 9))
-        painter.drawText(dx + 8, dy + 18, f"{self._arena_size:g} x {self._arena_size:g} m SLAM map")
+        label = "Waiting for /map from SLAM..." if self._map_img is None else f"{self._arena_size:g} x {self._arena_size:g} m SLAM map"
+        painter.drawText(dx + 8, dy + 18, label)
 
     def _draw_slam_map(self, painter):
         if self._map_img is None or self._map_w <= 0 or self._map_h <= 0:
@@ -672,8 +695,7 @@ class MapWidget(QWidget):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(205, 205, 205))
-        if self._arena_origin_x is not None and self._arena_origin_y is not None:
-            self._draw_coverage_grid(painter)
+        if self._arena_origin_x is not None and self._arena_origin_y is not None and self._map_data is not None:
             self._draw_slam_overlay(painter)
             self._draw_arena_boundary(painter)
         else:
@@ -681,7 +703,7 @@ class MapWidget(QWidget):
             self._draw_arena_boundary(painter)
 
         if len(self._path) >= 2:
-            painter.setPen(QPen(QColor(ACCENT), 2, Qt.DashLine))
+            painter.setPen(QPen(QColor(ACCENT), 3, Qt.DashLine))
             for i in range(len(self._path) - 1):
                 p1 = self._world_to_px(*self._path[i])
                 p2 = self._world_to_px(*self._path[i+1])
@@ -1403,7 +1425,7 @@ class RobotGUI(QMainWindow):
         img    = np.full((height, width), 205, dtype=np.uint8)
         img[data == 0]   = 254
         img[data >= 65]  = 0
-        img = np.flipud(img)
+        img = np.ascontiguousarray(np.flipud(img))
         self._draw_arena_boundary_on_saved_map(img, msg)
 
         image_path = f"{prefix}.png"

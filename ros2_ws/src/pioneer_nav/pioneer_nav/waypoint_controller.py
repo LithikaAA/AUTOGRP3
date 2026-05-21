@@ -107,6 +107,7 @@ class WaypointController(Node):
         self.declare_parameter("robot_state_topic", "/robot_state")
         self.declare_parameter("arena_status_topic", "/arena_status")
         self.declare_parameter("estop_status_topic", "/estop_status")
+        self.declare_parameter("ignore_coverage_commands", False)
         self.declare_parameter("use_gazebo_tf_pose", False)
         self.declare_parameter("gazebo_tf_topic", "/world/pioneer_world/dynamic_pose/info")
         self.declare_parameter("gazebo_tf_frame_match", "pioneer")
@@ -205,6 +206,7 @@ class WaypointController(Node):
         self.robot_state_topic = str(self.get_parameter("robot_state_topic").value)
         self.arena_status_topic = str(self.get_parameter("arena_status_topic").value)
         self.estop_status_topic = str(self.get_parameter("estop_status_topic").value)
+        self.ignore_coverage_commands = bool(self.get_parameter("ignore_coverage_commands").value)
         self.use_gazebo_tf_pose = bool(self.get_parameter("use_gazebo_tf_pose").value)
         self.gazebo_tf_topic = str(self.get_parameter("gazebo_tf_topic").value)
         self.gazebo_tf_frame_match = str(self.get_parameter("gazebo_tf_frame_match").value)
@@ -568,6 +570,9 @@ class WaypointController(Node):
                 return
             self.start_waypoints(coverage_mode=False)
         elif command in {"drive_coverage", "start_exploration", "explore_world"}:
+            if self.ignore_coverage_commands:
+                self.get_logger().info("Ignoring coverage command because control_node owns lawnmower coverage.")
+                return
             if self.active and self.coverage_mode:
                 self.get_logger().info("Ignoring duplicate drive_coverage command; coverage is already active.")
                 return
