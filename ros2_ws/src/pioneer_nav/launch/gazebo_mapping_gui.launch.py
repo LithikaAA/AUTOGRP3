@@ -123,7 +123,7 @@ def generate_launch_description():
         DeclareLaunchArgument('binary_map_csv', default_value=''),
         DeclareLaunchArgument('astar_obstacle_inflation_m', default_value='0.25'),
         DeclareLaunchArgument('astar_waypoint_spacing_m', default_value='0.35'),
-        DeclareLaunchArgument('coverage_area_size_m', default_value='8.0'),
+        DeclareLaunchArgument('coverage_area_size_m', default_value='15.0'),
         DeclareLaunchArgument('coverage_boundary_margin_m', default_value='0.5'),
         DeclareLaunchArgument('coverage_sweep_spacing_m', default_value='1.4'),
         DeclareLaunchArgument('coverage_pattern', default_value='serpentine'),

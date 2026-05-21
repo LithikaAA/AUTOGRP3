@@ -57,7 +57,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QGridLayout,
     QFrame, QScrollArea, QSizePolicy, QProgressBar, QPushButton, QLineEdit
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF, QRect
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QPointF
 from PyQt5.QtGui import (
     QImage, QPixmap, QFont, QColor, QPainter,
     QPen, QBrush, QPolygonF
@@ -257,7 +257,7 @@ def status_row(grid: QGridLayout, row: int, key: str, val: str = "—", val_colo
 #  MAP WIDGET  (original coverage-grid version)
 #  Kept from the original — LiDAR coverage grid,
 #  path trace, robot dot, detection markers,
-#  and planned path overlay.
+#  and detection markers.
 # ──────────────────────────────────────────────
 class MapWidget(QWidget):
     def __init__(self):
@@ -274,8 +274,6 @@ class MapWidget(QWidget):
         self._map_h     = 0
         self._map_data  = None
         self._last_map_time = None
-        self._slam_overlay_img = None
-        self._slam_overlay_key = None
 
         self._robot_x   = 0.0
         self._robot_y   = 0.0
@@ -292,10 +290,8 @@ class MapWidget(QWidget):
         self._obstacle_cells = np.zeros((self._coverage_n, self._coverage_n), dtype=bool)
 
         self._path_trace = []
-        self._scan_hits = []
+        self._live_scan_rays = []
         self._max_trace_points = 2000
-        self._max_scan_hits = 5000
-        self._scan_hit_lifetime = 10.0
 
         # Each entry: (world_x, world_y, label, colour_str)
         # Rebuilt every 2 seconds from detections_log.jsonl — never appended directly
@@ -319,8 +315,6 @@ class MapWidget(QWidget):
         h, w, _ = img.shape
         self._map_img = QImage(img.tobytes(), w, h, 3*w, QImage.Format_RGB888).copy()
         self._last_map_time = time.time()
-        self._slam_overlay_img = None
-        self._slam_overlay_key = None
         self.update()
 
     def update_pose(self, x, y, yaw):
@@ -331,8 +325,6 @@ class MapWidget(QWidget):
         if self._arena_origin_x is None or self._arena_origin_y is None:
             self._arena_origin_x = x
             self._arena_origin_y = y
-            self._slam_overlay_img = None
-            self._slam_overlay_key = None
         if not self._path_trace or math.hypot(
             x - self._path_trace[-1][0],
             y - self._path_trace[-1][1],
@@ -349,24 +341,20 @@ class MapWidget(QWidget):
         else:
             self._arena_origin_x = None
             self._arena_origin_y = None
-        self._slam_overlay_img = None
-        self._slam_overlay_key = None
         self._free_cells.fill(False)
         self._obstacle_cells.fill(False)
         self._path_trace.clear()
-        self._scan_hits.clear()
+        self._live_scan_rays.clear()
         self.update()
 
     def update_scan(self, msg):
-        if not self._have_pose or self._arena_origin_x is None:
+        if not self._have_pose:
             return
 
-        hits = []
-        now = time.time()
+        rays = []
         min_usable_range = max(msg.range_min, LIDAR_SELF_MASK_MIN_RANGE)
-        step = max(1, len(msg.ranges) // 180)
-        for i in range(0, len(msg.ranges), step):
-            r = msg.ranges[i]
+        for i, raw_range in enumerate(msg.ranges):
+            r = raw_range
             if math.isnan(r) or r <= min_usable_range:
                 continue
             hit_obstacle = math.isfinite(r)
@@ -378,15 +366,9 @@ class MapWidget(QWidget):
             angle = self._robot_yaw + msg.angle_min + i * msg.angle_increment
             wx = self._robot_x + r * math.cos(angle)
             wy = self._robot_y + r * math.sin(angle)
-            if hit_obstacle:
-                hits.append((wx, wy, now))
-            self._paint_lidar_ray(angle, r, msg.range_max, hit_obstacle)
+            rays.append((self._robot_x, self._robot_y, wx, wy, hit_obstacle))
 
-        self._scan_hits.extend(hits)
-        cutoff = now - self._scan_hit_lifetime
-        self._scan_hits = [hit for hit in self._scan_hits if hit[2] >= cutoff]
-        if len(self._scan_hits) > self._max_scan_hits:
-            self._scan_hits = self._scan_hits[-self._max_scan_hits:]
+        self._live_scan_rays = rays
         self.update()
 
     def _world_to_arena(self, wx, wy):
@@ -450,20 +432,15 @@ class MapWidget(QWidget):
             coverage_home = self._coverage_home_from_path()
             if coverage_home is not None:
                 # The control node appends the arena home/start pose to the end
-                # of coverage paths. Use that as the GUI centre so the live
-                # crop matches the saved-map arena box exactly, even if /pose
-                # arrived first after the robot had already moved.
+                # of coverage paths. Keep that as the fallback GUI centre for
+                # pre-SLAM drawing, while /map remains the primary live view.
                 self._arena_origin_x, self._arena_origin_y = coverage_home
-                self._slam_overlay_img = None
-                self._slam_overlay_key = None
             elif self._arena_origin_x is None or self._arena_origin_y is None:
                 if self._have_pose:
                     self._arena_origin_x = self._robot_x
                     self._arena_origin_y = self._robot_y
                 else:
                     self._arena_origin_x, self._arena_origin_y = self._path[-1]
-                self._slam_overlay_img = None
-                self._slam_overlay_key = None
         self.update()
 
     def _coverage_home_from_path(self):
@@ -490,6 +467,12 @@ class MapWidget(QWidget):
         return dx, dy, size
 
     def _world_to_px(self, wx, wy):
+        if self._map_w > 0 and self._map_h > 0:
+            dx, dy, scale = self._map_view_transform()
+            gx = (wx - self._map_ox) / self._map_res
+            gy = self._map_h - (wy - self._map_oy) / self._map_res
+            return (int(dx + gx * scale), int(dy + gy * scale))
+
         if self._arena_origin_x is not None and self._arena_origin_y is not None:
             dx, dy, size = self._arena_view_rect()
             ax, ay = self._world_to_arena(wx, wy)
@@ -497,14 +480,8 @@ class MapWidget(QWidget):
             py = int(dy + (self._arena_half - ay) / self._arena_size * size)
             return (px, py)
 
-        if self._map_w > 0 and self._map_h > 0:
-            dx, dy, scale = self._map_view_transform()
-            gx = (wx - self._map_ox) / self._map_res
-            gy = self._map_h - (wy - self._map_oy) / self._map_res
-            return (int(dx + gx * scale), int(dy + gy * scale))
-
         if self._map_w == 0 or self._map_h == 0:
-            scan_points = [(x, y) for x, y, _stamp in self._scan_hits]
+            scan_points = [(x2, y2) for _x1, _y1, x2, y2, _hit in self._live_scan_rays]
             points = self._path_trace + scan_points + [(self._robot_x, self._robot_y)]
             if not points:
                 return (self.width()//2, self.height()//2)
@@ -575,64 +552,6 @@ class MapWidget(QWidget):
         painter.setFont(QFont(FONT_UI, 9))
         painter.drawText(dx + 8, dy + 18, f"{self._arena_size:g} x {self._arena_size:g} m LiDAR scan")
 
-    def _slam_overlay_image(self):
-        if (
-            self._map_data is None
-            or self._map_w <= 0
-            or self._map_h <= 0
-            or self._arena_origin_x is None
-            or self._arena_origin_y is None
-        ):
-            return None
-
-        _dx, _dy, size = self._arena_view_rect()
-        key = (
-            size,
-            self._map_w,
-            self._map_h,
-            self._map_res,
-            self._map_ox,
-            self._map_oy,
-            self._arena_origin_x,
-            self._arena_origin_y,
-            self._last_map_time,
-        )
-        if self._slam_overlay_img is not None and self._slam_overlay_key == key:
-            return self._slam_overlay_img
-
-        rows, cols = np.indices((size, size), dtype=np.float32)
-        arena_x = (cols + 0.5) / size * self._arena_size - self._arena_half
-        arena_y = self._arena_half - (rows + 0.5) / size * self._arena_size
-        world_x = self._arena_origin_x + arena_x
-        world_y = self._arena_origin_y + arena_y
-
-        gx = np.floor((world_x - self._map_ox) / self._map_res).astype(np.int32)
-        gy = np.floor((world_y - self._map_oy) / self._map_res).astype(np.int32)
-        valid = (gx >= 0) & (gx < self._map_w) & (gy >= 0) & (gy < self._map_h)
-
-        img = np.full((size, size, 3), 205, dtype=np.uint8)
-        sampled = np.full((size, size), -1, dtype=np.int16)
-        sampled[valid] = self._map_data[gy[valid], gx[valid]]
-        img[sampled == 0] = [254, 254, 254]
-        img[sampled > 50] = [0, 0, 0]
-
-        self._slam_overlay_img = QImage(
-            img.tobytes(),
-            size,
-            size,
-            3 * size,
-            QImage.Format_RGB888,
-        ).copy()
-        self._slam_overlay_key = key
-        return self._slam_overlay_img
-
-    def _draw_slam_overlay(self, painter):
-        overlay = self._slam_overlay_image()
-        if overlay is None:
-            return
-        dx, dy, size = self._arena_view_rect()
-        painter.drawImage(dx, dy, overlay)
-
     def _draw_empty_arena(self, painter):
         size = min(self.width(), self.height()) - 20
         size = max(10, size)
@@ -650,25 +569,6 @@ class MapWidget(QWidget):
     def _draw_slam_map(self, painter):
         if self._map_img is None or self._map_w <= 0 or self._map_h <= 0:
             self._draw_empty_arena(painter)
-            return
-
-        if self._arena_origin_x is not None and self._arena_origin_y is not None:
-            top_left = self._world_to_px(
-                self._map_ox,
-                self._map_oy + self._map_h * self._map_res,
-            )
-            bottom_right = self._world_to_px(
-                self._map_ox + self._map_w * self._map_res,
-                self._map_oy,
-            )
-            x = min(top_left[0], bottom_right[0])
-            y = min(top_left[1], bottom_right[1])
-            w = max(1, abs(bottom_right[0] - top_left[0]))
-            h = max(1, abs(bottom_right[1] - top_left[1]))
-            painter.drawImage(
-                QRect(x, y, w, h),
-                self._map_img,
-            )
             return
 
         dx, dy, scale = self._map_view_transform()
@@ -699,33 +599,28 @@ class MapWidget(QWidget):
         for i in range(len(corners)):
             painter.drawLine(*corners[i], *corners[(i + 1) % len(corners)])
 
+    def _draw_live_scan(self, painter):
+        if not self._live_scan_rays:
+            return
+
+        clear_pen = QPen(QColor(255, 255, 255, 115), 1)
+        hit_pen = QPen(QColor(35, 35, 35, 180), 1)
+        hit_brush = QBrush(QColor(35, 35, 35, 180))
+        for x1, y1, x2, y2, hit_obstacle in self._live_scan_rays:
+            p1 = self._world_to_px(x1, y1)
+            p2 = self._world_to_px(x2, y2)
+            painter.setPen(hit_pen if hit_obstacle else clear_pen)
+            painter.drawLine(*p1, *p2)
+            if hit_obstacle:
+                painter.setBrush(hit_brush)
+                painter.drawEllipse(p2[0] - 1, p2[1] - 1, 2, 2)
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         painter.fillRect(self.rect(), QColor(205, 205, 205))
-        if self._arena_origin_x is not None and self._arena_origin_y is not None and self._map_data is not None:
-            self._draw_slam_overlay(painter)
-            self._draw_arena_boundary(painter)
-        else:
-            self._draw_slam_map(painter)
-            self._draw_arena_boundary(painter)
-
-        # Planned path — dashed line plus numbered waypoint dots.
-        if len(self._path) >= 2:
-            painter.setPen(QPen(QColor(ACCENT), 3, Qt.DashLine))
-            for i in range(len(self._path) - 1):
-                p1 = self._world_to_px(*self._path[i])
-                p2 = self._world_to_px(*self._path[i+1])
-                painter.drawLine(*p1, *p2)
-
-            for idx, (wx, wy) in enumerate(self._path):
-                px, py = self._world_to_px(wx, wy)
-                painter.setBrush(QBrush(QColor(ACCENT)))
-                painter.setPen(QPen(QColor(TEXT), 1))
-                painter.drawEllipse(px - 5, py - 5, 10, 10)
-                painter.setFont(QFont(FONT_UI, 7, QFont.Bold))
-                painter.setPen(QColor(TEXT))
-                painter.drawText(px + 7, py + 4, str(idx + 1))
+        self._draw_slam_map(painter)
+        self._draw_live_scan(painter)
 
         # Draw detection markers — one per unique obstacle from the log file
         for (wx, wy, label, col) in self._detections:
@@ -1140,7 +1035,7 @@ class RobotGUI(QMainWindow):
         self.signals.arena_updated.connect(self._on_arena)
         self.signals.save_status.connect(self._on_save_status)
         self._start_wandering_btn.clicked.connect(
-            lambda: self._send_mission_command("start_wandering"))
+            lambda: self._send_mission_command("drive_coverage"))
         self._go_home_btn.clicked.connect(
             lambda: self._send_mission_command("go_home"))
         self._drive_waypoints_btn.clicked.connect(
@@ -1374,7 +1269,7 @@ class RobotGUI(QMainWindow):
         self._arena_panel.update(data)
 
     def _send_mission_command(self, command: str):
-        if command == "start_wandering":
+        if command in {"start_wandering", "drive_coverage"}:
             self._map_widget.reset_centre_reference()
             self._on_state("MAPPING")
         elif command == "drive_waypoints":
