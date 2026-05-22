@@ -20,6 +20,10 @@ def rel(path):
     return os.path.relpath(path, here)
 
 
+def existing_rel_files(*paths):
+    return [rel(here / path) for path in paths if (here / path).is_file()]
+
+
 robots_dir = first_existing(workspace_root / 'robots', repo_root / 'robots')
 world_file = first_existing(workspace_root / 'basic_urdf.sdf', repo_root / 'ros2_ws' / 'basic_urdf.sdf')
 
@@ -56,22 +60,21 @@ setup(
     data_files=[
         ('share/ament_index/resource_index/packages', ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        ('share/' + package_name + '/launch', [
+        ('share/' + package_name + '/launch', existing_rel_files(
             'launch/part2_mission.launch.py',
             'launch/sdf.launch.py',
             'launch/control_node_gazebo.launch.py',
             'launch/slam_mapping.launch.py',
-            'launch/nav2_navigation.launch.py',
             'launch/gazebo_mapping_gui.launch.py',
             'launch/mapping_gui.launch.py',
             'launch/letter_detector.launch.py',
-        ]),
-        ('share/' + package_name + '/config', [
+        )),
+        ('share/' + package_name + '/config', existing_rel_files(
             'pioneer_nav/config/test_waypoints.txt',
             'config/slam_toolbox_mapping.yaml',
             'config/nav2_params.yaml',
             'config/slam_mapping.rviz',
-        ]),
+        )),
     ] + asset_data_files,
     install_requires=['setuptools'],
     zip_safe=True,
