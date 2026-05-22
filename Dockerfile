@@ -62,6 +62,11 @@ COPY ros2_ws/basic_urdf.sdf /ros2_ws/basic_urdf.sdf
 COPY robots /ros2_ws/robots
 COPY ariaNode /ros2_ws/src/ariaNode
 
+RUN if [ ! -f /ros2_ws/src/pioneer_nav/pioneer_nav/unified_detector_node.py ] && \
+       [ -f /ros2_ws/src/pioneer_nav/pioneer_nav/unified_detector_node_original.py ]; then \
+        cp /ros2_ws/src/pioneer_nav/pioneer_nav/unified_detector_node_original.py \
+           /ros2_ws/src/pioneer_nav/pioneer_nav/unified_detector_node.py; \
+    fi
 RUN test -f /ros2_ws/src/pioneer_nav/pioneer_nav/unified_detector_node.py
 
 # Build workspace
