@@ -53,10 +53,11 @@ warnstate = 1
 estopstate = 2
 
 # settings
-stopdist = 0.18 # metres -> emergency stop zone
-warndist = 0.35 # metres -> warning zone (stop and wait)
-fwdspeed = 0.2 # m/s
-front_half_angle_deg = 35.0
+stopdist = 0.5          # metres -> motion estop zone (moving/suddenly-appearing obstacles)
+critical_dist = 0.22    # metres -> proximity estop (static, last-resort; below avoidance threshold)
+warndist = 1.0          # metres -> warning zone (slow down / warn)
+fwdspeed = 0.2          # m/s
+front_half_angle_deg = 45.0   # ±45° = 90° total front cone
 min_hits = 3
 
 # motion detection threshold
@@ -80,6 +81,7 @@ class LidarEstop(Node):
         self.declare_parameter("bag_directory", default_bagdirect)
         self.declare_parameter("incident_log", default_incidentlog)
         self.declare_parameter("stop_distance_m", stopdist)
+        self.declare_parameter("critical_distance_m", critical_dist)
         self.declare_parameter("warning_distance_m", warndist)
         self.declare_parameter("front_half_angle_deg", front_half_angle_deg)
         self.declare_parameter("min_hits", min_hits)
@@ -90,6 +92,7 @@ class LidarEstop(Node):
         self.bagdirect = self.get_parameter("bag_directory").value
         self.incidentlog = self.get_parameter("incident_log").value
         self.stopdist = max(0.01, float(self.get_parameter("stop_distance_m").value))
+        self.criticaldist = max(0.01, float(self.get_parameter("critical_distance_m").value))
         self.warndist = max(self.stopdist, float(self.get_parameter("warning_distance_m").value))
         self.front_half_angle = math.radians(
             max(1.0, float(self.get_parameter("front_half_angle_deg").value))
@@ -97,9 +100,10 @@ class LidarEstop(Node):
         self.min_hits = max(1, int(self.get_parameter("min_hits").value))
         self.latch_estop = bool(self.get_parameter("latch_estop").value)
 
-        # two separate states now:
-        # estopON -> full emergency stop (1m), latches for estophold seconds
-        # warnON  -> warning zone stop (5m), clears as soon as path is clear
+        # proxEstop: auto-clearing — something is in the front cone right now
+        # estopON:   latching — something *moved* toward the robot (requires reset_estop)
+        # warnON:    auto-clearing warning zone
+        self.proxEstop = False
         self.estopON = False
         self.warnON  = False
 
@@ -147,6 +151,7 @@ class LidarEstop(Node):
         if msg.data.strip() != "reset_estop":
             return
         self.estopON = False
+        self.proxEstop = False
         self.warnON = False
         self.sendvelo(0.0)
         self.statuspub.publish(Int8(data=clearstate))
@@ -154,6 +159,7 @@ class LidarEstop(Node):
         self.get_logger().info("LiDAR e-stop reset by /mission_command.")
 
     def front_sector_stats(self, msg: LaserScan):
+        """Count rays in front cone within critical (last-resort) and warning distances."""
         closest = float("inf")
         stop_hits = 0
         warn_hits = 0
@@ -163,7 +169,7 @@ class LidarEstop(Node):
             if -self.front_half_angle <= angle <= self.front_half_angle:
                 if not (math.isnan(rangenow) or math.isinf(rangenow) or rangenow <= 0.1):
                     closest = min(closest, rangenow)
-                    if rangenow <= self.stopdist:
+                    if rangenow <= self.criticaldist:
                         stop_hits += 1
                     elif rangenow <= self.warndist:
                         warn_hits += 1
@@ -211,115 +217,88 @@ class LidarEstop(Node):
         curr = msg.ranges
         static_closest, static_stop_hits, static_warn_hits = self.front_sector_stats(msg)
 
-        if static_stop_hits >= self.min_hits and (not self.estopON or not self.latch_estop):
-            self.sendvelo(0.0)
-            self.estopON = True
-            self.warnON = False
-            self.get_logger().warn(
-                f"EMERGENCY STOP - obstacle at {static_closest:.2f}m "
-                f"({static_stop_hits} front rays)"
-            )
-            self.logincident(static_closest, static_stop_hits)
-            self.savethebag()
-        elif static_warn_hits >= self.min_hits and not self.estopON:
-            self.sendvelo(0.0)
-            if not self.warnON:
+        # ── Proximity estop (AUTO-CLEARING) ──────────────────────────────────
+        # Anything in the front cone within stopdist → stop immediately.
+        # Clears on its own when the obstacle moves away — no manual reset needed.
+        if static_stop_hits >= self.min_hits and not self.estopON:
+            if not self.proxEstop:
+                self.proxEstop = True
+                self.sendvelo(0.0)
                 self.get_logger().warn(
-                    f"Warning stop - obstacle at {static_closest:.2f}m "
+                    f"PROXIMITY ESTOP: obstacle at {static_closest:.2f}m "
+                    f"({static_stop_hits} front rays) — will auto-clear when path is free."
+                )
+                self.logincident(static_closest, static_stop_hits)
+                self.savethebag()
+        elif self.proxEstop and static_stop_hits < self.min_hits:
+            self.proxEstop = False
+            self.get_logger().info("Proximity estop cleared — path is free, resuming.")
+
+        # Warning zone (auto-clearing)
+        if static_warn_hits >= self.min_hits and not self.estopON and not self.proxEstop:
+            if not self.warnON:
+                self.warnON = True
+                self.get_logger().warn(
+                    f"Warning: obstacle at {static_closest:.2f}m "
                     f"({static_warn_hits} front rays)"
                 )
-            self.warnON = True
+        elif self.warnON and static_warn_hits < self.min_hits and not self.proxEstop:
+            self.warnON = False
+            self.get_logger().info("Warning zone clear — resuming.")
 
-        # first scan ever, nothing to compare against yet, just save and wait
+        # ── Motion estop (LATCHING) ───────────────────────────────────────────
+        # Something suddenly moved close — latches until reset_estop command.
         if self.prevranges is None:
             self.prevranges = curr
             return
 
-        # make sure scan lengths match (they always should, but just in case)
         if len(curr) != len(self.prevranges):
             self.prevranges = curr
             return
 
-        # track closest moving hit and how many rays agree per zone
-        warnMOOVEhits  = 0 # rays with motion within warn zone (5m)
-        estopMOOVEhits = 0 # rays with motion within estop zone (1m)
-        hitclosest = float("inf")
+        motion_stop_hits = 0
+        motion_warn_hits = 0
+        motion_closest = float("inf")
+        angle = msg.angle_min
 
-        for i in range(len(curr)):
-
-            rangenow  = curr[i]
+        for i, rangenow in enumerate(curr):
             rangeprev = self.prevranges[i]
+            angle_i = msg.angle_min + i * msg.angle_increment
 
-            # skip invalid readings (esp 0 readings)
             if (
-                math.isnan(rangenow)  or math.isinf(rangenow)  or rangenow  <= 0.1 or
+                math.isnan(rangenow) or math.isinf(rangenow) or rangenow <= 0.1 or
                 math.isnan(rangeprev) or math.isinf(rangeprev) or rangeprev <= 0.1
             ):
                 continue
 
-            # how much did this ray change since last scan?
-            change = abs(rangenow - rangeprev)
+            # only check the front cone for motion too
+            if abs(angle_i) > self.front_half_angle:
+                continue
 
-            # ignore tiny jitter completely
+            change = abs(rangenow - rangeprev)
             if change < 0.05:
                 continue
 
-            # count hits per zone
             if change >= movethres:
-
                 if rangenow <= self.stopdist:
-                    # emergency zone
-                    estopMOOVEhits += 1
-                    hitclosest = min(hitclosest, rangenow)
-
+                    motion_stop_hits += 1
+                    motion_closest = min(motion_closest, rangenow)
                 elif rangenow <= self.warndist:
-                    # warning zone
-                    warnMOOVEhits += 1
-                    hitclosest = min(hitclosest, rangenow)
+                    motion_warn_hits += 1
+                    motion_closest = min(motion_closest, rangenow)
 
-        # needs multiple rays to agree
-        estoptrigger = estopMOOVEhits >= 5
-        warntrigger = warnMOOVEhits >= 5
-
-        # EMERGENCY STOP
-        if estoptrigger and not self.estopON:
-
-            print(f"Moving object detected (hits={estopMOOVEhits}, closest={hitclosest:.2f}m)")
-
-            # stop immediately
-            self.sendvelo(0.0)
-
-            self.get_logger().info(
-                f"EMERGENCY STOP - moving obstacle at {hitclosest:.2f}m"
-            )
-
+        if motion_stop_hits >= self.min_hits and not self.estopON:
             self.estopON = True
-            self.warnON  = False
-
-            # log + save evidence
-            self.logincident(hitclosest, estopMOOVEhits)
+            self.proxEstop = False
+            self.warnON = False
+            self.sendvelo(0.0)
+            self.get_logger().warn(
+                f"MOTION ESTOP: moving obstacle at {motion_closest:.2f}m "
+                f"({motion_stop_hits} rays) — send reset_estop to clear."
+            )
+            self.logincident(motion_closest, motion_stop_hits)
             self.savethebag()
 
-        # WARNING ZONE (5m)
-        # only applies if not already in estop
-        elif warntrigger and not self.estopON:
-            print(f"[WARN] moving object in warning zone (hits={warnMOOVEhits}, closest={hitclosest:.2f}m)")
-
-            # stop immediately too
-            self.sendvelo(0.0)
-
-            if not self.warnON:
-                self.get_logger().info(f"Moving obstacle in warning zone at {hitclosest:.2f}m — stopping")
-                self.warnON = True
-
-        # ALL CLEAR
-        else:
-            # clear warn zone immediately
-            if self.warnON and static_warn_hits < self.min_hits:
-                self.get_logger().info("Warning zone clear - resuming")
-                self.warnON = False
-
-        # save current scan for next comparison
         self.prevranges = curr
 
     # write incident to a log file
@@ -338,8 +317,8 @@ class LidarEstop(Node):
     # handles steady state, the immediate stops happen in lidarcb
     def controloop(self):
 
-        # estop overrides everything
-        if self.estopON:
+        # estop overrides everything (latching motion estop OR proximity estop)
+        if self.estopON or self.proxEstop:
             self.sendvelo(0.0)
             self.statuspub.publish(Int8(data=estopstate))
             self.triggeredpub.publish(Bool(data=True))

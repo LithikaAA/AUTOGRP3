@@ -191,8 +191,8 @@ def generate_launch_description():
                     parameters=[
                         {'bag_directory': '/tmp/pioneer_estop/bags'},
                         {'incident_log': '/tmp/pioneer_estop/incidents.txt'},
-                        {'stop_distance_m': 0.18},
-                        {'warning_distance_m': 0.35},
+                        {'stop_distance_m': 0.5},
+                        {'warning_distance_m': 1.0},
                     ],
                 ),
                 Node(
