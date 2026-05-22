@@ -703,14 +703,14 @@ Overall, these changes make the robot behave more like a real system where senso
   <joint name="cam_joint" type="fixed">
     <parent link="chassis"/> <!-- Camera mounted on chassis -->
     <child link="cam_frame"/> <!-- Camera frame -->
-    <origin xyz="0.30 0 0.25" rpy="0 0 0"/> <!-- Front-facing camera position -->
+    <origin xyz="0.38 0 0.20" rpy="0 0 0"/>
   </joint>
 
   <link name="cam_frame">
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0"/> <!-- Visual at origin -->
       <geometry>
-        <box size="0.01 0.05 0.01"/> <!-- Small visual box -->
+        <box size="0.05 0.01 0.01"/> <!-- Camera body points forward along X -->
       </geometry>
       <material name="greenCam">
         <color rgba="0 1.0 0 1.0"/> <!-- Green camera marker -->

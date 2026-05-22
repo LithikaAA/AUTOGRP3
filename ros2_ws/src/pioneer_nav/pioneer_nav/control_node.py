@@ -14,11 +14,20 @@ from sensor_msgs.msg import Joy, LaserScan
 from std_msgs.msg import String, Int8
 from tf2_msgs.msg import TFMessage
 
+try:
+    from action_msgs.msg import GoalStatus
+    from nav2_msgs.action import NavigateToPose
+    from rclpy.action import ActionClient
+except ImportError:
+    GoalStatus = None
+    NavigateToPose = None
+    ActionClient = None
+
 # Configuration defaults
 INITIAL_TURN_ANGLE = 45
 INITIAL_DRIVE_DISTANCE = 5.0
 BOUNDARY_BUFFER = 1.0
-MAP_SIZE = 15.0
+MAP_SIZE = 10.0
 MAP_HALF_SIZE = MAP_SIZE / 2
 MAP_CENTER = (0.0, 0.0)
 
@@ -128,6 +137,7 @@ class AUTO_STATE(Enum):
     OBSTACLE_FOLLOW = 13
     OBSTACLE_RETURN_TURN = 14
     INITIAL_SCAN = 15
+    COVERAGE_NAV2 = 16
 
 
 def quaternion_to_yaw(orientation):
@@ -146,6 +156,14 @@ def signed_angle_diff(target_yaw, current_yaw):
     if angle_diff > 180:
         angle_diff -= 360
     return angle_diff
+
+
+def yaw_to_quaternion(yaw_deg):
+    yaw_rad = math.radians(yaw_deg)
+    pose = PoseStamped()
+    pose.pose.orientation.z = math.sin(yaw_rad / 2.0)
+    pose.pose.orientation.w = math.cos(yaw_rad / 2.0)
+    return pose.pose.orientation
 
 
 class ControlNode(Node):
@@ -197,6 +215,11 @@ class ControlNode(Node):
         self.declare_parameter('mission_command_topic', '/mission_command')
         self.declare_parameter('planned_path_topic', '/planned_path')
         self.declare_parameter('publish_gui_topics', True)
+        self.declare_parameter('use_nav2', False)
+        self.declare_parameter('nav2_action_name', 'navigate_to_pose')
+        self.declare_parameter('nav2_goal_frame', 'map')
+        self.declare_parameter('nav2_server_wait_s', 2.0)
+        self.declare_parameter('nav2_goal_timeout_s', 120.0)
 
         joy_topic = self.get_parameter('joy_topic').value
         scan_topic = self.get_parameter('scan_topic').value
@@ -244,6 +267,14 @@ class ControlNode(Node):
         self.gazebo_tf_frame_match = self.get_parameter('gazebo_tf_frame_match').value
         self.gazebo_tf_allow_unmatched = bool(self.get_parameter('gazebo_tf_allow_unmatched').value)
         self.publish_gui_topics = bool(self.get_parameter('publish_gui_topics').value)
+        self.use_nav2 = bool(self.get_parameter('use_nav2').value)
+        self.nav2_action_name = self.get_parameter('nav2_action_name').value
+        self.nav2_goal_frame = self.get_parameter('nav2_goal_frame').value
+        self.nav2_server_wait_s = max(0.1, float(self.get_parameter('nav2_server_wait_s').value))
+        self.nav2_goal_timeout_s = max(5.0, float(self.get_parameter('nav2_goal_timeout_s').value))
+        if self.use_nav2 and ActionClient is None:
+            self.get_logger().error('use_nav2=true requested, but nav2_msgs/rclpy action support is unavailable. Falling back to native coverage driving.')
+            self.use_nav2 = False
 
         # ---- publishers ----
         self.cmd_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
@@ -260,6 +291,8 @@ class ControlNode(Node):
         self.create_subscription(String, mission_command_topic, self.mission_command_cb, 10)
         if self.use_gazebo_tf_pose:
             self.create_subscription(TFMessage, self.gazebo_tf_topic, self.gazebo_tf_cb, 10)
+
+        self.nav2_client = ActionClient(self, NavigateToPose, self.nav2_action_name) if self.use_nav2 else None
 
         self.drive_mode = DRIVE_MODE.AUTO
         self.auto_state = AUTO_STATE.INITIAL_TURN
@@ -301,6 +334,12 @@ class ControlNode(Node):
         self.coverage_idx = 0
         self.coverage_scan_until = 0.0
         self.coverage_scan_then_advance = False
+        self.nav2_send_goal_future = None
+        self.nav2_goal_handle = None
+        self.nav2_result_future = None
+        self.nav2_goal_sent_time = 0.0
+        self.nav2_goal_idx = -1
+        self.nav2_wait_logged = False
         self.last_path_publish_time = 0.0
         self.reached_home = False
         self._last_auto_button = False
@@ -344,6 +383,10 @@ class ControlNode(Node):
             f'margin={self.coverage_boundary_margin:.2f}m, speed={self.coverage_linear_speed:.2f}m/s, '
             f'scan_spin={self.coverage_scan_spin_s:.1f}s, row_midpoints={self.coverage_row_midpoint_scans}'
         )
+        if self.use_nav2:
+            self.get_logger().info(
+                f'Nav2 coverage mode enabled: action={self.nav2_action_name}, frame={self.nav2_goal_frame}.'
+            )
         if not self.center_arena_on_start:
             self.get_logger().info(
                 f'{MAP_SIZE:g}x{MAP_SIZE:g} arena fixed at odom/world ({self.map_origin_x:.2f}, {self.map_origin_y:.2f}).'
@@ -373,6 +416,7 @@ class ControlNode(Node):
                 self.start_coverage()
 
             elif command == 'go_home':
+                self.cancel_nav2_goal()
                 self.external_waypoint_active = False
                 self.lawnmower_mapping_requested = False
                 self.coverage_active = False
@@ -399,6 +443,7 @@ class ControlNode(Node):
                 self.start_coverage()
 
             elif command == 'drive_waypoints':
+                self.cancel_nav2_goal()
                 self.external_waypoint_active = True
                 self.lawnmower_mapping_requested = False
                 self.coverage_active = False
@@ -409,6 +454,7 @@ class ControlNode(Node):
                 self.get_logger().info(f'GUI command: Paused for external navigation: {command}.')
 
             elif command == 'reset_estop':
+                self.cancel_nav2_goal()
                 self.emergency_stop = False
                 if self.external_estop_status == ESTOP_ACTIVE:
                     self.external_estop_status = ESTOP_CLEAR
@@ -426,8 +472,10 @@ class ControlNode(Node):
             previous = self.external_estop_status
             self.external_estop_status = int(msg.data)
             if self.external_estop_status == ESTOP_ACTIVE:
+                self.cancel_nav2_goal()
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
+                self.lawnmower_mapping_requested = False
                 self.coverage_active = False
                 self.publish_twist(0.0, 0.0)
                 if previous != ESTOP_ACTIVE:
@@ -441,6 +489,7 @@ class ControlNode(Node):
 
     def start_continuous_mapping(self):
         """Start SLAM mapping with a full scan, then lawnmower coverage."""
+        self.cancel_nav2_goal()
         if self.map_origin_x is None or self.map_origin_y is None:
             self.map_origin_x = self.current_x
             self.map_origin_y = self.current_y
@@ -467,9 +516,8 @@ class ControlNode(Node):
         self.emergency_stop = False
         self.drive_mode = DRIVE_MODE.AUTO
         self.auto_state = AUTO_STATE.INITIAL_SCAN
-        scan_turn_speed = abs(self.coverage_scan_turn_speed) or COVERAGE_SCAN_TURN_SPEED
-        full_scan_s = (2.0 * math.pi * self.initial_mapping_scan_revolutions) / scan_turn_speed
-        self.coverage_scan_until = time.time() + max(full_scan_s, self.coverage_scan_spin_s)
+        scan_duration_s = self.initial_coverage_scan_duration()
+        self.coverage_scan_until = time.time() + scan_duration_s
         self.target_yaw = None
         self.wandering_target_yaw = None
         self.turn_start_time = None
@@ -482,11 +530,12 @@ class ControlNode(Node):
         self.publish_robot_state()
         self.get_logger().info(
             f'Mapping started with an initial {self.initial_mapping_scan_revolutions:.2f}x full in-place scan, '
-            f'then lawnmower coverage with obstacle avoidance.'
+            f'then lawnmower coverage from the first corner waypoint.'
         )
 
     def start_coverage(self):
-        """Start native 8x8 lawnmower coverage from the current arena origin."""
+        """Start native lawnmower coverage from the current arena origin."""
+        self.cancel_nav2_goal()
         if self.map_origin_x is None or self.map_origin_y is None:
             self.map_origin_x = self.current_x
             self.map_origin_y = self.current_y
@@ -514,9 +563,11 @@ class ControlNode(Node):
         self.reached_home = False
         self.emergency_stop = False
         self.drive_mode = DRIVE_MODE.AUTO
-        self.auto_state = AUTO_STATE.COVERAGE_SCAN if self.coverage_scan_spin_s > 0.0 else AUTO_STATE.COVERAGE_TURN
+        drive_state = AUTO_STATE.COVERAGE_NAV2 if self.use_nav2 else AUTO_STATE.COVERAGE_TURN
+        scan_duration_s = self.initial_coverage_scan_duration()
+        self.auto_state = AUTO_STATE.COVERAGE_SCAN if scan_duration_s > 0.0 else drive_state
         if self.auto_state == AUTO_STATE.COVERAGE_SCAN:
-            self.coverage_scan_until = time.time() + self.coverage_scan_spin_s
+            self.coverage_scan_until = time.time() + scan_duration_s
         self.target_yaw = None
         self.turn_start_time = None
         self.turn_start_yaw = None
@@ -525,10 +576,15 @@ class ControlNode(Node):
         self.publish_planned_path()
         self.publish_robot_state()
         self.get_logger().info(
-            f'GUI command: Native lawnmower coverage started with {len(self.coverage_waypoints)} waypoint(s).'
+            f'GUI command: Native lawnmower coverage started with {len(self.coverage_waypoints)} waypoint(s)'
+            f' using {"Nav2" if self.use_nav2 else "built-in controller"}.'
         )
         if self.auto_state == AUTO_STATE.COVERAGE_SCAN:
-            self.get_logger().info(f'Starting initial coverage scan for {self.coverage_scan_spin_s:.1f}s.')
+            first = self.coverage_waypoints[0]
+            self.get_logger().info(
+                f'Starting initial full coverage scan for {scan_duration_s:.1f}s, '
+                f'then driving to corner waypoint ({first[0]:.2f}, {first[1]:.2f}).'
+            )
 
     def restore_lawnmower_mapping(self, reason):
         """Force the active mapping mission back onto its coverage route."""
@@ -551,7 +607,8 @@ class ControlNode(Node):
         self.coverage_scan_until = 0.0
         self.coverage_scan_then_advance = False
         self.reset_coverage_avoidance()
-        self.auto_state = AUTO_STATE.COVERAGE_TURN
+        self.cancel_nav2_goal()
+        self.auto_state = AUTO_STATE.COVERAGE_NAV2 if self.use_nav2 else AUTO_STATE.COVERAGE_TURN
         self.target_yaw = None
         self.turn_start_time = None
         self.turn_start_yaw = None
@@ -560,6 +617,13 @@ class ControlNode(Node):
         self.publish_planned_path()
         self.publish_robot_state()
         return True
+
+    def initial_coverage_scan_duration(self):
+        if self.coverage_scan_spin_s <= 0.0:
+            return 0.0
+        scan_turn_speed = abs(self.coverage_scan_turn_speed) or COVERAGE_SCAN_TURN_SPEED
+        full_scan_s = (2.0 * math.pi * self.initial_mapping_scan_revolutions) / scan_turn_speed
+        return max(full_scan_s, self.coverage_scan_spin_s)
 
     def generate_coverage_waypoints(self):
         half = MAP_SIZE / 2.0
@@ -726,6 +790,7 @@ class ControlNode(Node):
             stop_pressed = bool(msg.buttons[self.joy_stop_button])
 
             if stop_pressed and not self._last_stop_button:
+                self.cancel_nav2_goal()
                 self.emergency_stop = True
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.lawnmower_mapping_requested = False
@@ -734,6 +799,7 @@ class ControlNode(Node):
                 self.get_logger().warn('PS4 Square pressed: emergency stop latched')
 
             if manual_pressed and not self._last_manual_button:
+                self.cancel_nav2_goal()
                 self.emergency_stop = False
                 self.drive_mode = DRIVE_MODE.MANUAL
                 self.lawnmower_mapping_requested = False
@@ -934,6 +1000,9 @@ class ControlNode(Node):
             return 0.0, 0.0
         return self.current_x - self.map_origin_x, self.current_y - self.map_origin_y
 
+    def outside_arena(self, rel_x, rel_y, tolerance=0.05):
+        return abs(rel_x) > MAP_HALF_SIZE + tolerance or abs(rel_y) > MAP_HALF_SIZE + tolerance
+
     def control_loop(self):
         with self.mutex:
             self.publish_robot_state()
@@ -1013,6 +1082,21 @@ class ControlNode(Node):
             if self.coverage_active and time.time() - self.last_path_publish_time > 1.0:
                 self.publish_planned_path()
 
+            if self.coverage_active and self.outside_arena(rel_x, rel_y):
+                self.get_logger().warn(
+                    f'Coverage left the {MAP_SIZE:g}x{MAP_SIZE:g} arena at relative '
+                    f'({rel_x:.2f}, {rel_y:.2f}); cancelling Nav2 and returning to center.',
+                    throttle_duration_sec=1.0
+                )
+                self.cancel_nav2_goal()
+                self.coverage_active = False
+                self.lawnmower_mapping_requested = False
+                self.auto_state = AUTO_STATE.RETURN_TO_CENTER
+                self.target_yaw = None
+                self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
+                self.publish_twist(0.0, 0.0)
+                return
+
             invalid_lawnmower_state = self.auto_state in [
                 AUTO_STATE.WANDERING_TURN,
                 AUTO_STATE.WANDERING_DRIVE,
@@ -1023,7 +1107,12 @@ class ControlNode(Node):
                 self.restore_lawnmower_mapping(f'Mapping tried to enter {self.auto_state.name}')
                 return
 
-            coverage_state = self.auto_state in [AUTO_STATE.COVERAGE_TURN, AUTO_STATE.COVERAGE_DRIVE, AUTO_STATE.COVERAGE_SCAN]
+            coverage_state = self.auto_state in [
+                AUTO_STATE.COVERAGE_TURN,
+                AUTO_STATE.COVERAGE_DRIVE,
+                AUTO_STATE.COVERAGE_SCAN,
+                AUTO_STATE.COVERAGE_NAV2,
+            ]
             if (self.coverage_active and
                     not coverage_state and
                     self.auto_state not in [AUTO_STATE.INITIAL_TURN, AUTO_STATE.RETURN_TO_CENTER] and
@@ -1087,6 +1176,8 @@ class ControlNode(Node):
                 self.handle_coverage_drive()
             elif self.auto_state == AUTO_STATE.COVERAGE_SCAN:
                 self.handle_coverage_scan()
+            elif self.auto_state == AUTO_STATE.COVERAGE_NAV2:
+                self.handle_coverage_nav2()
 
     # ------------------------------------------------------------------ #
     #  STATE HANDLERS                                                      #
@@ -1196,6 +1287,113 @@ class ControlNode(Node):
             angular_speed = math.copysign(math.radians(self.turn_speed_deg), angle_diff)
             self.publish_twist(0.0, angular_speed)
 
+    def cancel_nav2_goal(self):
+        if self.nav2_goal_handle is not None:
+            try:
+                self.nav2_goal_handle.cancel_goal_async()
+            except Exception as exc:
+                self.get_logger().warn(f'Failed to cancel Nav2 goal cleanly: {exc}', throttle_duration_sec=2.0)
+        self.nav2_send_goal_future = None
+        self.nav2_goal_handle = None
+        self.nav2_result_future = None
+        self.nav2_goal_sent_time = 0.0
+        self.nav2_goal_idx = -1
+        self.nav2_wait_logged = False
+
+    def _coverage_goal_yaw(self):
+        if self.coverage_idx + 1 < len(self.coverage_waypoints):
+            current = self.coverage_waypoints[self.coverage_idx]
+            next_goal = self.coverage_waypoints[self.coverage_idx + 1]
+            return (math.degrees(math.atan2(next_goal[1] - current[1], next_goal[0] - current[0])) + 360) % 360
+        goal = self.current_coverage_goal()
+        if goal is None:
+            return self.current_yaw
+        return (math.degrees(math.atan2(goal[1] - self.current_y, goal[0] - self.current_x)) + 360) % 360
+
+    def start_nav2_coverage_goal(self, goal):
+        if not self.use_nav2 or self.nav2_client is None or NavigateToPose is None:
+            return False
+
+        if not self.nav2_client.wait_for_server(timeout_sec=self.nav2_server_wait_s):
+            if not self.nav2_wait_logged:
+                self.get_logger().warn(
+                    f'Nav2 action server "{self.nav2_action_name}" is not ready; falling back to built-in coverage drive.',
+                    throttle_duration_sec=2.0
+                )
+                self.nav2_wait_logged = True
+            return False
+
+        nav_goal = NavigateToPose.Goal()
+        nav_goal.pose.header.frame_id = self.nav2_goal_frame
+        nav_goal.pose.header.stamp = self.get_clock().now().to_msg()
+        nav_goal.pose.pose.position.x = float(goal[0])
+        nav_goal.pose.pose.position.y = float(goal[1])
+        nav_goal.pose.pose.orientation = yaw_to_quaternion(self._coverage_goal_yaw())
+
+        self.nav2_send_goal_future = self.nav2_client.send_goal_async(nav_goal)
+        self.nav2_goal_handle = None
+        self.nav2_result_future = None
+        self.nav2_goal_sent_time = time.time()
+        self.nav2_goal_idx = self.coverage_idx
+        self.nav2_wait_logged = False
+        self.get_logger().info(
+            f'Nav2 goal {self.coverage_idx + 1}/{len(self.coverage_waypoints)} sent: '
+            f'({goal[0]:.2f}, {goal[1]:.2f}).'
+        )
+        return True
+
+    def handle_coverage_nav2(self):
+        goal = self.current_coverage_goal()
+        if goal is None:
+            self.finish_coverage()
+            return
+
+        distance = math.hypot(goal[0] - self.current_x, goal[1] - self.current_y)
+        if distance <= self.coverage_goal_tolerance:
+            self.get_logger().info(
+                f'Nav2 coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)} reached by pose tolerance.'
+            )
+            self.advance_coverage_waypoint()
+            return
+
+        if self.nav2_goal_idx != self.coverage_idx:
+            if not self.start_nav2_coverage_goal(goal):
+                self.auto_state = AUTO_STATE.COVERAGE_TURN
+                return
+
+        if self.nav2_send_goal_future is not None and self.nav2_send_goal_future.done():
+            goal_handle = self.nav2_send_goal_future.result()
+            self.nav2_send_goal_future = None
+            if not goal_handle.accepted:
+                self.get_logger().warn(
+                    f'Nav2 rejected coverage waypoint {self.coverage_idx + 1}; using built-in coverage drive.'
+                )
+                self.cancel_nav2_goal()
+                self.auto_state = AUTO_STATE.COVERAGE_TURN
+                return
+            self.nav2_goal_handle = goal_handle
+            self.nav2_result_future = goal_handle.get_result_async()
+
+        if self.nav2_goal_sent_time and time.time() - self.nav2_goal_sent_time > self.nav2_goal_timeout_s:
+            self.get_logger().warn(
+                f'Nav2 timed out on coverage waypoint {self.coverage_idx + 1}; advancing to keep lawnmower moving.'
+            )
+            self.advance_coverage_waypoint()
+            return
+
+        if self.nav2_result_future is not None and self.nav2_result_future.done():
+            result = self.nav2_result_future.result()
+            status = result.status
+            if GoalStatus is not None and status == GoalStatus.STATUS_SUCCEEDED:
+                self.get_logger().info(
+                    f'Nav2 reached coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)}.'
+                )
+            else:
+                self.get_logger().warn(
+                    f'Nav2 finished coverage waypoint {self.coverage_idx + 1} with status {status}; advancing.'
+                )
+            self.advance_coverage_waypoint()
+
     def current_coverage_goal(self):
         if not self.coverage_active or self.coverage_idx >= len(self.coverage_waypoints):
             return None
@@ -1214,6 +1412,7 @@ class ControlNode(Node):
         self.last_goal_progress_time = time.time()
 
     def finish_coverage(self):
+        self.cancel_nav2_goal()
         self.coverage_active = False
         self.lawnmower_mapping_requested = False
         self.coverage_idx = len(self.coverage_waypoints)
@@ -1230,6 +1429,7 @@ class ControlNode(Node):
         self.get_logger().info('Lawnmower coverage complete. Returned to arena center and waiting idle.')
 
     def advance_coverage_waypoint(self):
+        self.cancel_nav2_goal()
         if self.coverage_scan_spin_s > 0.0:
             self.auto_state = AUTO_STATE.COVERAGE_SCAN
             self.coverage_scan_until = time.time() + self.coverage_scan_spin_s
@@ -1249,6 +1449,7 @@ class ControlNode(Node):
     def _advance_coverage_waypoint_after_scan(self):
         self.coverage_idx += 1
         self.reset_coverage_avoidance()
+        self.cancel_nav2_goal()
         self.target_yaw = None
         self.turn_start_time = None
         self.turn_start_yaw = None
@@ -1259,7 +1460,7 @@ class ControlNode(Node):
             self.finish_coverage()
             return
         goal = self.coverage_waypoints[self.coverage_idx]
-        self.auto_state = AUTO_STATE.COVERAGE_TURN
+        self.auto_state = AUTO_STATE.COVERAGE_NAV2 if self.use_nav2 else AUTO_STATE.COVERAGE_TURN
         self.get_logger().info(
             f'Coverage waypoint {self.coverage_idx + 1}/{len(self.coverage_waypoints)}: '
             f'goal=({goal[0]:.2f}, {goal[1]:.2f}).'
@@ -1518,7 +1719,7 @@ class ControlNode(Node):
             self.coverage_scan_then_advance = False
             self._advance_coverage_waypoint_after_scan()
         else:
-            self.auto_state = AUTO_STATE.COVERAGE_TURN
+            self.auto_state = AUTO_STATE.COVERAGE_NAV2 if self.use_nav2 else AUTO_STATE.COVERAGE_TURN
             self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
             self.get_logger().info('Initial coverage scan complete. Driving to first lawnmower waypoint.')
 
@@ -1532,7 +1733,10 @@ class ControlNode(Node):
         if self.lawnmower_mapping_requested and not self.coverage_active:
             self.restore_lawnmower_mapping('Initial full scan completed without active coverage')
             return
-        self.auto_state = AUTO_STATE.COVERAGE_TURN if self.coverage_active else AUTO_STATE.WANDERING_TURN
+        if self.coverage_active:
+            self.auto_state = AUTO_STATE.COVERAGE_NAV2 if self.use_nav2 else AUTO_STATE.COVERAGE_TURN
+        else:
+            self.auto_state = AUTO_STATE.WANDERING_TURN
         self.transition_stop_end_time = time.time() + TRANSITION_STOP_DURATION
         self.target_yaw = None
         self.turn_start_time = None

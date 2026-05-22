@@ -59,7 +59,7 @@ def generate_launch_description():
     )
 
     arena_size_arg = DeclareLaunchArgument(
-        'arena_size_m', default_value='15.0',
+        'arena_size_m', default_value='10.0',
         description='Square arena side length in metres.'
     )
     coverage_boundary_margin_arg = DeclareLaunchArgument(
@@ -81,6 +81,10 @@ def generate_launch_description():
     coverage_row_midpoint_scans_arg = DeclareLaunchArgument(
         'coverage_row_midpoint_scans', default_value='true',
         description='Add a scan waypoint at the middle of every lawnmower row.'
+    )
+    use_nav2_arg = DeclareLaunchArgument(
+        'use_nav2', default_value='false',
+        description='Use Nav2 NavigateToPose for lawnmower waypoint driving.'
     )
 
     # ==================== Gazebo ====================
@@ -148,6 +152,7 @@ def generate_launch_description():
             {'coverage_scan_spin_s': ParameterValue(LaunchConfiguration('coverage_scan_spin_s'), value_type=float)},
             {'coverage_scan_turn_speed': ParameterValue(LaunchConfiguration('coverage_scan_turn_speed'), value_type=float)},
             {'coverage_row_midpoint_scans': ParameterValue(LaunchConfiguration('coverage_row_midpoint_scans'), value_type=bool)},
+            {'use_nav2': ParameterValue(LaunchConfiguration('use_nav2'), value_type=bool)},
             {'center_arena_on_start': False},
             {'arena_origin_x': 0.0},
             {'arena_origin_y': 0.0},
@@ -198,6 +203,7 @@ def generate_launch_description():
         coverage_scan_spin_arg,
         coverage_scan_turn_speed_arg,
         coverage_row_midpoint_scans_arg,
+        use_nav2_arg,
         gazebo,
         robot,
         robot_state_publisher,

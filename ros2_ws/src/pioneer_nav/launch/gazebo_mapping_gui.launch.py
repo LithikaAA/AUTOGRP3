@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -53,6 +53,7 @@ def generate_launch_description():
     waypoint_critical_reverse_speed = LaunchConfiguration('waypoint_critical_reverse_speed')
     front_obstacle_fov_deg = LaunchConfiguration('front_obstacle_fov_deg')
     side_obstacle_fov_deg = LaunchConfiguration('side_obstacle_fov_deg')
+    use_nav2 = LaunchConfiguration('use_nav2')
     slam_start_delay = LaunchConfiguration('slam_start_delay')
 
     control_launch = IncludeLaunchDescription(
@@ -71,6 +72,7 @@ def generate_launch_description():
             'coverage_scan_spin_s': coverage_scan_spin_s,
             'coverage_scan_turn_speed': coverage_scan_turn_speed,
             'coverage_row_midpoint_scans': 'true',
+            'use_nav2': use_nav2,
         }.items(),
     )
 
@@ -88,6 +90,19 @@ def generate_launch_description():
             'scan_frame': 'pioneer/base_link/laser',
             'odom_tf_stamp_with_current_time': 'true',
             'slam_start_delay': slam_start_delay,
+        }.items(),
+    )
+    nav2_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                pkg_pioneer_nav,
+                'launch',
+                'nav2_navigation.launch.py',
+            ])
+        ),
+        condition=IfCondition(use_nav2),
+        launch_arguments={
+            'use_sim_time': 'true',
         }.items(),
     )
 
@@ -123,7 +138,7 @@ def generate_launch_description():
         DeclareLaunchArgument('binary_map_csv', default_value=''),
         DeclareLaunchArgument('astar_obstacle_inflation_m', default_value='0.25'),
         DeclareLaunchArgument('astar_waypoint_spacing_m', default_value='0.35'),
-        DeclareLaunchArgument('coverage_area_size_m', default_value='15.0'),
+        DeclareLaunchArgument('coverage_area_size_m', default_value='10.0'),
         DeclareLaunchArgument('coverage_boundary_margin_m', default_value='0.5'),
         DeclareLaunchArgument('coverage_sweep_spacing_m', default_value='1.4'),
         DeclareLaunchArgument('coverage_pattern', default_value='serpentine'),
@@ -148,6 +163,7 @@ def generate_launch_description():
         DeclareLaunchArgument('waypoint_critical_reverse_speed', default_value='-0.25'),
         DeclareLaunchArgument('front_obstacle_fov_deg', default_value='130.0'),
         DeclareLaunchArgument('side_obstacle_fov_deg', default_value='90.0'),
+        DeclareLaunchArgument('use_nav2', default_value='true'),
         DeclareLaunchArgument(
             'slam_start_delay',
             default_value='8.0',
@@ -196,6 +212,10 @@ def generate_launch_description():
         TimerAction(
             period=2.0,
             actions=[slam_launch],
+        ),
+        TimerAction(
+            period=PythonExpression([slam_start_delay, ' + 4.0']),
+            actions=[nav2_launch],
         ),
         TimerAction(
             period=4.0,

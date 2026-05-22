@@ -61,6 +61,7 @@ setup(
             'launch/sdf.launch.py',
             'launch/control_node_gazebo.launch.py',
             'launch/slam_mapping.launch.py',
+            'launch/nav2_navigation.launch.py',
             'launch/gazebo_mapping_gui.launch.py',
             'launch/mapping_gui.launch.py',
             'launch/letter_detector.launch.py',
@@ -68,6 +69,7 @@ setup(
         ('share/' + package_name + '/config', [
             'pioneer_nav/config/test_waypoints.txt',
             'config/slam_toolbox_mapping.yaml',
+            'config/nav2_params.yaml',
             'config/slam_mapping.rviz',
         ]),
     ] + asset_data_files,

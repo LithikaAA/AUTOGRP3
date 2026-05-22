@@ -28,6 +28,8 @@ RUN apt-get update && apt-get install -y \
     ros-jazzy-geometry-msgs \
     ros-jazzy-slam-toolbox \
     ros-jazzy-nav2-bringup \
+    ros-jazzy-nav2-msgs \
+    ros-jazzy-nav2-regulated-pure-pursuit-controller \
     ros-jazzy-joy \
     ros-jazzy-teleop-twist-joy \
     ros-jazzy-nmea-navsat-driver \
@@ -60,10 +62,14 @@ COPY ros2_ws/basic_urdf.sdf /ros2_ws/basic_urdf.sdf
 COPY robots /ros2_ws/robots
 COPY ariaNode /ros2_ws/src/ariaNode
 
+RUN test -f /ros2_ws/src/pioneer_nav/pioneer_nav/unified_detector_node.py
+
 # Build workspace
 WORKDIR /ros2_ws
 RUN . /opt/ros/jazzy/setup.sh && \
-    colcon build --symlink-install
+    colcon build --symlink-install && \
+    . /ros2_ws/install/setup.sh && \
+    python3 -c "import pioneer_nav.unified_detector_node"
 
 # Default location for saved occupancy maps. Bind-mount this path when running
 # the container if you want maps to persist on the host.

@@ -5,7 +5,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 
@@ -52,6 +52,7 @@ def generate_launch_description():
     control_emergency_stop_distance = LaunchConfiguration('control_emergency_stop_distance')
     control_lidar_front_angle_deg = LaunchConfiguration('control_lidar_front_angle_deg')
     control_lidar_self_filter_min_range = LaunchConfiguration('control_lidar_self_filter_min_range')
+    use_nav2 = LaunchConfiguration('use_nav2')
     slam_start_delay = LaunchConfiguration('slam_start_delay')
     odom_tf_stamp_with_current_time = LaunchConfiguration('odom_tf_stamp_with_current_time')
 
@@ -77,6 +78,19 @@ def generate_launch_description():
             'slam_start_delay':                slam_start_delay,
         }.items(),
     )
+    nav2_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                pkg_pioneer_nav,
+                'launch',
+                'nav2_navigation.launch.py',
+            ])
+        ),
+        condition=IfCondition(use_nav2),
+        launch_arguments={
+            'use_sim_time': use_sim_time,
+        }.items(),
+    )
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='false'),
@@ -95,7 +109,7 @@ def generate_launch_description():
         DeclareLaunchArgument('waypoint_goal_tolerance', default_value='0.8'),
         DeclareLaunchArgument('waypoint_linear_speed', default_value='0.18'),
         DeclareLaunchArgument('waypoint_slow_linear_speed', default_value='0.04'),
-        DeclareLaunchArgument('coverage_area_size_m', default_value='15.0'),
+        DeclareLaunchArgument('coverage_area_size_m', default_value='10.0'),
         DeclareLaunchArgument('coverage_boundary_margin_m', default_value='0.5'),
         DeclareLaunchArgument('coverage_sweep_spacing_m', default_value='1.4'),
         DeclareLaunchArgument('coverage_pattern', default_value='serpentine'),
@@ -118,6 +132,7 @@ def generate_launch_description():
         DeclareLaunchArgument('control_emergency_stop_distance', default_value='0.18'),
         DeclareLaunchArgument('control_lidar_front_angle_deg', default_value='35.0'),
         DeclareLaunchArgument('control_lidar_self_filter_min_range', default_value='0.25'),
+        DeclareLaunchArgument('use_nav2', default_value='true'),
         DeclareLaunchArgument('slam_start_delay', default_value='8.0'),
         DeclareLaunchArgument('odom_tf_stamp_with_current_time', default_value='true'),
 
@@ -147,6 +162,10 @@ def generate_launch_description():
             arguments=['-rp', aria_port],
         ),
         slam_launch,
+        TimerAction(
+            period=PythonExpression([slam_start_delay, ' + 2.0']),
+            actions=[nav2_launch],
+        ),
         Node(
             package='pioneer_nav',
             executable='control_node',
@@ -182,6 +201,7 @@ def generate_launch_description():
                 {'emergency_stop_distance':    ParameterValue(control_emergency_stop_distance, value_type=float)},
                 {'lidar_front_angle_deg':      ParameterValue(control_lidar_front_angle_deg, value_type=float)},
                 {'lidar_self_filter_min_range': ParameterValue(control_lidar_self_filter_min_range, value_type=float)},
+                {'use_nav2':                   ParameterValue(use_nav2, value_type=bool)},
                 {'center_arena_on_start':      True},
                 {'use_gazebo_tf_pose':         False},
             ],
