@@ -46,6 +46,7 @@ from sensor_msgs.msg import LaserScan
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Bool
 from std_msgs.msg import Int8
+from std_msgs.msg import String
 
 clearstate = 0
 warnstate = 1
@@ -55,6 +56,8 @@ estopstate = 2
 stopdist = 0.18 # metres -> emergency stop zone
 warndist = 0.35 # metres -> warning zone (stop and wait)
 fwdspeed = 0.2 # m/s
+front_half_angle_deg = 35.0
+min_hits = 3
 
 # motion detection threshold
 movethres = 0.18 # metres
@@ -78,6 +81,9 @@ class LidarEstop(Node):
         self.declare_parameter("incident_log", default_incidentlog)
         self.declare_parameter("stop_distance_m", stopdist)
         self.declare_parameter("warning_distance_m", warndist)
+        self.declare_parameter("front_half_angle_deg", front_half_angle_deg)
+        self.declare_parameter("min_hits", min_hits)
+        self.declare_parameter("latch_estop", True)
         self.publish_forward_when_clear = bool(
             self.get_parameter("publish_forward_when_clear").value
         )
@@ -85,6 +91,11 @@ class LidarEstop(Node):
         self.incidentlog = self.get_parameter("incident_log").value
         self.stopdist = max(0.01, float(self.get_parameter("stop_distance_m").value))
         self.warndist = max(self.stopdist, float(self.get_parameter("warning_distance_m").value))
+        self.front_half_angle = math.radians(
+            max(1.0, float(self.get_parameter("front_half_angle_deg").value))
+        )
+        self.min_hits = max(1, int(self.get_parameter("min_hits").value))
+        self.latch_estop = bool(self.get_parameter("latch_estop").value)
 
         # two separate states now:
         # estopON -> full emergency stop (1m), latches for estophold seconds
@@ -118,6 +129,7 @@ class LidarEstop(Node):
             self.lidarcb,
             10
         )
+        self.create_subscription(String, "/mission_command", self.commandcb, 10)
 
         # timer: runs every 0.1 seconds (10 Hz)
         # continuously sends velocity commands
@@ -130,6 +142,34 @@ class LidarEstop(Node):
         self.startbag()
 
         self.get_logger().info("LiDAR e-stop node started. Watching for moving obstacles...")
+
+    def commandcb(self, msg: String):
+        if msg.data.strip() != "reset_estop":
+            return
+        self.estopON = False
+        self.warnON = False
+        self.sendvelo(0.0)
+        self.statuspub.publish(Int8(data=clearstate))
+        self.triggeredpub.publish(Bool(data=False))
+        self.get_logger().info("LiDAR e-stop reset by /mission_command.")
+
+    def front_sector_stats(self, msg: LaserScan):
+        closest = float("inf")
+        stop_hits = 0
+        warn_hits = 0
+
+        angle = msg.angle_min
+        for rangenow in msg.ranges:
+            if -self.front_half_angle <= angle <= self.front_half_angle:
+                if not (math.isnan(rangenow) or math.isinf(rangenow) or rangenow <= 0.1):
+                    closest = min(closest, rangenow)
+                    if rangenow <= self.stopdist:
+                        stop_hits += 1
+                    elif rangenow <= self.warndist:
+                        warn_hits += 1
+            angle += msg.angle_increment
+
+        return closest, stop_hits, warn_hits
 
     # rosbag helpers
 
@@ -169,6 +209,26 @@ class LidarEstop(Node):
     def lidarcb(self, msg: LaserScan):
 
         curr = msg.ranges
+        static_closest, static_stop_hits, static_warn_hits = self.front_sector_stats(msg)
+
+        if static_stop_hits >= self.min_hits and (not self.estopON or not self.latch_estop):
+            self.sendvelo(0.0)
+            self.estopON = True
+            self.warnON = False
+            self.get_logger().warn(
+                f"EMERGENCY STOP - obstacle at {static_closest:.2f}m "
+                f"({static_stop_hits} front rays)"
+            )
+            self.logincident(static_closest, static_stop_hits)
+            self.savethebag()
+        elif static_warn_hits >= self.min_hits and not self.estopON:
+            self.sendvelo(0.0)
+            if not self.warnON:
+                self.get_logger().warn(
+                    f"Warning stop - obstacle at {static_closest:.2f}m "
+                    f"({static_warn_hits} front rays)"
+                )
+            self.warnON = True
 
         # first scan ever, nothing to compare against yet, just save and wait
         if self.prevranges is None:
@@ -255,7 +315,7 @@ class LidarEstop(Node):
         # ALL CLEAR
         else:
             # clear warn zone immediately
-            if self.warnON:
+            if self.warnON and static_warn_hits < self.min_hits:
                 self.get_logger().info("Warning zone clear - resuming")
                 self.warnON = False
 

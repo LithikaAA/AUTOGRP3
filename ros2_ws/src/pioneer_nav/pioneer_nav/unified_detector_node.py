@@ -436,7 +436,8 @@ class UnifiedDetectorNode(Node):
 
             tracker.seen(now)
             bearing_rad = self._bearing_from_x(cx_px, img_width)
-            depth_str   = self._depth_label(cx_px, cy_px)
+            distance_m  = self._get_depth(cx_px, cy_px)
+            depth_str   = f"{distance_m:.2f} m" if distance_m else "depth N/A"
 
             colour = (0, 0, 255) if "red" in label else (0, 255, 255)
             cv2.rectangle(bgr, (bx, by), (bx + bw, by + bh), colour, 3)
@@ -450,6 +451,7 @@ class UnifiedDetectorNode(Node):
                 "label":         label,
                 "center_x":      cx_px,
                 "center_y":      cy_px,
+                "distance_m":    round(distance_m, 3) if distance_m else None,
                 "bearing_deg":   round(math.degrees(bearing_rad), 2),
                 "robot_x":       self.robot_x,
                 "robot_y":       self.robot_y,

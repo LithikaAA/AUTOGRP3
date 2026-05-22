@@ -1243,13 +1243,18 @@ class RobotGUI(QMainWindow):
         to avoid duplicates with the log-file poller.
         """
         label   = data.get("label",       "unknown")
-        dist    = data.get("distance_m",  0.0)
+        dist    = data.get("distance_m")
         bearing = data.get("bearing_deg", 0.0)
         shape   = data.get("shape",       "")        # e.g. "cone", "cylinder", "box"
         colour  = RED if "red" in label else YELLOW
 
         shape_str = f"  shape={shape}" if shape else ""
         if self._should_log_detection_event(f"colour:{label}", cooldown_s=8.0):
+            dist_str = f"{dist:.2f}m" if dist else "depth N/A"
+            self._det_log.add_entry(
+                f"{label}{shape_str}  dist={dist_str}  bearing={bearing:.1f} deg",
+                colour)
+            return
             self._det_log.add_entry(
                 f"{label}{shape_str}  dist={dist:.2f}m  bearing={bearing:.1f}°",
                 colour)
